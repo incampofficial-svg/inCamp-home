@@ -1,8 +1,13 @@
 import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { FileText, UserPlus, Download } from "lucide-react";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 export function CTASection() {
+  const { tenant } = useTenant();
+  const slug = tenant?.slug || "";
+
   return (
     <section className="py-20 lg:py-28 bg-primary relative overflow-hidden">
       {/* Background Decoration */}
@@ -22,19 +27,19 @@ export function CTASection() {
 
           <div className="mt-10 flex flex-col sm:flex-row gap-4 justify-center">
             <Button asChild variant="orange" size="xl">
-              <Link to="/registration">
+              <Link to={tenantPath(slug, "/registration")}>
                 <UserPlus className="w-5 h-5" />
                 Register Now
               </Link>
             </Button>
             <Button asChild size="xl" className="bg-primary-foreground text-primary hover:bg-primary-foreground/90">
-              <Link to="/problems">
+              <Link to={tenantPath(slug, "/problems")}>
                 <FileText className="w-5 h-5" />
                 View Problems
               </Link>
             </Button>
             <Button asChild size="xl" className="bg-transparent border-2 border-primary-foreground/30 text-primary-foreground hover:bg-primary-foreground/10">
-              <Link to="/resources">
+              <Link to={tenantPath(slug, "/resources")}>
                 <Download className="w-5 h-5" />
                 Download Template
               </Link>

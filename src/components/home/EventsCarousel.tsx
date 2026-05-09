@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ChevronLeft, ChevronRight, Calendar, Clock, MapPin } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { supabase } from "@/integrations/supabase/client";
+import { useTenant } from "@/context/TenantContext";
 
 interface Event {
   id: string;
@@ -15,6 +16,7 @@ interface Event {
 }
 
 export function EventsCarousel() {
+  const { tenant } = useTenant();
   const [events, setEvents] = useState<Event[]>([]);
   const [slideIndex, setSlideIndex] = useState(0);
   const [isTransitioning, setIsTransitioning] = useState(true);
@@ -48,13 +50,14 @@ export function EventsCarousel() {
 
   useEffect(() => {
     fetchEvents();
-  }, []);
+  }, [tenant?.id]);
 
   const fetchEvents = async () => {
     try {
       const { data, error } = await supabase
         .from("events")
         .select("*")
+        .eq("tenant_id", tenant!.id)
         .eq("is_active", true)
         .order("event_date", { ascending: true });
 

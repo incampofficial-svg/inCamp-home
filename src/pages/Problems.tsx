@@ -9,6 +9,8 @@ import { ProblemFormDialog } from "@/components/admin/ProblemFormDialog";
 import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "sonner";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 const themes = [
   {
@@ -60,6 +62,7 @@ export default function Problems() {
   const [timeRemaining, setTimeRemaining] = useState<string>("");
   const [isUnlocked, setIsUnlocked] = useState<boolean>(false);
   const { isAdmin } = useAdmin();
+  const { tenant } = useTenant();
 
   // Admin state
   const [formOpen, setFormOpen] = useState(false);
@@ -78,6 +81,7 @@ export default function Problems() {
     let query = supabase
       .from("problem_statements")
       .select("*")
+      .eq("tenant_id", tenant!.id)
       .not("approved_at", "is", null)
       .order("problem_statement_id", { ascending: true });
 
@@ -107,6 +111,7 @@ export default function Problems() {
         const { data, error } = await supabase
           .from("contest_settings")
           .select("problems_unlock_at")
+          .eq("tenant_id", tenant!.id)
           .single();
 
         if (error) throw error;
@@ -130,13 +135,13 @@ export default function Problems() {
     };
 
     fetchUnlockTime();
-  }, [isAdmin]);
+  }, [isAdmin, tenant?.id]);
 
   useEffect(() => {
     if (isUnlocked) {
       fetchProblems();
     }
-  }, [isUnlocked]);
+  }, [isUnlocked, tenant?.id]);
 
   useEffect(() => {
     if (!unlockTime || isUnlocked) return;
@@ -195,6 +200,7 @@ export default function Problems() {
         category,
         theme,
         department_id: department_id,
+        tenant_id: tenant!.id,
       };
 
       if (selectedProblem) {
@@ -202,7 +208,8 @@ export default function Problems() {
         const { error } = await supabase
           .from("problem_statements")
           .update(problemDataForSave)
-          .eq("id", selectedProblem.id);
+          .eq("id", selectedProblem.id)
+          .eq("tenant_id", tenant!.id);
         if (error) throw error;
         toast.success("Problem statement updated");
       } else {
@@ -218,6 +225,7 @@ export default function Problems() {
               created_by: authData.user?.id,
               submitted_at: now,
               approved_at: now,
+              tenant_id: tenant!.id,
             },
           ]);
         if (error) throw error;
@@ -240,7 +248,8 @@ export default function Problems() {
       const { error } = await supabase
         .from("problem_statements")
         .delete()
-        .eq("id", selectedProblem.id);
+        .eq("id", selectedProblem.id)
+        .eq("tenant_id", tenant!.id);
       if (error) throw error;
       toast.success("Problem statement deleted");
       setDeleteOpen(false);
@@ -611,10 +620,10 @@ export default function Problems() {
             </p>
             <div className="flex flex-wrap justify-center gap-4">
               <Button asChild variant="heroOutline" size="lg">
-                <Link to="/resources">Download Resources</Link>
+                <Link to={tenantPath(tenant!.slug, "/resources")}>Download Resources</Link>
               </Button>
               <Button asChild variant="orange" size="lg">
-                <Link to="/registration">Register Now</Link>
+                <Link to={tenantPath(tenant!.slug, "/registration")}>Register Now</Link>
               </Button>
             </div>
           </div>

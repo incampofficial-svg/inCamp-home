@@ -9,6 +9,7 @@ import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
 import { QuerySubmissionForm } from "@/components/resources/QuerySubmissionForm";
 import { AdminQueryList } from "@/components/resources/AdminQueryList";
 import { toast } from "sonner";
+import { useTenant } from "@/context/TenantContext";
 
 const iconMap: Record<string, React.ElementType> = {
   ppt_template: FileText,
@@ -55,6 +56,7 @@ const faqs = [
 
 export default function Resources() {
   const { isAdmin } = useAdmin();
+  const { tenant } = useTenant();
   const [resources, setResources] = useState<Resource[]>([]);
   const [loading, setLoading] = useState(true);
   const [editDialogOpen, setEditDialogOpen] = useState(false);
@@ -66,6 +68,7 @@ export default function Resources() {
     const { data } = await supabase
       .from("resources")
       .select("*")
+      .eq("tenant_id", tenant!.id)
       .order("section_key");
 
     if (data) {
@@ -76,7 +79,7 @@ export default function Resources() {
 
   useEffect(() => {
     fetchResources();
-  }, []);
+  }, [tenant?.id]);
 
   const openEditDialog = (resource: Resource) => {
     setSelectedResource(resource);
@@ -115,7 +118,8 @@ export default function Resources() {
           file_url: null,
           file_type: null
         })
-        .eq("id", selectedResource.id);
+        .eq("id", selectedResource.id)
+        .eq("tenant_id", tenant!.id);
 
       if (error) throw error;
 

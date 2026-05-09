@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import { Check, Clock, User, Mail, Calendar, MessageSquare } from "lucide-react";
 import { format } from "date-fns";
+import { useTenant } from "@/context/TenantContext";
 
 interface UserQuery {
   id: string;
@@ -23,12 +24,14 @@ interface UserQuery {
 export function AdminQueryList() {
   const [queries, setQueries] = useState<UserQuery[]>([]);
   const [loading, setLoading] = useState(true);
+  const { tenant } = useTenant();
 
   const fetchQueries = async () => {
     setLoading(true);
     const { data, error } = await supabase
       .from("user_queries")
       .select("*")
+      .eq("tenant_id", tenant!.id)
       .order("created_at", { ascending: false });
 
     if (error) {
@@ -43,6 +46,7 @@ export function AdminQueryList() {
               .from("profiles")
               .select("name, email")
               .eq("id", query.user_id)
+              .eq("tenant_id", tenant!.id)
               .single();
 
             return {
@@ -70,12 +74,13 @@ export function AdminQueryList() {
       await supabase
         .from("user_queries")
         .delete()
+        .eq("tenant_id", tenant!.id)
         .eq("status", "resolved")
         .lt("resolved_at", twentyFourHoursAgo.toISOString());
     };
 
     cleanupOldQueries();
-  }, []);
+  }, [tenant?.id]);
 
   const handleMarkResolved = async (queryId: string) => {
     const { error } = await supabase
@@ -84,7 +89,8 @@ export function AdminQueryList() {
         status: "resolved",
         resolved_at: new Date().toISOString(),
       })
-      .eq("id", queryId);
+      .eq("id", queryId)
+      .eq("tenant_id", tenant!.id);
 
     if (error) {
       console.error("Error updating query:", error);

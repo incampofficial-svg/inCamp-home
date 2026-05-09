@@ -1,5 +1,7 @@
 import { Link } from "react-router-dom";
 import { Mail, MapPin } from "lucide-react";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 const quickLinks = [
   { name: "Problem Statements", path: "/problems" },
@@ -10,6 +12,9 @@ const quickLinks = [
 ];
 
 export function Footer() {
+  const { tenant } = useTenant();
+  const slug = tenant?.slug || "";
+
   return (
     <footer className="bg-primary text-primary-foreground">
       <div className="container mx-auto px-4 py-12 lg:py-16">
@@ -34,7 +39,7 @@ export function Footer() {
               {quickLinks.map((link) => (
                 <li key={link.path}>
                   <Link
-                    to={link.path}
+                    to={tenantPath(slug, link.path)}
                     className="text-primary-foreground/80 hover:text-secondary transition-colors text-sm"
                   >
                     {link.name}

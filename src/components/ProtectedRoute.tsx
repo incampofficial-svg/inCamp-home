@@ -1,5 +1,7 @@
 import { Navigate, useLocation } from "react-router-dom";
 import { useAuth } from "@/contexts/AuthContext";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 interface ProtectedRouteProps {
   children: React.ReactNode;
@@ -7,6 +9,7 @@ interface ProtectedRouteProps {
 
 export function ProtectedRoute({ children }: ProtectedRouteProps) {
   const { user, loading } = useAuth();
+  const { tenant } = useTenant();
   const location = useLocation();
 
   if (loading) {
@@ -24,7 +27,7 @@ export function ProtectedRoute({ children }: ProtectedRouteProps) {
 
   if (!user) {
     // Redirect to auth page, preserving the intended destination
-    return <Navigate to="/auth" state={{ from: location }} replace />;
+    return <Navigate to={tenantPath(tenant!.slug, "/auth")} state={{ from: location }} replace />;
   }
 
   return <>{children}</>;

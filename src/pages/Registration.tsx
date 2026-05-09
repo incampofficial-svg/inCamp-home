@@ -7,6 +7,8 @@ import { useToast } from "@/hooks/use-toast";
 import { useAuth } from "@/contexts/AuthContext";
 import { useAdmin } from "@/hooks/useAdmin";
 import { supabase } from "@/integrations/supabase/client";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 // Per-member field shape
 interface MemberFields {
@@ -31,6 +33,7 @@ export default function Registration() {
   const { toast } = useToast();
   const { user } = useAuth();
   const { isAdmin } = useAdmin();
+  const { tenant } = useTenant();
   const navigate = useNavigate();
   const [isSubmitted, setIsSubmitted] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -56,6 +59,7 @@ export default function Registration() {
         const { data, error } = await supabase
           .from("contest_settings")
           .select("problems_unlock_at")
+          .eq("tenant_id", tenant!.id)
           .single();
 
         if (error) throw error;
@@ -79,7 +83,7 @@ export default function Registration() {
     };
 
     fetchUnlockTime();
-  }, [isAdmin]);
+  }, [isAdmin, tenant?.id]);
 
   useEffect(() => {
     if (!unlockTime || isUnlocked) return;
@@ -131,6 +135,7 @@ export default function Registration() {
         .from("problem_statements")
         .select("id, max_registrations, curr_registrations")
         .eq("problem_statement_id", id)
+        .eq("tenant_id", tenant!.id)
         .single();
 
       if (error || !data) {
@@ -200,8 +205,8 @@ export default function Registration() {
   };
 
   const handleLoginRedirect = () => {
-    localStorage.setItem("redirectAfterLogin", "/registration");
-    navigate("/auth");
+    localStorage.setItem("redirectAfterLogin", tenantPath(tenant!.slug, "/registration"));
+    navigate(tenantPath(tenant!.slug, "/auth"));
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -236,6 +241,7 @@ export default function Registration() {
       .from("problem_statements")
       .select("max_registrations, curr_registrations")
       .eq("id", resolvedUuid)
+      .eq("tenant_id", tenant!.id)
       .single();
 
     if (livePS) {
@@ -266,8 +272,12 @@ export default function Registration() {
       }
 
       // Check if team name already exists
-      const { data: teamExists, error: checkError } = await supabase
-        .rpc("check_team_name_exists", { team_name_input: teamName.trim() });
+      const { data: teamExists, error: checkError } = await (supabase as any)
+        .from("team_registrations")
+        .select("id")
+        .eq("tenant_id", tenant!.id)
+        .eq("team_name", teamName.trim())
+        .maybeSingle();
 
       if (checkError) {
         toast({
@@ -316,6 +326,7 @@ export default function Registration() {
         .from("team_registrations")
         .insert({
           user_id: authUser.id,
+          tenant_id: tenant!.id,
           team_name: teamName,
           problem_id: problemId,
           // Member 1

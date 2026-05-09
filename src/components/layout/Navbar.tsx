@@ -4,26 +4,31 @@ import { Menu, X, LogIn, LogOut, User, Shield } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
 import { useAdmin } from "@/hooks/useAdmin";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 export function Navbar() {
   const [isOpen, setIsOpen] = useState(false);
   const location = useLocation();
   const { user, signOut } = useAuth();
   const { isAdmin } = useAdmin();
+  const { tenant } = useTenant();
+  const slug = tenant?.slug || "";
+  const path = (value: string) => tenantPath(slug, value);
 
   const navLinks = [
-    { name: "Home", path: "/" },
-    { name: "About Us", path: "/about" },
-    { name: "Events", path: "/events" },
-    { name: "Problem Statements", path: "/problems" },
-    { name: "Resources", path: "/resources" },
+    { name: "Home", path: path("/") },
+    { name: "About Us", path: path("/about") },
+    { name: "Events", path: path("/events") },
+    { name: "Problem Statements", path: path("/problems") },
+    { name: "Resources", path: path("/resources") },
     ...(isAdmin
       ? [
-          { name: "Dashboard", path: "/admin" },
-          { name: "Departments", path: "/departments" },
+          { name: "Dashboard", path: path("/admin") },
+          { name: "Departments", path: path("/departments") },
         ]
-      : [{ name: "Registration", path: "/registration" }]),
-    { name: "Contact", path: "/contact" },
+      : [{ name: "Registration", path: path("/registration") }]),
+    { name: "Contact", path: path("/contact") },
   ];
 
   const handleSignOut = async () => {
@@ -38,7 +43,7 @@ export function Navbar() {
         {/* ================= TOP ROW ================= */}
         <div className="h-14 flex items-center justify-between">
           {/* Logo */}
-          <Link to="/" className="flex items-center gap-2 shrink-0">
+          <Link to={path("/")} className="flex items-center gap-2 shrink-0">
             <img
               src="/favicon.png"
               alt="inCamp Logo"
@@ -69,7 +74,7 @@ export function Navbar() {
               </>
             ) : (
               <Button asChild variant="orange" size="sm">
-                <Link to="/auth">
+                <Link to={path("/auth")}>
                   <LogIn className="w-4 h-4 mr-1" />
                   Login
                 </Link>
@@ -148,7 +153,7 @@ export function Navbar() {
                   className="mx-4"
                   onClick={() => setIsOpen(false)}
                 >
-                  <Link to="/auth">
+                  <Link to={path("/auth")}>
                     <LogIn className="w-4 h-4 mr-1" />
                     Login / Sign Up
                   </Link>

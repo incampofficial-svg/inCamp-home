@@ -7,6 +7,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/integrations/supabase/client";
 import { useAdmin } from "@/hooks/useAdmin";
 import { toast } from "sonner";
+import { useTenant } from "@/context/TenantContext";
 
 interface Coordinator {
   role: string;
@@ -23,6 +24,7 @@ interface GeneralInfo {
 
 export default function Contact() {
   const { isAdmin } = useAdmin();
+  const { tenant } = useTenant();
   const [coordinators, setCoordinators] = useState<Coordinator[]>([]);
   const [generalInfo, setGeneralInfo] = useState<GeneralInfo>({
     email: "",
@@ -43,15 +45,16 @@ export default function Contact() {
 
   useEffect(() => {
     fetchContent();
-  }, []);
+  }, [tenant?.id]);
 
   const fetchContent = async () => {
     setLoading(true);
     
-    const { data } = await supabase
+    const { data } = await (supabase as any)
       .from("page_content")
       .select("*")
-      .eq("page_name", "contact");
+      .eq("page_name", "contact")
+      .eq("tenant_id", tenant!.id);
 
     if (data) {
       const coordData = data.find((d) => d.section_key === "coordinators");
@@ -79,17 +82,19 @@ export default function Contact() {
   const handleSave = async () => {
     setSaving(true);
     try {
-      await supabase
+      await (supabase as any)
         .from("page_content")
         .update({ content: JSON.parse(JSON.stringify(editCoordinators)), updated_at: new Date().toISOString() })
         .eq("page_name", "contact")
-        .eq("section_key", "coordinators");
+        .eq("section_key", "coordinators")
+        .eq("tenant_id", tenant!.id);
 
-      await supabase
+      await (supabase as any)
         .from("page_content")
         .update({ content: JSON.parse(JSON.stringify(editGeneralInfo)), updated_at: new Date().toISOString() })
         .eq("page_name", "contact")
-        .eq("section_key", "general_info");
+        .eq("section_key", "general_info")
+        .eq("tenant_id", tenant!.id);
 
       setCoordinators(editCoordinators);
       setGeneralInfo(editGeneralInfo);

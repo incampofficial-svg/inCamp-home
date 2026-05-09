@@ -6,6 +6,8 @@ import { Button } from "@/components/ui/button";
 import { useAuth } from "@/contexts/AuthContext";
 import { Layout } from "@/components/layout/Layout";
 import { toast } from "sonner";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 interface Event {
   id: string;
@@ -19,6 +21,7 @@ export default function EventRegister() {
   const { id: eventId } = useParams();
   const navigate = useNavigate();
   const { user, loading: authLoading } = useAuth();
+  const { tenant } = useTenant();
 
   const [event, setEvent] = useState<Event | null>(null);
   const [alreadyRegistered, setAlreadyRegistered] = useState(false);
@@ -32,7 +35,7 @@ export default function EventRegister() {
     // Check authentication first
     if (!user) {
       toast.error("Authentication Required — Please log in to register for this event.");
-      navigate("/auth");
+      navigate(tenantPath(tenant!.slug, "/auth"));
       return;
     }
 
@@ -40,7 +43,7 @@ export default function EventRegister() {
 
     fetchEvent();
     checkRegistration();
-  }, [user, authLoading, eventId, navigate]);
+  }, [user, authLoading, eventId, navigate, tenant?.slug]);
 
 
   const fetchEvent = async () => {
@@ -48,6 +51,7 @@ export default function EventRegister() {
       .from("events")
       .select("id, title, description, event_date, location")
       .eq("id", eventId)
+      .eq("tenant_id", tenant!.id)
       .single();
 
     setEvent(data);
@@ -61,7 +65,8 @@ export default function EventRegister() {
       const { data: allUserRegistrations, error: fetchError } = await supabase
         .from("event_registrations")
         .select("*")
-        .eq("user_id", user?.id);
+        .eq("user_id", user?.id)
+        .eq("tenant_id", tenant!.id);
 
       console.log("All user registrations:", allUserRegistrations, "error:", fetchError);
 
@@ -71,6 +76,7 @@ export default function EventRegister() {
         .select("id")
         .eq("event_id", eventId)
         .eq("user_id", user?.id)
+        .eq("tenant_id", tenant!.id)
         .maybeSingle();
 
       console.log("Specific event registration check - data:", data, "error:", error);
@@ -92,12 +98,13 @@ export default function EventRegister() {
     setSubmitting(true);
 
     const { error } = await supabase.from("event_registrations").insert({
+      tenant_id: tenant!.id,
       event_id: eventId,
       user_id: user?.id,
     });
 
     if (!error) {
-      navigate(`/events/${eventId}`);
+      navigate(tenantPath(tenant!.slug, `/events/${eventId}`));
     }
 
     setSubmitting(false);

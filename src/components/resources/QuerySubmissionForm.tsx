@@ -7,9 +7,11 @@ import { supabase } from "@/integrations/supabase/client";
 import { useAuth } from "@/contexts/AuthContext";
 import { toast } from "sonner";
 import { Send, HelpCircle } from "lucide-react";
+import { useTenant } from "@/context/TenantContext";
 
 export function QuerySubmissionForm() {
   const { user } = useAuth();
+  const { tenant } = useTenant();
   const [queryText, setQueryText] = useState("");
   const [email, setEmail] = useState("");
   const [name, setName] = useState("");
@@ -31,6 +33,7 @@ export function QuerySubmissionForm() {
     setSubmitting(true);
 
     const { error } = await supabase.from("user_queries").insert({
+      tenant_id: tenant!.id,
       query_text: queryText.trim(),
       user_id: user?.id || null,
       user_email: user?.email || email.trim() || null,

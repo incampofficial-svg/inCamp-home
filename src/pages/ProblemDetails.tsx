@@ -4,6 +4,8 @@ import { Layout } from "@/components/layout/Layout";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import { ArrowLeft, FileText, Tag, Layers } from "lucide-react";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 interface ProblemStatement {
   id: string;
@@ -17,6 +19,7 @@ interface ProblemStatement {
 
 export default function ProblemDetails() {
   const { id } = useParams<{ id: string }>();
+  const { tenant } = useTenant();
   const [problem, setProblem] = useState<ProblemStatement | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -35,6 +38,7 @@ export default function ProblemDetails() {
         .from("problem_statements")
         .select("*")
         .eq("problem_statement_id", id)
+        .eq("tenant_id", tenant!.id)
         .maybeSingle();
 
       if (cancelled) return;
@@ -63,6 +67,7 @@ export default function ProblemDetails() {
           .from("problem_statements")
           .select("*")
           .eq("id", id)
+          .eq("tenant_id", tenant!.id)
           .maybeSingle();
 
         if (cancelled) return;
@@ -88,7 +93,7 @@ export default function ProblemDetails() {
     return () => {
       cancelled = true;
     };
-  }, [id]);
+  }, [id, tenant?.id]);
 
   const getThemeColor = (theme: string) => {
     switch (theme) {
@@ -133,7 +138,7 @@ export default function ProblemDetails() {
               The problem statement you're looking for doesn't exist or has been removed.
             </p>
             <Button asChild variant="orange">
-              <Link to="/problems">
+              <Link to={tenantPath(tenant!.slug, "/problems")}>
                 <ArrowLeft className="w-4 h-4 mr-2" />
                 Back to Problems
               </Link>
@@ -154,7 +159,7 @@ export default function ProblemDetails() {
             variant="ghost"
             className="text-primary-foreground/80 hover:text-primary-foreground hover:bg-primary-foreground/10 mb-4"
           >
-            <Link to="/problems">
+            <Link to={tenantPath(tenant!.slug, "/problems")}>
               <ArrowLeft className="w-4 h-4 mr-2" />
               Back to Problem Statements
             </Link>
@@ -234,13 +239,13 @@ export default function ProblemDetails() {
           {/* Action Buttons */}
           <div className="mt-8 flex flex-wrap gap-4 justify-center">
             <Button asChild variant="outline" size="lg">
-              <Link to="/problems">
+              <Link to={tenantPath(tenant!.slug, "/problems")}>
                 <ArrowLeft className="w-4 h-4 mr-2" />
                 Browse More Problems
               </Link>
             </Button>
             <Button asChild variant="orange" size="lg">
-              <Link to="/registration">
+              <Link to={tenantPath(tenant!.slug, "/registration")}>
                 Register Your Team
               </Link>
             </Button>

@@ -8,6 +8,7 @@ import { ProblemFormDialog } from "@/components/admin/ProblemFormDialog";
 import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { toast } from "sonner";
+import { useTenant } from "@/context/TenantContext";
 
 interface ProblemRow {
   id: string;
@@ -31,6 +32,7 @@ export default function DepartmentsPage() {
   const [selectedTheme, setSelectedTheme] = useState<string>("All");
   const [selectedDept, setSelectedDept] = useState<string>("All");
   const { isAdmin } = useAdmin();
+  const { tenant } = useTenant();
 
   const [formOpen, setFormOpen] = useState(false);
   const [selected, setSelected] = useState<ProblemRow | null>(null);
@@ -49,8 +51,8 @@ export default function DepartmentsPage() {
   const fetch = async () => {
     setLoading(true);
     const [{ data: problemsData, error: problemsError }, { data: regsData }] = await Promise.all([
-      supabase.from("problem_statements").select("*").eq("status", "pending_review").order("created_at", { ascending: false }),
-      supabase.from("team_registrations").select("department"),
+      supabase.from("problem_statements").select("*").eq("tenant_id", tenant!.id).eq("status", "pending_review").order("created_at", { ascending: false }),
+      (supabase as any).from("team_registrations").select("department").eq("tenant_id", tenant!.id),
     ]);
 
     if (problemsError) {
@@ -88,7 +90,7 @@ export default function DepartmentsPage() {
 
   useEffect(() => {
     fetch();
-  }, []);
+  }, [tenant?.id]);
 
   const openEdit = (p: ProblemRow) => {
     setSelected(p);
@@ -98,7 +100,11 @@ export default function DepartmentsPage() {
   const handleSave = async (data: Omit<ProblemRow, "id" | "created_at">) => {
     try {
       if (selected) {
-        const { error } = await supabase.from("problem_statements").update(data).eq("id", selected.id);
+        const { error } = await supabase
+          .from("problem_statements")
+          .update({ ...data, tenant_id: tenant!.id } as any)
+          .eq("id", selected.id)
+          .eq("tenant_id", tenant!.id);
         if (error) throw error;
         toast.success("Problem updated");
       }
@@ -144,7 +150,8 @@ export default function DepartmentsPage() {
       const { error: statusError } = await supabase
         .from("problem_statements")
         .update({ status: "revision_needed", approved_at: null })
-        .eq("id", rejectingProblem.id);
+        .eq("id", rejectingProblem.id)
+        .eq("tenant_id", tenant!.id);
 
       if (statusError) throw statusError;
 
@@ -174,7 +181,8 @@ export default function DepartmentsPage() {
       const { error } = await supabase
         .from("problem_statements")
         .update({ status: "approved", approved_at: new Date().toISOString(), max_registrations: limit } as any)
-        .eq("id", acceptingProblem.id);
+        .eq("id", acceptingProblem.id)
+        .eq("tenant_id", tenant!.id);
       if (error) throw error;
       toast.success("Problem accepted");
       setAcceptOpen(false);
@@ -194,7 +202,11 @@ export default function DepartmentsPage() {
         updateData.approved_at = null;
       }
 
-      const { error } = await supabase.from("problem_statements").update(updateData).eq("id", id);
+      const { error } = await supabase
+        .from("problem_statements")
+        .update(updateData)
+        .eq("id", id)
+        .eq("tenant_id", tenant!.id);
       if (error) throw error;
       toast.success("Status updated");
       fetch();
@@ -211,7 +223,11 @@ export default function DepartmentsPage() {
   const confirmDelete = async () => {
     if (!selected) return;
     try {
-      const { error } = await supabase.from("problem_statements").delete().eq("id", selected.id);
+      const { error } = await supabase
+        .from("problem_statements")
+        .delete()
+        .eq("id", selected.id)
+        .eq("tenant_id", tenant!.id);
       if (error) throw error;
       toast.success("Deleted");
       setDeleteOpen(false);

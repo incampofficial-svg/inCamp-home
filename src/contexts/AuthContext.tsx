@@ -6,7 +6,7 @@ interface AuthContextType {
   user: User | null;
   session: Session | null;
   loading: boolean;
-  signUp: (email: string, password: string, name: string) => Promise<{ error: Error | null }>;
+  signUp: (email: string, password: string, name: string, tenantId?: string) => Promise<{ error: Error | null }>;
   signIn: (email: string, password: string) => Promise<{ error: Error | null }>;
   signOut: () => Promise<void>;
 }
@@ -38,19 +38,39 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => subscription.unsubscribe();
   }, []);
 
-  const signUp = async (email: string, password: string, name: string) => {
-    const redirectUrl = `${window.location.origin}/`;
+  const signUp = async (email: string, password: string, name: string, tenantId?: string) => {
+    const redirectUrl = `${window.location.origin}${window.location.pathname}`;
 
-    const { error } = await supabase.auth.signUp({
+    const { data, error } = await supabase.auth.signUp({
       email,
       password,
       options: {
         emailRedirectTo: redirectUrl,
         data: {
           name: name,
+          tenant_id: tenantId,
         },
       },
     });
+
+    if (!error && data.user && tenantId) {
+      const { error: profileError } = await (supabase as any)
+        .from("profiles")
+        .upsert(
+          {
+            id: data.user.id,
+            email,
+            name,
+            tenant_id: tenantId,
+          },
+          { onConflict: "id" }
+        );
+
+      if (profileError) {
+        console.warn("Profile tenant assignment warning:", profileError.message);
+      }
+    }
+
     return { error: error as Error | null };
   };
 
@@ -78,7 +98,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setSession(null);
       // Cleanly redirect to login page (which is the root "/")
       // Using replace to prevent navigating back to a protected route
-      window.location.replace("/");
+      const tenantSlug = window.location.pathname.split("/").filter(Boolean)[0];
+      window.location.replace(tenantSlug ? `/${tenantSlug}` : "/");
     }
   };
 

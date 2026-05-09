@@ -10,6 +10,8 @@ import { Label } from "@/components/ui/label";
 import { useToast } from "@/hooks/use-toast";
 import { z } from "zod";
 import { Eye, EyeOff, LogIn, UserPlus } from "lucide-react";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 const DEPARTMENT_ADMIN_URL = "https://depart-admin-portal.vercel.app/dashboard";
 
@@ -68,8 +70,10 @@ export default function Auth() {
   const [errors, setErrors] = useState<Record<string, string>>({});
 
   const { user, session, signIn, signUp } = useAuth();
+  const { tenant } = useTenant();
   const navigate = useNavigate();
   const { toast } = useToast();
+  const homePath = tenantPath(tenant?.slug || "", "/");
 
   const routeUserAfterLogin = useCallback(async (
     userId: string,
@@ -116,8 +120,8 @@ export default function Auth() {
       return;
     }
 
-    void routeUserAfterLogin(user.id, "/");
-  }, [user, isPostLoginRouting, routeUserAfterLogin]);
+    void routeUserAfterLogin(user.id, homePath);
+  }, [user, isPostLoginRouting, routeUserAfterLogin, homePath]);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const { name, value } = e.target;
@@ -187,7 +191,7 @@ export default function Auth() {
             return;
           }
 
-          const redirectUrl = localStorage.getItem("redirectAfterLogin") || "/";
+          const redirectUrl = localStorage.getItem("redirectAfterLogin") || homePath;
           localStorage.removeItem("redirectAfterLogin");
           await routeUserAfterLogin(signedInUser.id, redirectUrl, signedInSession);
         }
@@ -206,9 +210,13 @@ export default function Auth() {
           return;
         }
 
-        // Check if email already exists in database
-        const { data: emailExists, error: checkError } = await supabase
-          .rpc('check_email_exists', { _email: formData.email });
+        // Check if email already exists in this tenant's profile records.
+        const { data: emailExists, error: checkError } = await (supabase as any)
+          .from("profiles")
+          .select("id")
+          .eq("tenant_id", tenant!.id)
+          .eq("email", formData.email)
+          .maybeSingle();
 
         if (checkError) {
           toast({
@@ -226,7 +234,7 @@ export default function Auth() {
           return;
         }
 
-        const { error } = await signUp(formData.email, formData.password, formData.name);
+        const { error } = await signUp(formData.email, formData.password, formData.name, tenant?.id);
         if (error) {
           // Handle specific error messages
           if (error.message.includes("already registered")) {
@@ -305,7 +313,7 @@ export default function Auth() {
                   </Button>
                   <Button
                     onClick={async () => {
-                      const { error } = await signUp(formData.email, formData.password, formData.name);
+                      const { error } = await signUp(formData.email, formData.password, formData.name, tenant?.id);
                       if (error) {
                         toast({
                           title: "Error",

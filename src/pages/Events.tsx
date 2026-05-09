@@ -9,6 +9,8 @@ import { useAdmin } from "@/hooks/useAdmin";
 import { EventFormDialog } from "@/components/admin/EventFormDialog";
 import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
 import { toast } from "sonner";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 interface Event {
   id: string;
@@ -31,6 +33,7 @@ export default function EventsPage() {
   const [loading, setLoading] = useState(true);
   const navigate = useNavigate();
   const { isAdmin } = useAdmin();
+  const { tenant } = useTenant();
 
   // Admin state
   const [formOpen, setFormOpen] = useState(false);
@@ -40,12 +43,13 @@ export default function EventsPage() {
 
   useEffect(() => {
     fetchEvents();
-  }, []);
+  }, [tenant?.id]);
 
   const fetchEvents = async () => {
     const { data, error } = await (supabase as any)
       .from("events")
       .select("*")
+      .eq("tenant_id", tenant!.id)
       .order("event_date", { ascending: true });
 
     if (!error && data) setEvents(data as Event[]);
@@ -59,15 +63,16 @@ export default function EventsPage() {
         // Update existing
         const { error } = await (supabase as any)
           .from("events")
-          .update(data)
-          .eq("id", selectedEvent.id);
+          .update({ ...data, tenant_id: tenant!.id })
+          .eq("id", selectedEvent.id)
+          .eq("tenant_id", tenant!.id);
         if (error) throw error;
         toast.success("Event updated");
       } else {
         // Create new
         const { error } = await (supabase as any)
           .from("events")
-          .insert([data]);
+          .insert([{ ...data, tenant_id: tenant!.id }]);
         if (error) throw error;
         toast.success("Event created");
       }
@@ -88,7 +93,8 @@ export default function EventsPage() {
       const { error } = await (supabase as any)
         .from("events")
         .delete()
-        .eq("id", selectedEvent.id);
+        .eq("id", selectedEvent.id)
+        .eq("tenant_id", tenant!.id);
       if (error) throw error;
       toast.success("Event deleted");
       setDeleteOpen(false);
@@ -245,7 +251,7 @@ export default function EventsPage() {
                         <Button
                           variant="orange"
                           size="sm"
-                          onClick={() => navigate(`/events/${event.id}/register`)}
+                          onClick={() => navigate(tenantPath(tenant!.slug, `/events/${event.id}/register`))}
                         >
                           Register Now
                         </Button>
@@ -253,7 +259,7 @@ export default function EventsPage() {
                       <Button
                         variant="outline"
                         size="sm"
-                        onClick={() => navigate(`/events/${event.id}`)}
+                        onClick={() => navigate(tenantPath(tenant!.slug, `/events/${event.id}`))}
                       >
                         View Details
                       </Button>

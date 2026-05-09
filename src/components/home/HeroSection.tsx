@@ -2,8 +2,11 @@ import { Link } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { ArrowRight, FileText } from "lucide-react";
 import { useState, useEffect } from "react";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 export function HeroSection({ frontImage, backImage }: { frontImage: string; backImage: string }) {
+  const { tenant } = useTenant();
   const [currentImageIndex, setCurrentImageIndex] = useState(0);
   const images = [
     "/BackgroundSlider1.jpeg",
@@ -63,13 +66,13 @@ export function HeroSection({ frontImage, backImage }: { frontImage: string; bac
 
             <div className="flex flex-col sm:flex-row gap-4 justify-center lg:justify-start animate-fade-in-up animation-delay-200">
               <Button asChild variant="orange" size="xl">
-                <Link to="/problems">
+                <Link to={tenantPath(tenant?.slug || "", "/problems")}>
                   <FileText className="w-5 h-5" />
                   View Problems
                 </Link>
               </Button>
               <Button asChild variant="orangeOutline" size="xl" className="border-primary-foreground/30 text-primary-foreground hover:bg-primary-foreground hover:text-primary">
-                <Link to="/registration">
+                <Link to={tenantPath(tenant?.slug || "", "/registration")}>
                   Apply Now
                   <ArrowRight className="w-5 h-5" />
                 </Link>

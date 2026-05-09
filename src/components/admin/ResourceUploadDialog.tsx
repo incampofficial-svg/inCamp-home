@@ -7,6 +7,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/integrations/supabase/client";
 import { Upload, X } from "lucide-react";
 import { toast } from "sonner";
+import { useTenant } from "@/context/TenantContext";
 
 interface Resource {
   id: string;
@@ -35,6 +36,7 @@ export function ResourceUploadDialog({
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const { tenant } = useTenant();
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
@@ -80,9 +82,11 @@ export function ResourceUploadDialog({
           description,
           file_url: fileUrl,
           file_type: fileType,
+          tenant_id: tenant!.id,
           updated_at: new Date().toISOString(),
         })
-        .eq("id", resource.id);
+        .eq("id", resource.id)
+        .eq("tenant_id", tenant!.id);
 
       if (updateError) throw updateError;
 

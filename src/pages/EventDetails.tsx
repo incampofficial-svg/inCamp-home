@@ -5,6 +5,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Calendar, Clock, MapPin } from "lucide-react";
 import { Layout } from "@/components/layout/Layout";
+import { useTenant } from "@/context/TenantContext";
 
 interface Event {
   id: string;
@@ -24,18 +25,20 @@ interface Event {
 export default function EventDetails() {
   const { id } = useParams();
   const navigate = useNavigate();
+  const { tenant } = useTenant();
   const [event, setEvent] = useState<Event | null>(null);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     fetchEvent();
-  }, [id]);
+  }, [id, tenant?.id]);
 
   const fetchEvent = async () => {
     const { data, error } = await supabase
       .from("events")
       .select("*")
       .eq("id", id)
+      .eq("tenant_id", tenant!.id)
       .single();
 
     if (!error) setEvent(data);

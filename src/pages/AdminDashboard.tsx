@@ -8,6 +8,8 @@ import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from "recha
 import { Button } from "@/components/ui/button";
 import { TeamFormDialog } from "@/components/admin/TeamFormDialog";
 import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
 
 interface Stats {
   totalProblems: number;
@@ -79,6 +81,7 @@ export default function AdminDashboard() {
   const [deleteAllConfirmDialogOpen, setDeleteAllConfirmDialogOpen] = useState(false);
   const [teamToDelete, setTeamToDelete] = useState<TeamRegistration | null>(null);
   const [problems, setProblems] = useState<ProblemStatement[]>([]);
+  const { tenant } = useTenant();
 
   // Helper function to recalculate statistics
   const recalculateStats = (teams: TeamRegistration[]) => {
@@ -118,6 +121,7 @@ export default function AdminDashboard() {
       const { data: problems, error: problemsError } = await supabase
         .from("problem_statements")
         .select("*")
+        .eq("tenant_id", tenant!.id)
         .order("problem_statement_id", { ascending: true });
 
       console.log("AdminDashboard - Fetched problems:", problems);
@@ -139,7 +143,8 @@ export default function AdminDashboard() {
       // Fetch team registrations per problem
       const { data: registrations, error: regError } = await (supabase as any)
         .from("team_registrations")
-        .select("problem_id");
+        .select("problem_id")
+        .eq("tenant_id", tenant!.id);
 
       if (regError) {
         console.error("Error fetching registrations:", regError);
@@ -175,7 +180,8 @@ export default function AdminDashboard() {
       // Fetch all team registrations with problem details
       const { data: teamRegs, error: teamError } = await (supabase as any)
         .from("team_registrations")
-        .select("*");
+        .select("*")
+        .eq("tenant_id", tenant!.id);
 
       if (teamError) {
         console.error("Error fetching team registrations:", teamError);
@@ -207,7 +213,7 @@ export default function AdminDashboard() {
     };
 
     fetchStats();
-  }, []);
+  }, [tenant?.id]);
 
   // Filter and sort teams
   useEffect(() => {
@@ -252,6 +258,7 @@ export default function AdminDashboard() {
       const { data: problemsData, error } = await supabase
         .from("problem_statements")
         .select("problem_statement_id, title, theme")
+        .eq("tenant_id", tenant!.id)
         .order("problem_statement_id", { ascending: true });
 
       if (!error && problemsData) {
@@ -260,7 +267,7 @@ export default function AdminDashboard() {
     };
 
     fetchProblems();
-  }, []);
+  }, [tenant?.id]);
 
   const handleEditTeam = (team: TeamRegistration) => {
     setSelectedTeam(team);
@@ -301,7 +308,11 @@ export default function AdminDashboard() {
       }
 
       console.log("Deleting team record from database...");
-      const { error } = await (supabase as any).from("team_registrations").delete().eq("id", teamToDelete.id);
+      const { error } = await (supabase as any)
+        .from("team_registrations")
+        .delete()
+        .eq("id", teamToDelete.id)
+        .eq("tenant_id", tenant!.id);
 
       if (error) {
         console.error("Error deleting team from database:", error);
@@ -324,7 +335,8 @@ export default function AdminDashboard() {
       // First, fetch all teams to get their document URLs
       const { data: allTeams, error: fetchError } = await (supabase as any)
         .from("team_registrations")
-        .select("document_url");
+        .select("document_url")
+        .eq("tenant_id", tenant!.id);
 
       if (fetchError) {
         console.error("Error fetching teams for deletion:", fetchError);
@@ -355,7 +367,11 @@ export default function AdminDashboard() {
       }
 
       // Delete all team records from database
-      const { error } = await (supabase as any).from("team_registrations").delete().neq("id", "00000000-0000-0000-0000-000000000000");
+      const { error } = await (supabase as any)
+        .from("team_registrations")
+        .delete()
+        .eq("tenant_id", tenant!.id)
+        .neq("id", "00000000-0000-0000-0000-000000000000");
 
       if (error) throw error;
 
@@ -373,8 +389,9 @@ export default function AdminDashboard() {
         // Update existing team
         const { error } = await (supabase as any)
           .from("team_registrations")
-          .update(data)
-          .eq("id", selectedTeam.id);
+          .update({ ...data, tenant_id: tenant!.id })
+          .eq("id", selectedTeam.id)
+          .eq("tenant_id", tenant!.id);
 
         if (error) throw error;
 
@@ -826,7 +843,7 @@ export default function AdminDashboard() {
                 </h2>
                 <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
                   <Link
-                    to="/problems"
+                    to={tenantPath(tenant!.slug, "/problems")}
                     className="p-4 rounded-lg border border-border hover:border-secondary hover:bg-accent/50 transition-all"
                   >
                     <FileText className="w-6 h-6 text-secondary mb-2" />
@@ -834,7 +851,7 @@ export default function AdminDashboard() {
                     <p className="text-sm text-muted-foreground">Add, edit or delete problem statements</p>
                   </Link>
                   <Link
-                    to="/events"
+                    to={tenantPath(tenant!.slug, "/events")}
                     className="p-4 rounded-lg border border-border hover:border-secondary hover:bg-accent/50 transition-all"
                   >
                     <Calendar className="w-6 h-6 text-secondary mb-2" />
@@ -842,7 +859,7 @@ export default function AdminDashboard() {
                     <p className="text-sm text-muted-foreground">Add, edit or delete events</p>
                   </Link>
                   <Link
-                    to="/resources"
+                    to={tenantPath(tenant!.slug, "/resources")}
                     className="p-4 rounded-lg border border-border hover:border-secondary hover:bg-accent/50 transition-all"
                   >
                     <FileText className="w-6 h-6 text-secondary mb-2" />
