@@ -272,11 +272,12 @@ export default function Registration() {
         return;
       }
 
-      // Check if team name already exists
+      // Check if team name already exists for this tenant
       const { data: teamExists, error: checkError } = await (supabase as any)
         .from("team_registrations")
         .select("id")
         .eq("team_name", teamName.trim())
+        .eq("tenant_id", tenant!.id)
         .maybeSingle();
 
       if (checkError) {
