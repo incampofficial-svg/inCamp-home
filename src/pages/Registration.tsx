@@ -9,6 +9,7 @@ import { useAdmin } from "@/hooks/useAdmin";
 import { supabase } from "@/integrations/supabase/client";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
+import { fetchProblemsUnlockAt } from "@/lib/contestSettings";
 
 // Per-member field shape
 interface MemberFields {
@@ -56,15 +57,13 @@ export default function Registration() {
   useEffect(() => {
     const fetchUnlockTime = async () => {
       try {
-        const { data, error } = await supabase
-          .from("contest_settings")
-          .select("problems_unlock_at")
-          .eq("tenant_id", tenant!.id)
-          .single();
+        const unlockDate = await fetchProblemsUnlockAt();
 
-        if (error) throw error;
+        if (!unlockDate) {
+          setIsUnlocked(true);
+          return;
+        }
 
-        const unlockDate = new Date(data.problems_unlock_at);
         setUnlockTime(unlockDate);
 
         if (isAdmin) {
@@ -131,12 +130,14 @@ export default function Registration() {
     if (!id) return { error: "", uuid: null };
 
     try {
-      const { data, error } = await supabase
+      let q: any = supabase
         .from("problem_statements")
         .select("id, max_registrations, curr_registrations")
-        .eq("problem_statement_id", id)
-        .eq("tenant_id", tenant!.id)
-        .single();
+        .eq("problem_statement_id", id);
+
+      if (tenant?.id) q = q.eq("tenant_id", tenant.id);
+
+      const { data, error } = await q.single();
 
       if (error || !data) {
         setProblemLimitInfo(null);
@@ -241,7 +242,7 @@ export default function Registration() {
       .from("problem_statements")
       .select("max_registrations, curr_registrations")
       .eq("id", resolvedUuid)
-      .eq("tenant_id", tenant!.id)
+      .eq("tenant_id", tenant?.id)
       .single();
 
     if (livePS) {
@@ -275,7 +276,6 @@ export default function Registration() {
       const { data: teamExists, error: checkError } = await (supabase as any)
         .from("team_registrations")
         .select("id")
-        .eq("tenant_id", tenant!.id)
         .eq("team_name", teamName.trim())
         .maybeSingle();
 
@@ -326,7 +326,6 @@ export default function Registration() {
         .from("team_registrations")
         .insert({
           user_id: authUser.id,
-          tenant_id: tenant!.id,
           team_name: teamName,
           problem_id: problemId,
           // Member 1
@@ -360,6 +359,7 @@ export default function Registration() {
           // Document
           document_url: documentUrl,
           document_filename: selectedFile ? selectedFile.name : null,
+          tenant_id: tenant?.id,
         });
 
       if (insertError) {

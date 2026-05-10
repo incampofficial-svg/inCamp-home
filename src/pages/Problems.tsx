@@ -11,6 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/u
 import { toast } from "sonner";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
+import { fetchProblemsUnlockAt } from "@/lib/contestSettings";
 
 const themes = [
   {
@@ -81,12 +82,15 @@ export default function Problems() {
     let query = supabase
       .from("problem_statements")
       .select("*")
-      .eq("tenant_id", tenant!.id)
-      .not("approved_at", "is", null)
       .order("problem_statement_id", { ascending: true });
 
     if (!isAdmin) {
       query = query.eq("status", "approved");
+    }
+
+    // Ensure we only fetch problem statements for the current tenant
+    if (tenant?.id) {
+      query = query.eq("tenant_id", tenant.id);
     }
 
     const { data, error: fetchError } = await query;
@@ -108,15 +112,13 @@ export default function Problems() {
   useEffect(() => {
     const fetchUnlockTime = async () => {
       try {
-        const { data, error } = await supabase
-          .from("contest_settings")
-          .select("problems_unlock_at")
-          .eq("tenant_id", tenant!.id)
-          .single();
+        const unlockDate = await fetchProblemsUnlockAt();
 
-        if (error) throw error;
+        if (!unlockDate) {
+          setIsUnlocked(true);
+          return;
+        }
 
-        const unlockDate = new Date(data.problems_unlock_at);
         setUnlockTime(unlockDate);
 
         if (isAdmin) {
@@ -200,7 +202,6 @@ export default function Problems() {
         category,
         theme,
         department_id: department_id,
-        tenant_id: tenant!.id,
       };
 
       if (selectedProblem) {
@@ -209,7 +210,7 @@ export default function Problems() {
           .from("problem_statements")
           .update(problemDataForSave)
           .eq("id", selectedProblem.id)
-          .eq("tenant_id", tenant!.id);
+          .eq("tenant_id", tenant?.id);
         if (error) throw error;
         toast.success("Problem statement updated");
       } else {
@@ -225,7 +226,7 @@ export default function Problems() {
               created_by: authData.user?.id,
               submitted_at: now,
               approved_at: now,
-              tenant_id: tenant!.id,
+              tenant_id: tenant?.id,
             },
           ]);
         if (error) throw error;
@@ -249,7 +250,7 @@ export default function Problems() {
         .from("problem_statements")
         .delete()
         .eq("id", selectedProblem.id)
-        .eq("tenant_id", tenant!.id);
+        .eq("tenant_id", tenant?.id);
       if (error) throw error;
       toast.success("Problem statement deleted");
       setDeleteOpen(false);

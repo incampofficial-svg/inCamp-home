@@ -34,12 +34,14 @@ export default function ProblemDetails() {
       setError(null);
 
       // Fetch by public-facing problem_statement_id first (e.g. "25001")
-      const byCode = await supabase
+      let byCodeQuery: any = supabase
         .from("problem_statements")
         .select("*")
-        .eq("problem_statement_id", id)
-        .eq("tenant_id", tenant!.id)
-        .maybeSingle();
+        .eq("problem_statement_id", id);
+
+      if (tenant?.id) byCodeQuery = byCodeQuery.eq("tenant_id", tenant.id);
+
+      const byCode = await byCodeQuery.maybeSingle();
 
       if (cancelled) return;
 
@@ -63,12 +65,14 @@ export default function ProblemDetails() {
         );
 
       if (isUuid) {
-        const byUuid = await supabase
+        let byUuidQuery: any = supabase
           .from("problem_statements")
           .select("*")
-          .eq("id", id)
-          .eq("tenant_id", tenant!.id)
-          .maybeSingle();
+          .eq("id", id);
+
+        if (tenant?.id) byUuidQuery = byUuidQuery.eq("tenant_id", tenant.id);
+
+        const byUuid = await byUuidQuery.maybeSingle();
 
         if (cancelled) return;
 
