@@ -16,6 +16,7 @@ import Resources from "./pages/Resources";
 import Registration from "./pages/Registration";
 import Contact from "./pages/Contact";
 import Auth from "./pages/Auth";
+import Profile from "./pages/Profile";
 import AdminDashboard from "./pages/AdminDashboard";
 import NotFound from "./pages/NotFound";
 import EventDetails from "./pages/EventDetails";
@@ -81,7 +82,7 @@ const App = () => (
                 path="admin"
                 element={
                   <ProtectedRoute>
-                    <AdminDashboard />
+                    <AdminDashboard/>
                   </ProtectedRoute>
                 }
               />

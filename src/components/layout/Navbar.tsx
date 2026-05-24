@@ -16,6 +16,15 @@ export function Navbar() {
   const slug = tenant?.slug || "";
   const path = (value: string) => tenantPath(slug, value);
 
+  const [profileOpen, setProfileOpen] = useState(false);
+
+  const username = user
+    ? (user.user_metadata?.full_name as string) ||
+      (user.user_metadata?.name as string) ||
+      user.email?.split("@")[0] ||
+      "User"
+    : "";
+
   const navLinks = [
     { name: "Home", path: path("/") },
     { name: "About Us", path: path("/about") },
@@ -24,8 +33,8 @@ export function Navbar() {
     { name: "Resources", path: path("/resources") },
     ...(isAdmin
       ? [
-          { name: "Dashboard", path: path("/admin") },
-          { name: "Departments", path: path("/departments") },
+          { name: "Dashboard", path: "/admin" },
+          { name: "Approvals", path: "/departments" },
         ]
       : [{ name: "Registration", path: path("/registration") }]),
     { name: "Contact", path: path("/contact") },
@@ -58,11 +67,18 @@ export function Navbar() {
           <div className="hidden md:flex items-center gap-3 whitespace-nowrap">
             {user ? (
               <>
-                <span className="flex items-center gap-1 text-sm text-muted-foreground max-w-[140px] truncate">
-                  {isAdmin && <Shield className="w-4 h-4 text-secondary" />}
-                  <User className="w-4 h-4" />
-                  {user.email?.split("@")[0]}
-                </span>
+                <Button
+                  asChild
+                  variant="ghost"
+                  size="sm"
+                  className="flex items-center gap-2 rounded-full border border-border px-3 py-2"
+                >
+                  <Link to="/profile">
+                    {isAdmin && <Shield className="w-4 h-4 text-secondary" />}
+                    <User className="w-4 h-4" />
+                    <span className="max-w-[140px] truncate text-sm">{username}</span>
+                  </Link>
+                </Button>
                 <Button
                   variant="outline"
                   size="sm"
@@ -135,8 +151,11 @@ export function Navbar() {
                   <div className="flex items-center gap-1 text-sm text-muted-foreground">
                     {isAdmin && <Shield className="w-4 h-4 text-secondary" />}
                     <User className="w-4 h-4" />
-                    {user.email}
+                    {username}
                   </div>
+                  <Button asChild variant="outline" className="w-full">
+                    <Link to="/profile">Profile</Link>
+                  </Button>
                   <Button
                     variant="outline"
                     className="w-full"
