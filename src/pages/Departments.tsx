@@ -141,6 +141,7 @@ export default function DepartmentsPage() {
             problem_statement_id: rejectingProblem.id,
             remark: remarkText,
             author_id: userId,
+            tenant_id: tenant!.id,
           },
           { onConflict: "problem_statement_id" }
         );

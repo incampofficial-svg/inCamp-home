@@ -58,6 +58,7 @@ const App = () => (
             <Route path="/contact" element={<LegacyTenantRedirect />} />
             <Route path="/departments" element={<LegacyTenantRedirect />} />
             <Route path="/admin" element={<LegacyTenantRedirect />} />
+            <Route path="/profile" element={<LegacyTenantRedirect />} />
             <Route path="/:tenantSlug" element={<TenantLayout />}>
               <Route index element={<Index />} />
               <Route path="about" element={<About />} />
@@ -71,9 +72,17 @@ const App = () => (
               <Route path="registration" element={<Registration />} />
               <Route path="contact" element={<Contact />} />
               <Route
-                path="departments"
+                path="profile"
                 element={
                   <ProtectedRoute>
+                    <Profile />
+                  </ProtectedRoute>
+                }
+              />
+              <Route
+                path="departments"
+                element={
+                  <ProtectedRoute requireAdmin>
                     <Departments />
                   </ProtectedRoute>
                 }
@@ -81,7 +90,7 @@ const App = () => (
               <Route
                 path="admin"
                 element={
-                  <ProtectedRoute>
+                  <ProtectedRoute requireAdmin>
                     <AdminDashboard/>
                   </ProtectedRoute>
                 }

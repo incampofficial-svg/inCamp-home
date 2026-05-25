@@ -1,9 +1,10 @@
 import { supabase } from "@/integrations/supabase/client";
 
-export async function fetchProblemsUnlockAt(): Promise<Date | null> {
+export async function fetchProblemsUnlockAt(tenantId: string): Promise<Date | null> {
   const { data, error } = await (supabase as any)
     .from("contest_settings")
     .select("problems_unlock_at")
+    .eq("tenant_id", tenantId)
     .limit(1)
     .maybeSingle();
 

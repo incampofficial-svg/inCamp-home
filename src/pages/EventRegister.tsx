@@ -61,22 +61,12 @@ export default function EventRegister() {
   const checkRegistration = async () => {
     console.log("Checking registration for eventId:", eventId, "userId:", user?.id);
     try {
-      // First, let's check if the table exists and get all records for this user
-      const { data: allUserRegistrations, error: fetchError } = await supabase
-        .from("event_registrations")
-        .select("*")
-        .eq("user_id", user?.id)
-        .eq("tenant_id", tenant!.id);
-
-      console.log("All user registrations:", allUserRegistrations, "error:", fetchError);
-
-      // Then check specifically for this event
+      // Check specifically for this event. The event row itself is tenant-filtered.
       const { data, error } = await supabase
         .from("event_registrations")
         .select("id")
         .eq("event_id", eventId)
         .eq("user_id", user?.id)
-        .eq("tenant_id", tenant!.id)
         .maybeSingle();
 
       console.log("Specific event registration check - data:", data, "error:", error);
@@ -98,7 +88,6 @@ export default function EventRegister() {
     setSubmitting(true);
 
     const { error } = await supabase.from("event_registrations").insert({
-      tenant_id: tenant!.id,
       event_id: eventId,
       user_id: user?.id,
     });
