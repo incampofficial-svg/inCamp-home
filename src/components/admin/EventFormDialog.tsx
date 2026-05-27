@@ -21,6 +21,7 @@ interface Event {
   organizer_name: string | null;
   organizer_contact: string | null;
   registration_deadline: string | null;
+  registration_link?: string | null;
   max_participants: number | null;
   is_active: boolean;
   image_url?: string | null;
@@ -50,6 +51,7 @@ export function EventFormDialog({
     mode: "",
     organizer_name: "",
     organizer_contact: "",
+    registration_link: "",
     registration_deadline: "",
     max_participants: "",
     is_active: true,
@@ -101,6 +103,7 @@ export function EventFormDialog({
         mode: event.mode || "",
         organizer_name: event.organizer_name || "",
         organizer_contact: event.organizer_contact || "",
+        registration_link: (event as any).registration_link || "",
         registration_deadline: formatDateForInput(event.registration_deadline || ""),
         max_participants:
           event.max_participants === null || event.max_participants === undefined
@@ -127,6 +130,7 @@ export function EventFormDialog({
         mode: "",
         organizer_name: "",
         organizer_contact: "",
+        registration_link: "",
         registration_deadline: "",
         max_participants: "",
         is_active: true,
@@ -150,6 +154,19 @@ export function EventFormDialog({
     // Validate event date
     if (formData.event_date < minDate) {
       toast.error("Event date and time cannot be in the past. Please select a future date and time.");
+      return;
+    }
+    // Validate registration link presence and basic URL format
+    if (!formData.registration_link || formData.registration_link.trim() === "") {
+      toast.error("Registration link is required.");
+      return;
+    }
+    try {
+      // basic URL validation
+      // eslint-disable-next-line no-new
+      new URL(formData.registration_link);
+    } catch (err) {
+      toast.error("Registration link must be a valid URL (include http:// or https://)");
       return;
     }
     if (
@@ -189,6 +206,7 @@ export function EventFormDialog({
         image_url: imageUrl,
         organizer_name: formData.organizer_name.trim() || null,
         organizer_contact: formData.organizer_contact.trim() || null,
+        registration_link: formData.registration_link?.trim() || null,
         registration_deadline: formData.registration_deadline || null,
         max_participants: formData.max_participants
           ? Number(formData.max_participants)
@@ -372,6 +390,16 @@ export function EventFormDialog({
               onCheckedChange={(checked) => setFormData({ ...formData, is_active: checked as boolean })}
             />
             <Label htmlFor="is_active">Active Event</Label>
+          </div>
+          <div>
+            <Label htmlFor="registration_link">Registration Link</Label>
+            <Input
+              id="registration_link"
+              value={formData.registration_link}
+              onChange={(e) => setFormData({ ...formData, registration_link: e.target.value })}
+              placeholder="https://example.com/register"
+              required
+            />
           </div>
           <div className="flex gap-2 justify-end pt-4">
             <Button type="button" variant="outline" onClick={() => onOpenChange(false)}>

@@ -71,3 +71,16 @@ Yes, you can!
 To connect a domain, navigate to Project > Settings > Domains and click Connect Domain.
 
 Read more here: [Setting up a custom domain](https://docs.lovable.dev/features/custom-domain#custom-domain)
+
+## Automated cleanup of expired events
+
+This repo includes a small script that removes events whose deadline has passed. It is intended to be run on a schedule (we provide a GitHub Actions workflow that runs daily).
+
+Required repository secrets (set in GitHub):
+
+- `SUPABASE_URL` — your Supabase project URL (e.g. https://abccompany.supabase.co)
+- `SUPABASE_SERVICE_ROLE_KEY` — your Supabase service role key (keep this secret)
+- `SUPABASE_EVENTS_DEADLINE_COLUMN` — optional; defaults to `deadline` if omitted
+
+The workflow file is `.github/workflows/cleanup-events.yml` and the script is `scripts/cleanup-events.mjs`.
+
