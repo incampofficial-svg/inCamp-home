@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Card, CardContent } from "@/components/ui/card";
 import { Edit, Save, X, Plus, Trash2, ImagePlus } from "lucide-react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { supabase } from "@/integrations/supabase/client";
 import { useAdmin } from "@/hooks/useAdmin";
 import { useTenant } from "@/context/TenantContext";
@@ -17,9 +18,15 @@ interface PageHeader {
   teamSubtitle: string;
 }
 
-interface PageDescription {
-  paragraphs: string[];
+interface DescriptiveBox {
+  id: string;
+  text: string;
+  fontSize: "sm" | "base" | "lg" | "xl" | "2xl";
   fontStyle: "default" | "serif" | "mono" | "italic";
+  fontWeight: "normal" | "semibold" | "bold";
+  textEffect: "none" | "shadow" | "highlight";
+  animation: "none" | "fadeIn" | "slideUp" | "bounce";
+  textColor?: string;
 }
 
 interface AboutCard {
@@ -37,13 +44,28 @@ const defaultHeader: PageHeader = {
   teamSubtitle: "Behind inCamp",
 };
 
-const defaultDescription: PageDescription = {
-  paragraphs: [
-    "inCamp is a student-driven innovation challenge designed to identify, analyse, and solve real-world problems within the campus ecosystem. We believe every challenge holds the seed of transformation.",
-    "Through our structured 5D Framework — Discover, Define, Design, Develop, and Deliver — participants journey from problem identification to prototype creation, gaining invaluable entrepreneurial skills along the way.",
-  ],
-  fontStyle: "default",
-};
+const defaultDescriptiveBoxes: DescriptiveBox[] = [
+  {
+    id: "box-1",
+    text: "inCamp is a student-driven innovation challenge designed to identify, analyse, and solve real-world problems within the campus ecosystem. We believe every challenge holds the seed of transformation.",
+    fontSize: "lg",
+    fontStyle: "default",
+    fontWeight: "normal",
+    textEffect: "none",
+    animation: "fadeIn",
+    textColor: "#0f172a",
+  },
+  {
+    id: "box-2",
+    text: "Through our structured 5D Framework — Discover, Define, Design, Develop, and Deliver — participants journey from problem identification to prototype creation, gaining invaluable entrepreneurial skills along the way.",
+    fontSize: "lg",
+    fontStyle: "default",
+    fontWeight: "normal",
+    textEffect: "none",
+    animation: "fadeIn",
+    textColor: "#0f172a",
+  },
+];
 
 const defaultTeamCards: AboutCard[] = [
   {
@@ -90,11 +112,38 @@ const defaultTeamCards: AboutCard[] = [
   },
 ];
 
-const fontClasses: Record<PageDescription["fontStyle"], string> = {
+const fontStyleClasses: Record<DescriptiveBox["fontStyle"], string> = {
   default: "",
   serif: "font-serif",
   mono: "font-mono",
   italic: "italic",
+};
+
+const fontSizeClasses: Record<DescriptiveBox["fontSize"], string> = {
+  sm: "text-sm",
+  base: "text-base",
+  lg: "text-lg",
+  xl: "text-xl",
+  "2xl": "text-2xl",
+};
+
+const fontWeightClasses: Record<DescriptiveBox["fontWeight"], string> = {
+  normal: "font-normal",
+  semibold: "font-semibold",
+  bold: "font-bold",
+};
+
+const textEffectClasses: Record<DescriptiveBox["textEffect"], string> = {
+  none: "",
+  shadow: "drop-shadow-lg",
+  highlight: "bg-yellow-200/30 px-2 py-1 rounded",
+};
+
+const animationClasses: Record<DescriptiveBox["animation"], string> = {
+  none: "",
+  fadeIn: "animate-fade-in",
+  slideUp: "animate-slide-up",
+  bounce: "animate-bounce",
 };
 
 export default function About() {
@@ -106,12 +155,13 @@ export default function About() {
   const [uploadingImage, setUploadingImage] = useState(false);
 
   const [header, setHeader] = useState<PageHeader>(defaultHeader);
-  const [description, setDescription] = useState<PageDescription>(defaultDescription);
+  const [descriptiveBoxes, setDescriptiveBoxes] = useState<DescriptiveBox[]>(defaultDescriptiveBoxes);
   const [teamCards, setTeamCards] = useState<AboutCard[]>(defaultTeamCards);
 
   const [editHeader, setEditHeader] = useState<PageHeader>(defaultHeader);
-  const [editDescription, setEditDescription] = useState<PageDescription>(defaultDescription);
+  const [editDescriptiveBoxes, setEditDescriptiveBoxes] = useState<DescriptiveBox[]>(defaultDescriptiveBoxes);
   const [editTeamCards, setEditTeamCards] = useState<AboutCard[]>(defaultTeamCards);
+  const [selectedCard, setSelectedCard] = useState<AboutCard | null>(null);
 
   useEffect(() => {
     fetchContent();
@@ -128,7 +178,7 @@ export default function About() {
 
       if (data) {
         const headerRow = data.find((row) => row.section_key === "header");
-        const descriptionRow = data.find((row) => row.section_key === "description");
+        const boxesRow = data.find((row) => row.section_key === "descriptive_boxes");
         const cardsRow = data.find((row) => row.section_key === "team_cards");
 
         if (headerRow) {
@@ -137,10 +187,12 @@ export default function About() {
           setEditHeader(parsed);
         }
 
-        if (descriptionRow) {
-          const parsed = typeof descriptionRow.content === "string" ? JSON.parse(descriptionRow.content) : descriptionRow.content;
-          setDescription(parsed);
-          setEditDescription(parsed);
+        if (boxesRow) {
+          const parsed = typeof boxesRow.content === "string" ? JSON.parse(boxesRow.content) : boxesRow.content;
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            setDescriptiveBoxes(parsed);
+            setEditDescriptiveBoxes(parsed);
+          }
         }
 
         if (cardsRow) {
@@ -172,8 +224,8 @@ export default function About() {
         },
         {
           page_name: "about",
-          section_key: "description",
-          content: editDescription,
+          section_key: "descriptive_boxes",
+          content: editDescriptiveBoxes,
           tenant_id: tenant!.id,
           updated_at: new Date().toISOString(),
         },
@@ -193,7 +245,7 @@ export default function About() {
       if (error) throw error;
 
       setHeader(editHeader);
-      setDescription(editDescription);
+      setDescriptiveBoxes(editDescriptiveBoxes);
       setTeamCards(editTeamCards);
       setEditing(false);
       toast.success("About page content updated successfully.");
@@ -207,9 +259,38 @@ export default function About() {
 
   const handleCancel = () => {
     setEditHeader(header);
-    setEditDescription(description);
+    setEditDescriptiveBoxes(descriptiveBoxes);
     setEditTeamCards(teamCards);
     setEditing(false);
+  };
+
+  const updateBoxField = (boxId: string, field: keyof DescriptiveBox, value: string | number) => {
+    setEditDescriptiveBoxes((current) =>
+      current.map((box) => (box.id === boxId ? { ...box, [field]: value } : box))
+    );
+  };
+
+  const removeBox = (boxId: string) => {
+    if (editDescriptiveBoxes.length > 1) {
+      setEditDescriptiveBoxes((current) => current.filter((box) => box.id !== boxId));
+    } else {
+      toast.error("You must keep at least one descriptive box.");
+    }
+  };
+
+  const addBox = () => {
+    setEditDescriptiveBoxes((current) => [
+      ...current,
+      {
+        id: crypto.randomUUID?.() || `${Date.now()}`,
+        text: "",
+        fontSize: "lg",
+        fontStyle: "default",
+        fontWeight: "normal",
+        textEffect: "none",
+        animation: "fadeIn",
+      },
+    ]);
   };
 
   const addTeamCard = () => {
@@ -272,7 +353,7 @@ export default function About() {
     );
   }
 
-  const descriptionClass = fontClasses[description.fontStyle];
+  
 
   return (
     <Layout>
@@ -292,21 +373,21 @@ export default function About() {
                       placeholder="Page heading"
                       className="bg-white text-foreground"
                     />
-                    <Textarea
-                      value={editHeader.subtitle}
-                      onChange={(e) => setEditHeader({ ...editHeader, subtitle: e.target.value })}
-                      placeholder="Page subtitle"
-                      className="min-h-[140px] bg-white text-foreground"
-                    />
                   </div>
                 ) : (
                   <>
                     <h2 className="mt-3 text-3xl lg:text-5xl font-poppins font-bold text-primary-foreground">
                       {header.title}
                     </h2>
-                    <div className={`mt-4 space-y-4 text-primary-foreground/80 text-lg leading-relaxed ${descriptionClass}`}>
-                      {description.paragraphs.map((paragraph, index) => (
-                        <p key={index}>{paragraph}</p>
+                    <div className="mt-8 space-y-6">
+                      {descriptiveBoxes.map((box) => (
+                        <div
+                          key={box.id}
+                          className={`${fontSizeClasses[box.fontSize]} ${fontStyleClasses[box.fontStyle]} ${fontWeightClasses[box.fontWeight]} ${textEffectClasses[box.textEffect]} ${animationClasses[box.animation]} leading-relaxed`}
+                          style={{ color: (box as any).textColor || undefined }}
+                        >
+                          {box.text}
+                        </div>
                       ))}
                     </div>
                   </>
@@ -336,53 +417,159 @@ export default function About() {
               </div>
 
               {editing && (
-                <div className="mt-10 bg-slate-50 rounded-3xl p-6 shadow-sm border border-slate-200">
-                  <h3 className="text-lg font-semibold text-foreground mb-4">Description Settings</h3>
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <div>
-                      <label className="block text-sm font-medium text-foreground mb-2">Paragraph 1</label>
-                      <Textarea
-                        value={editDescription.paragraphs[0] || ""}
-                        onChange={(e) =>
-                          setEditDescription((current) => ({
-                            ...current,
-                            paragraphs: [e.target.value, current.paragraphs[1] ?? ""],
-                          }))
-                        }
-                        className="min-h-[120px]"
-                      />
-                    </div>
-                    <div>
-                      <label className="block text-sm font-medium text-foreground mb-2">Paragraph 2</label>
-                      <Textarea
-                        value={editDescription.paragraphs[1] || ""}
-                        onChange={(e) =>
-                          setEditDescription((current) => ({
-                            ...current,
-                            paragraphs: [current.paragraphs[0] ?? "", e.target.value],
-                          }))
-                        }
-                        className="min-h-[120px]"
-                      />
-                    </div>
+                <div className="mt-10 bg-slate-50 rounded-3xl p-8 shadow-sm border border-slate-200">
+                  <div className="flex items-center justify-between mb-6">
+                    <h3 className="text-lg font-semibold text-foreground">Descriptive Boxes</h3>
+                    <Button onClick={addBox} variant="outline" size="sm">
+                      <Plus className="w-4 h-4 mr-2" />
+                      Add Box
+                    </Button>
                   </div>
-                  <div className="mt-4">
-                    <label className="block text-sm font-medium text-foreground mb-2">Font style for description</label>
-                    <select
-                      value={editDescription.fontStyle}
-                      onChange={(e) =>
-                        setEditDescription((current) => ({
-                          ...current,
-                          fontStyle: e.target.value as PageDescription["fontStyle"],
-                        }))
-                      }
-                      className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
-                    >
-                      <option value="default">Default</option>
-                      <option value="serif">Serif</option>
-                      <option value="mono">Monospace</option>
-                      <option value="italic">Italic</option>
-                    </select>
+
+                  <div className="space-y-8">
+                    {editDescriptiveBoxes.map((box, index) => (
+                      <div key={box.id} className="p-6 bg-white rounded-2xl border-2 border-slate-200 space-y-4">
+                        <div className="flex items-center justify-between mb-4">
+                          <h4 className="font-semibold text-foreground">Box {index + 1}</h4>
+                          {editDescriptiveBoxes.length > 1 && (
+                            <Button
+                              onClick={() => removeBox(box.id)}
+                              variant="outline"
+                              size="sm"
+                              className="text-red-600 hover:text-red-700"
+                            >
+                              <Trash2 className="w-4 h-4 mr-2" />
+                              Remove
+                            </Button>
+                          )}
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-medium text-foreground mb-2">
+                            Box Text
+                          </label>
+                          <Textarea
+                            value={box.text}
+                            onChange={(e) => updateBoxField(box.id, "text", e.target.value)}
+                            placeholder="Enter descriptive text..."
+                            className="min-h-[120px]"
+                          />
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="block text-sm font-medium text-foreground mb-2">
+                              Font Size
+                            </label>
+                            <select
+                              value={box.fontSize}
+                              onChange={(e) =>
+                                updateBoxField(box.id, "fontSize", e.target.value as DescriptiveBox["fontSize"])
+                              }
+                              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                            >
+                              <option value="sm">Small</option>
+                              <option value="base">Base</option>
+                              <option value="lg">Large</option>
+                              <option value="xl">Extra Large</option>
+                              <option value="2xl">2XL</option>
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-medium text-foreground mb-2">
+                              Font Weight
+                            </label>
+                            <select
+                              value={box.fontWeight}
+                              onChange={(e) =>
+                                updateBoxField(box.id, "fontWeight", e.target.value as DescriptiveBox["fontWeight"])
+                              }
+                              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                            >
+                              <option value="normal">Normal</option>
+                              <option value="semibold">Semi Bold</option>
+                              <option value="bold">Bold</option>
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-medium text-foreground mb-2">
+                              Font Style
+                            </label>
+                            <select
+                              value={box.fontStyle}
+                              onChange={(e) =>
+                                updateBoxField(box.id, "fontStyle", e.target.value as DescriptiveBox["fontStyle"])
+                              }
+                              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                            >
+                              <option value="default">Default</option>
+                              <option value="serif">Serif</option>
+                              <option value="mono">Monospace</option>
+                              <option value="italic">Italic</option>
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-medium text-foreground mb-2">
+                              Text Effect
+                            </label>
+                            <select
+                              value={box.textEffect}
+                              onChange={(e) =>
+                                updateBoxField(box.id, "textEffect", e.target.value as DescriptiveBox["textEffect"])
+                              }
+                              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                            >
+                              <option value="none">None</option>
+                              <option value="shadow">Drop Shadow</option>
+                              <option value="highlight">Highlight</option>
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-medium text-foreground mb-2">
+                              Animation
+                            </label>
+                            <select
+                              value={box.animation}
+                              onChange={(e) =>
+                                updateBoxField(box.id, "animation", e.target.value as DescriptiveBox["animation"])
+                              }
+                              className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                            >
+                              <option value="none">None</option>
+                              <option value="fadeIn">Fade In</option>
+                              <option value="slideUp">Slide Up</option>
+                              <option value="bounce">Bounce</option>
+                            </select>
+                          </div>
+
+                          <div>
+                            <label className="block text-sm font-medium text-foreground mb-2">Text Color</label>
+                            <input
+                              type="color"
+                              value={box.textColor || "#0f172a"}
+                              onChange={(e) => updateBoxField(box.id, "textColor", e.target.value)}
+                              className="w-full h-10 rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                            />
+                          </div>
+                        </div>
+
+                          <div className="p-6 bg-primary rounded-lg">
+                            <p className="text-xs font-medium text-primary-foreground/80 mb-2">Preview:</p>
+                            <div className="p-6 rounded-md">
+                              <div
+                                className={`${fontSizeClasses[box.fontSize]} ${fontStyleClasses[box.fontStyle]} ${fontWeightClasses[box.fontWeight]} ${textEffectClasses[box.textEffect]} ${animationClasses[box.animation]} leading-relaxed text-center`}
+                                style={{ color: box.textColor || undefined }}
+                              >
+                                {box.text || "Your preview will appear here..."}
+                              </div>
+                            </div>
+                          </div>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}
@@ -421,7 +608,11 @@ export default function About() {
 
           <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6 mb-8">
             {(editing ? editTeamCards : teamCards).map((card) => (
-              <Card key={card.id} className="overflow-hidden shadow-card hover:shadow-elevated transition-all">
+              <Card
+                key={card.id}
+                onClick={() => !editing && setSelectedCard(card)}
+                className={`overflow-hidden shadow-card hover:shadow-elevated transition-all ${!editing ? "cursor-pointer" : ""}`}
+              >
                 <CardContent className="p-6">
                   {editing ? (
                     <div className="space-y-4">
@@ -498,6 +689,21 @@ export default function About() {
               </Card>
             ))}
           </div>
+
+          {/* Card details dialog */}
+          <Dialog open={!!selectedCard} onOpenChange={(open) => { if (!open) setSelectedCard(null); }}>
+            <DialogContent className="max-w-3xl max-h-[85vh] overflow-y-auto">
+              <DialogHeader>
+                <DialogTitle>{selectedCard?.title}</DialogTitle>
+              </DialogHeader>
+              <div className="mt-4">
+                {selectedCard?.image_url ? (
+                  <img src={selectedCard.image_url} alt={selectedCard.title} className="w-full h-64 object-cover rounded-md mb-4" />
+                ) : null}
+                <p className="text-sm text-muted-foreground">{selectedCard?.description}</p>
+              </div>
+            </DialogContent>
+          </Dialog>
 
           {editing && (
             <div className="flex justify-center">
