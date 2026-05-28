@@ -9,17 +9,36 @@ import { Card, CardContent } from "@/components/ui/card";
 import { toast } from "sonner";
 import {
   Award,
+  BookOpen,
+  Briefcase,
   Check,
+  Code,
+  Compass,
   Edit,
+  Flag,
+  Image as ImageIcon,
+  Layers,
+  Lightbulb,
+  Map,
+  MapPin,
+  Milestone,
+  PenTool,
+  Play,
   Plus,
+  Presentation,
   Rocket,
   Save,
+  Search,
+  Settings,
   Target,
   Trash2,
+  TrendingUp,
   Upload,
   Users,
   X,
+  Zap,
 } from "lucide-react";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 
 interface TimelineCard {
   id: string;
@@ -28,6 +47,7 @@ interface TimelineCard {
   description: string;
   icon_url?: string | null;
   image_urls?: string[];
+  icon_name?: string | null;
 }
 
 interface TimelineHeader {
@@ -37,6 +57,12 @@ interface TimelineHeader {
   photo_url?: string | null;
   photo_urls?: string[];
 }
+
+const iconLibrary: Record<string, React.ElementType> = {
+  Target, Users, Rocket, Check, Award, Lightbulb, Search, Code, PenTool, 
+  Presentation, Flag, Compass, Layers, Milestone, Zap, BookOpen, 
+  Briefcase, Map, MapPin, Play, TrendingUp, Settings
+};
 
 const fallbackIcons = [Target, Users, Rocket, Check, Award];
 
@@ -222,6 +248,7 @@ export function TimelineSection() {
         description: "Describe the next step in the journey.",
         icon_url: null,
         image_urls: [],
+        icon_name: null,
       },
     ]);
   };
@@ -474,7 +501,9 @@ export function TimelineSection() {
         {editing && (
           <div className="mb-12 space-y-6">
             {editCards.map((card, index) => {
-              const Icon = fallbackIcons[index % fallbackIcons.length];
+              const Icon = card.icon_name && iconLibrary[card.icon_name]
+                ? iconLibrary[card.icon_name]
+                : fallbackIcons[index % fallbackIcons.length];
               return (
                 <Card key={card.id} className="border border-border bg-card shadow-card">
                   <CardContent className="space-y-4">
@@ -506,6 +535,36 @@ export function TimelineSection() {
                       </div>
                       <div className="flex items-center gap-2">
                         <div className="flex flex-wrap items-center gap-2">
+                          <Popover>
+                            <PopoverTrigger asChild>
+                              <Button variant="outline" size="sm" className="bg-background">
+                                <ImageIcon className="w-4 h-4 mr-2" />
+                                Change Icon
+                              </Button>
+                            </PopoverTrigger>
+                            <PopoverContent className="w-72 p-4 z-50 bg-background border border-border rounded-lg shadow-lg">
+                              <div className="mb-3 text-sm font-medium text-foreground">Select an icon</div>
+                              <div className="grid grid-cols-6 gap-2">
+                                {Object.entries(iconLibrary).map(([name, IconComponent]) => (
+                                  <button
+                                    key={name}
+                                    className={`p-2 flex items-center justify-center rounded-md border transition-colors ${card.icon_name === name ? 'border-primary bg-primary/10 text-primary' : 'border-transparent text-muted-foreground hover:bg-slate-100'}`}
+                                    onClick={() => {
+                                      setEditCards((current) =>
+                                        current.map((c) =>
+                                          c.id === card.id ? { ...c, icon_name: name, icon_url: null } : c
+                                        )
+                                      );
+                                    }}
+                                    title={name}
+                                  >
+                                    <IconComponent className="w-5 h-5" />
+                                  </button>
+                                ))}
+                              </div>
+                            </PopoverContent>
+                          </Popover>
+                          <span className="text-sm text-muted-foreground px-1">or</span>
                           <label className="cursor-pointer rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm hover:bg-slate-100">
                             <Upload className="w-4 h-4 inline-block mr-2" />
                             {uploadingIconId === card.id ? "Uploading..." : "Upload Icon"}
@@ -584,7 +643,9 @@ export function TimelineSection() {
 
             {displayedCards.map((phase, index) => {
               const isEven = index % 2 === 0;
-              const Icon = fallbackIcons[index % fallbackIcons.length];
+              const Icon = phase.icon_name && iconLibrary[phase.icon_name]
+                ? iconLibrary[phase.icon_name]
+                : fallbackIcons[index % fallbackIcons.length];
 
               return (
                 <div
