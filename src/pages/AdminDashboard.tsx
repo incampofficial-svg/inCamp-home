@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { AdminLayout } from "@/components/layout/AdminLayout";
 import { supabase } from "@/integrations/supabase/client";
-import { Users, FileText, Shield, TrendingUp, Edit, Trash2, Eye, Download, Calendar, ChevronUp } from "lucide-react";
+import { FileText, Shield, TrendingUp, Edit, Trash2, Eye, Download, Calendar, ChevronUp } from "lucide-react";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from "recharts";
 import { Button } from "@/components/ui/button";
@@ -67,6 +67,9 @@ interface UserProfile {
   email: string | null;
   role: string;
   created_at: string;
+  department?: string | null;
+  year?: string | null;
+  phone?: string | null;
 }
 
 export default function AdminDashboard() {
@@ -100,7 +103,7 @@ export default function AdminDashboard() {
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [deptAdmins, setDeptAdmins] = useState<UserProfile[]>([]);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [dialogView, setDialogView] = useState<"problems" | "allUsers" | "deptAdmins" | "studentUsers" | null>(null);
+  const [dialogView, setDialogView] = useState<"problems" | "themes" | "deptAdmins" | "studentUsers" | null>(null);
   const [studentDepartmentFilter, setStudentDepartmentFilter] = useState<string>("all");
   const [studentYearFilter, setStudentYearFilter] = useState<string>("all");
   const [deptAdminActionLoading, setDeptAdminActionLoading] = useState<string | null>(null);
@@ -169,7 +172,7 @@ try {
 
     supabase
       .from("profiles")
-      .select("id, name, email, created_at")
+      .select("id, name, email, role, created_at, department, year, phone")
       .eq("tenant_id", tenant!.id)
       .order("created_at", { ascending: true }),
 
@@ -213,7 +216,7 @@ try {
 
         const mergedUsers = profilesData.map((profile) => ({
           ...profile,
-          role: rolesData.find((role) => role.user_id === profile.id)?.role || "student",
+          role: rolesData.find((role) => role.user_id === profile.id)?.role || profile.role || "student",
         }));
 
         const deptAdminCount = rolesData.filter((r) => r.role === "deptadmin").length;
@@ -322,7 +325,7 @@ try {
     setFilteredTeams(filtered);
   }, [teamRegistrations, problemFilter, themeFilter, sortField, sortDirection]);
 
-  const handleOpenDialog = (view: "problems" | "allUsers" | "deptAdmins" | "studentUsers") => {
+  const handleOpenDialog = (view: "problems" | "themes" | "deptAdmins" | "studentUsers") => {
     setDialogView(view);
     setDialogOpen(true);
   };
@@ -332,14 +335,16 @@ try {
     setDialogView(null);
   };
 
-  const filteredStudentTeams = teamRegistrations.filter((team) => {
-    if (studentDepartmentFilter !== "all" && team.department !== studentDepartmentFilter) return false;
-    if (studentYearFilter !== "all" && team.year !== studentYearFilter) return false;
+  const studentUsers = allUsers.filter((user) => user.role === "student");
+
+  const filteredStudentUsers = studentUsers.filter((student) => {
+    if (studentDepartmentFilter !== "all" && student.department !== studentDepartmentFilter) return false;
+    if (studentYearFilter !== "all" && student.year !== studentYearFilter) return false;
     return true;
   });
 
-  const studentDepartments = [...new Set(teamRegistrations.map((team) => team.department).filter(Boolean))];
-  const studentYears = [...new Set(teamRegistrations.map((team) => team.year).filter(Boolean))];
+  const studentDepartments = [...new Set(studentUsers.map((student) => student.department).filter(Boolean))];
+  const studentYears = [...new Set(studentUsers.map((student) => student.year).filter(Boolean))];
   const problemThemes = [...new Set(problems.map((problem) => problem.theme).filter(Boolean))];
 
   const filteredProblemStats = problemStats.filter((problem) => {
@@ -368,18 +373,17 @@ try {
   });
 
   const downloadStudentData = (format: "csv" | "excel") => {
-    const rows = filteredStudentTeams;
+    const rows = filteredStudentUsers;
     if (rows.length === 0) return;
 
-    const header = ["Team Name", "Problem", "Year", "Department", "Email", "Phone", "Registered Date"];
+    const header = ["Name", "Email", "Year", "Department", "Phone", "Joined Date"];
     const csvBody = rows
       .map((row) =>
         [
-          row.team_name,
-          row.problem_title || "",
+          row.name || "",
+          row.email || "",
           row.year,
           row.department,
-          row.email,
           row.phone,
           row.created_at ? new Date(row.created_at).toLocaleDateString() : "",
         ]
@@ -654,11 +658,11 @@ try {
       view: "problems" as const,
     },
     {
-      title: "Total Registered Users",
-      value: stats.totalUsers,
-      icon: Users,
+      title: "Team Registrations by Theme",
+      value: themeStats.reduce((total, theme) => total + theme.count, 0),
+      icon: TrendingUp,
       color: "bg-secondary",
-      view: "allUsers" as const,
+      view: "themes" as const,
     },
     {
       title: "Department Admins",
@@ -737,84 +741,218 @@ try {
                 <DialogContent className="max-w-7xl w-[95vw] max-h-[90vh] overflow-hidden overflow-y-auto rounded-3xl p-6">
                   <DialogHeader>
                     <DialogTitle>
-                      {dialogView === "problems" && "Problem Statements"}
-                      {dialogView === "allUsers" && "All Registered Users"}
+                      {dialogView === "problems" && "Team Registrations by Problem Statement"}
+                      {dialogView === "themes" && "Team Registrations by Theme"}
                       {dialogView === "deptAdmins" && "Department Admins"}
                       {dialogView === "studentUsers" && "Student Users"}
                     </DialogTitle>
                     <DialogDescription>
-                      {dialogView === "problems" && "Review problem statements and registration counts."}
-                      {dialogView === "allUsers" && "View all registered users in the system."}
+                      {dialogView === "problems" && "Search, filter, and sort problem statements by registered team count."}
+                      {dialogView === "themes" && "Review team registrations grouped by theme."}
                       {dialogView === "deptAdmins" && "View all users with department admin access."}
-                      {dialogView === "studentUsers" && "View student team details filtered by department or year, then download the visible data."}
+                      {dialogView === "studentUsers" && "View student profiles filtered by department or year, then download the visible data."}
                     </DialogDescription>
                   </DialogHeader>
 
                   <div className="mt-6 space-y-6">
                     {dialogView === "problems" && (
-                      <div className="overflow-x-auto">
-                        <table className="w-full min-w-[600px] border-separate border-spacing-y-2">
-                          <thead>
-                            <tr className="text-left text-sm font-semibold text-foreground border-b border-border">
-                              <th className="py-3 px-4">Problem Title</th>
-                              <th className="py-3 px-4">Theme</th>
-                              <th className="py-3 px-4">Registered Teams</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {problemStats.length > 0 ? (
-                              problemStats.map((problem) => {
-                                const matchedProblem = problems.find((item) => item.problem_statement_id === problem.id);
-                                return (
-                                  <tr key={problem.id} className="border-b border-border/50">
-                                    <td className="py-3 px-4 text-foreground">{problem.title}</td>
-                                    <td className="py-3 px-4 text-foreground capitalize">{matchedProblem?.theme || "—"}</td>
-                                    <td className="py-3 px-4 text-foreground font-semibold">{problem.count}</td>
+                      <div>
+                        {problemStats.length > 0 ? (
+                          <>
+                            <div className="mb-6 space-y-4">
+                              <div className="flex flex-wrap gap-4">
+                                <div className="flex-1 min-w-[220px]">
+                                  <label className="block text-sm font-medium text-foreground mb-2">
+                                    Search Problem Statement
+                                  </label>
+                                  <input
+                                    type="text"
+                                    value={problemStatsSearchTerm}
+                                    onChange={(e) => setProblemStatsSearchTerm(e.target.value)}
+                                    placeholder="Search by problem title"
+                                    className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                                  />
+                                </div>
+
+                                <div className="flex-1 min-w-[220px]">
+                                  <label className="block text-sm font-medium text-foreground mb-2">
+                                    Filter by Theme
+                                  </label>
+                                  <select
+                                    value={problemStatsThemeFilter}
+                                    onChange={(e) => setProblemStatsThemeFilter(e.target.value)}
+                                    className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                                  >
+                                    <option value="all">All Themes</option>
+                                    {problemThemes.map((theme) => (
+                                      <option key={theme} value={theme}>
+                                        {theme}
+                                      </option>
+                                    ))}
+                                  </select>
+                                </div>
+                              </div>
+                            </div>
+
+                            <div className="overflow-x-auto">
+                              <table className="w-full min-w-[640px]">
+                                <thead>
+                                  <tr className="border-b border-border">
+                                    <th className="text-left py-2 px-4 font-medium text-foreground">
+                                      <div className="flex items-center gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setProblemStatsSortField("title");
+                                            setProblemStatsSortDirection((currentDirection) =>
+                                              problemStatsSortField === "title" && currentDirection === "asc" ? "desc" : "asc"
+                                            );
+                                          }}
+                                          className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-1"
+                                          aria-label={`Sort problem title ${
+                                            problemStatsSortField === "title" && problemStatsSortDirection === "asc"
+                                              ? "descending"
+                                              : "ascending"
+                                          }`}
+                                          title={`Sort problem title ${
+                                            problemStatsSortField === "title" && problemStatsSortDirection === "asc"
+                                              ? "descending"
+                                              : "ascending"
+                                          }`}
+                                        >
+                                          <ChevronUp
+                                            className={`h-4 w-4 transition-transform ${
+                                              problemStatsSortField !== "title" || problemStatsSortDirection === "desc"
+                                                ? "rotate-180"
+                                                : ""
+                                            }`}
+                                          />
+                                        </button>
+                                        <span>Problem Title</span>
+                                      </div>
+                                    </th>
+                                    <th className="text-left py-2 px-4 font-medium text-foreground">Theme</th>
+                                    <th className="text-right py-2 px-4 font-medium text-foreground">
+                                      <div className="flex items-center justify-end gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setProblemStatsSortField("count");
+                                            setProblemStatsSortDirection((currentDirection) =>
+                                              problemStatsSortField === "count" && currentDirection === "asc" ? "desc" : "asc"
+                                            );
+                                          }}
+                                          className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-1"
+                                          aria-label={`Sort registered teams ${
+                                            problemStatsSortField === "count" && problemStatsSortDirection === "asc"
+                                              ? "descending"
+                                              : "ascending"
+                                          }`}
+                                          title={`Sort registered teams ${
+                                            problemStatsSortField === "count" && problemStatsSortDirection === "asc"
+                                              ? "descending"
+                                              : "ascending"
+                                          }`}
+                                        >
+                                          <ChevronUp
+                                            className={`h-4 w-4 transition-transform ${
+                                              problemStatsSortField !== "count" || problemStatsSortDirection === "desc"
+                                                ? "rotate-180"
+                                                : ""
+                                            }`}
+                                          />
+                                        </button>
+                                        <span>Registered Teams</span>
+                                      </div>
+                                    </th>
                                   </tr>
-                                );
-                              })
-                            ) : (
-                              <tr>
-                                <td colSpan={3} className="py-6 text-center text-muted-foreground">
-                                  No problem statements available.
-                                </td>
-                              </tr>
-                            )}
-                          </tbody>
-                        </table>
+                                </thead>
+                                <tbody>
+                                  {sortedProblemStats.length > 0 ? (
+                                    sortedProblemStats.map((problem) => {
+                                      const matchedProblem = problems.find((item) => item.problem_statement_id === problem.id);
+
+                                      return (
+                                        <tr key={problem.id} className="border-b border-border/50">
+                                          <td className="py-3 px-4 text-foreground">{problem.title}</td>
+                                          <td className="py-3 px-4 text-foreground">{matchedProblem?.theme || "--"}</td>
+                                          <td className="py-3 px-4 text-right font-semibold text-primary">{problem.count}</td>
+                                        </tr>
+                                      );
+                                    })
+                                  ) : (
+                                    <tr>
+                                      <td colSpan={3} className="py-6 text-center text-muted-foreground">
+                                        No problem statements match the selected filters.
+                                      </td>
+                                    </tr>
+                                  )}
+                                </tbody>
+                              </table>
+                            </div>
+                          </>
+                        ) : (
+                          <p className="text-muted-foreground">No registrations yet.</p>
+                        )}
                       </div>
                     )}
 
-                    {dialogView === "allUsers" && (
-                      <div className="overflow-x-auto">
-                        <table className="w-full min-w-[640px] border-separate border-spacing-y-2">
-                          <thead>
-                            <tr className="text-left text-sm font-semibold text-foreground border-b border-border">
-                              <th className="py-3 px-4">Name</th>
-                              <th className="py-3 px-4">Email</th>
-                              <th className="py-3 px-4">Role</th>
-                              <th className="py-3 px-4">Joined</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {allUsers.length > 0 ? (
-                              allUsers.map((user) => (
-                                <tr key={user.id} className="border-b border-border/50">
-                                  <td className="py-3 px-4 text-foreground">{user.name || "—"}</td>
-                                  <td className="py-3 px-4 text-foreground">{user.email || "—"}</td>
-                                  <td className="py-3 px-4 text-foreground capitalize">{user.role}</td>
-                                  <td className="py-3 px-4 text-foreground text-sm">{user.created_at ? new Date(user.created_at).toLocaleDateString() : "—"}</td>
-                                </tr>
-                              ))
-                            ) : (
-                              <tr>
-                                <td colSpan={4} className="py-6 text-center text-muted-foreground">
-                                  No registered users found.
-                                </td>
-                              </tr>
-                            )}
-                          </tbody>
-                        </table>
+                    {dialogView === "themes" && (
+                      <div>
+                        {themeStats.length > 0 ? (
+                          <>
+                            <div className="mb-8">
+                              <div className="h-80 w-full">
+                                <ResponsiveContainer width="100%" height="100%">
+                                  <PieChart>
+                                    <Pie
+                                      data={themeStats.map((theme, index) => ({
+                                        name: theme.theme.charAt(0).toUpperCase() + theme.theme.slice(1),
+                                        value: Math.max(theme.count, 0.1),
+                                        actualCount: theme.count,
+                                        fill: `hsl(${index * 137.5 % 360}, 70%, 50%)`
+                                      }))}
+                                      cx="50%"
+                                      cy="50%"
+                                      labelLine={false}
+                                      label={({ name, actualCount }) => {
+                                        const totalRegistrations = themeStats.reduce((sum, theme) => sum + theme.count, 0);
+                                        const percentage = totalRegistrations === 0 ? 0 : ((actualCount / totalRegistrations) * 100).toFixed(0);
+                                        return `${name} ${percentage}%`;
+                                      }}
+                                      outerRadius={80}
+                                      fill="#8884d8"
+                                      dataKey="value"
+                                    >
+                                      {themeStats.map((entry, index) => (
+                                        <Cell key={`cell-${index}`} fill={`hsl(${index * 137.5 % 360}, 70%, 50%)`} />
+                                      ))}
+                                    </Pie>
+                                    <Tooltip
+                                      formatter={(value, name, props) => [
+                                        `${props.payload.actualCount} teams`,
+                                        name
+                                      ]}
+                                    />
+                                    <Legend />
+                                  </PieChart>
+                                </ResponsiveContainer>
+                              </div>
+                            </div>
+
+                            <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                              {themeStats.map((theme) => (
+                                <div key={theme.theme} className="bg-muted/50 rounded-lg p-4">
+                                  <h3 className="font-medium text-foreground capitalize">{theme.theme}</h3>
+                                  <p className="text-2xl font-bold text-primary mt-1">{theme.count}</p>
+                                  <p className="text-sm text-muted-foreground">teams registered</p>
+                                </div>
+                              ))}
+                            </div>
+                          </>
+                        ) : (
+                          <p className="text-muted-foreground">No registrations yet.</p>
+                        )}
                       </div>
                     )}
 
@@ -912,31 +1050,29 @@ try {
                           <table className="w-full min-w-[760px] border-separate border-spacing-y-2">
                             <thead>
                               <tr className="text-left text-sm font-semibold text-foreground border-b border-border">
-                                <th className="py-3 px-4">Team Name</th>
-                                <th className="py-3 px-4">Problem</th>
+                                <th className="py-3 px-4">Name</th>
+                                <th className="py-3 px-4">Email</th>
                                 <th className="py-3 px-4">Year</th>
                                 <th className="py-3 px-4">Department</th>
-                                <th className="py-3 px-4">Email</th>
                                 <th className="py-3 px-4">Phone</th>
-                                <th className="py-3 px-4">Registered</th>
+                                <th className="py-3 px-4">Joined</th>
                               </tr>
                             </thead>
                             <tbody>
-                              {filteredStudentTeams.length > 0 ? (
-                                filteredStudentTeams.map((team) => (
-                                  <tr key={team.id} className="border-b border-border/50">
-                                    <td className="py-3 px-4 text-foreground">{team.team_name}</td>
-                                    <td className="py-3 px-4 text-foreground">{team.problem_title || "—"}</td>
-                                    <td className="py-3 px-4 text-foreground">{team.year}</td>
-                                    <td className="py-3 px-4 text-foreground">{team.department}</td>
-                                    <td className="py-3 px-4 text-foreground">{team.email}</td>
-                                    <td className="py-3 px-4 text-foreground">{team.phone}</td>
-                                    <td className="py-3 px-4 text-foreground text-sm">{team.created_at ? new Date(team.created_at).toLocaleDateString() : "—"}</td>
+                              {filteredStudentUsers.length > 0 ? (
+                                filteredStudentUsers.map((student) => (
+                                  <tr key={student.id} className="border-b border-border/50">
+                                    <td className="py-3 px-4 text-foreground">{student.name || "--"}</td>
+                                    <td className="py-3 px-4 text-foreground">{student.email || "--"}</td>
+                                    <td className="py-3 px-4 text-foreground">{student.year || "--"}</td>
+                                    <td className="py-3 px-4 text-foreground">{student.department || "--"}</td>
+                                    <td className="py-3 px-4 text-foreground">{student.phone || "--"}</td>
+                                    <td className="py-3 px-4 text-foreground text-sm">{student.created_at ? new Date(student.created_at).toLocaleDateString() : "--"}</td>
                                   </tr>
                                 ))
                               ) : (
                                 <tr>
-                                  <td colSpan={7} className="py-6 text-center text-muted-foreground">
+                                  <td colSpan={6} className="py-6 text-center text-muted-foreground">
                                     No student data matches the selected filters.
                                   </td>
                                 </tr>
@@ -952,220 +1088,6 @@ try {
 
               {/* Registration Statistics */}
               <Accordion type="multiple" className="w-full space-y-4">
-                <AccordionItem value="problems" className="bg-card rounded-xl shadow-card">
-                  <AccordionTrigger className="px-6 py-4 hover:no-underline">
-                    <h2 className="text-xl font-poppins font-semibold text-foreground text-left">
-                      Team Registrations by Problem Statement
-                    </h2>
-                  </AccordionTrigger>
-                  <AccordionContent className="px-6 pb-4">
-                    {problemStats.length > 0 ? (
-                      <>
-                        {/* Filter Control */}
-                        <div className="mb-6 space-y-4">
-                          <div className="flex flex-wrap gap-4">
-                            <div className="flex-1 min-w-[220px]">
-                              <label className="block text-sm font-medium text-foreground mb-2">
-                                Search Problem Statement
-                              </label>
-                              <input
-                                type="text"
-                                value={problemStatsSearchTerm}
-                                onChange={(e) => setProblemStatsSearchTerm(e.target.value)}
-                                placeholder="Search by problem title"
-                                className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
-                              />
-                            </div>
-
-                            <div className="flex-1 min-w-[220px]">
-                              <label className="block text-sm font-medium text-foreground mb-2">
-                                Filter by Theme
-                              </label>
-                              <select
-                                value={problemStatsThemeFilter}
-                                onChange={(e) => setProblemStatsThemeFilter(e.target.value)}
-                                className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
-                              >
-                                <option value="all">All Themes</option>
-                                {problemThemes.map((theme) => (
-                                  <option key={theme} value={theme}>
-                                    {theme}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="overflow-x-auto">
-                          <table className="w-full">
-                            <thead>
-                              <tr className="border-b border-border">
-                                <th className="text-left py-2 px-4 font-medium text-foreground">
-                                  <div className="flex items-center gap-2">
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setProblemStatsSortField("title");
-                                        setProblemStatsSortDirection((currentDirection) =>
-                                          problemStatsSortField === "title" && currentDirection === "asc" ? "desc" : "asc"
-                                        );
-                                      }}
-                                      className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-1"
-                                      aria-label={`Sort problem title ${
-                                        problemStatsSortField === "title" && problemStatsSortDirection === "asc"
-                                          ? "descending"
-                                          : "ascending"
-                                      }`}
-                                      title={`Sort problem title ${
-                                        problemStatsSortField === "title" && problemStatsSortDirection === "asc"
-                                          ? "descending"
-                                          : "ascending"
-                                      }`}
-                                    >
-                                      <ChevronUp
-                                        className={`h-4 w-4 transition-transform ${
-                                          problemStatsSortField !== "title" || problemStatsSortDirection === "desc"
-                                            ? "rotate-180"
-                                            : ""
-                                        }`}
-                                      />
-                                    </button>
-                                    <span>Problem Title</span>
-                                  </div>
-                                </th>
-                                <th className="text-left py-2 px-4 font-medium text-foreground">Theme</th>
-                                <th className="text-right py-2 px-4 font-medium text-foreground">
-                                  <div className="flex items-center justify-end gap-2">
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setProblemStatsSortField("count");
-                                        setProblemStatsSortDirection((currentDirection) =>
-                                          problemStatsSortField === "count" && currentDirection === "asc" ? "desc" : "asc"
-                                        );
-                                      }}
-                                      className="inline-flex h-5 w-5 items-center justify-center rounded-sm text-muted-foreground transition-colors hover:text-foreground focus:outline-none focus:ring-2 focus:ring-primary focus:ring-offset-1"
-                                      aria-label={`Sort registered teams ${
-                                        problemStatsSortField === "count" && problemStatsSortDirection === "asc"
-                                          ? "descending"
-                                          : "ascending"
-                                      }`}
-                                      title={`Sort registered teams ${
-                                        problemStatsSortField === "count" && problemStatsSortDirection === "asc"
-                                          ? "descending"
-                                          : "ascending"
-                                      }`}
-                                    >
-                                      <ChevronUp
-                                        className={`h-4 w-4 transition-transform ${
-                                          problemStatsSortField !== "count" || problemStatsSortDirection === "desc"
-                                            ? "rotate-180"
-                                            : ""
-                                        }`}
-                                      />
-                                    </button>
-                                    <span>Registered Teams</span>
-                                  </div>
-                                </th>
-                              </tr>
-                            </thead>
-                            <tbody>
-                              {sortedProblemStats.length > 0 ? (
-                                sortedProblemStats.map((problem) => {
-                                  const matchedProblem = problems.find((item) => item.problem_statement_id === problem.id);
-
-                                  return (
-                                    <tr key={problem.id} className="border-b border-border/50">
-                                      <td className="py-3 px-4 text-foreground">{problem.title}</td>
-                                      <td className="py-3 px-4 text-foreground">{matchedProblem?.theme || "—"}</td>
-                                      <td className="py-3 px-4 text-right font-semibold text-primary">{problem.count}</td>
-                                    </tr>
-                                  );
-                                })
-                              ) : (
-                                <tr>
-                                  <td colSpan={3} className="py-6 text-center text-muted-foreground">
-                                    No problem statements match the selected filters.
-                                  </td>
-                                </tr>
-                              )}
-                            </tbody>
-                          </table>
-                        </div>
-                      </>
-                    ) : (
-                      <p className="text-muted-foreground">No registrations yet.</p>
-                    )}
-                  </AccordionContent>
-                </AccordionItem>
-
-                <AccordionItem value="themes" className="bg-card rounded-xl shadow-card">
-                  <AccordionTrigger className="px-6 py-4 hover:no-underline">
-                    <h2 className="text-xl font-poppins font-semibold text-foreground text-left">
-                      Team Registrations by Theme
-                    </h2>
-                  </AccordionTrigger>
-                  <AccordionContent className="px-6 pb-4">
-                    {themeStats.length > 0 ? (
-                      <>
-                        {/* Pie Chart */}
-                        <div className="mb-8">
-                          <div className="h-80 w-full">
-                            <ResponsiveContainer width="100%" height="100%">
-                              <PieChart>
-                                <Pie
-                                  data={themeStats.map((theme, index) => ({
-                                    name: theme.theme.charAt(0).toUpperCase() + theme.theme.slice(1),
-                                    value: Math.max(theme.count, 0.1), // Ensure minimum value to prevent 0% slices
-                                    actualCount: theme.count,
-                                    fill: `hsl(${index * 137.5 % 360}, 70%, 50%)`
-                                  }))}
-                                  cx="50%"
-                                  cy="50%"
-                                  labelLine={false}
-                                  label={({ name, actualCount }) => {
-                                    const totalRegistrations = themeStats.reduce((sum, t) => sum + t.count, 0);
-                                    const percentage = totalRegistrations === 0 ? 0 : ((actualCount / totalRegistrations) * 100).toFixed(0);
-                                    return `${name} ${percentage}%`;
-                                  }}
-                                  outerRadius={80}
-                                  fill="#8884d8"
-                                  dataKey="value"
-                                >
-                                  {themeStats.map((entry, index) => (
-                                    <Cell key={`cell-${index}`} fill={`hsl(${index * 137.5 % 360}, 70%, 50%)`} />
-                                  ))}
-                                </Pie>
-                                <Tooltip
-                                  formatter={(value, name, props) => [
-                                    `${props.payload.actualCount} teams`,
-                                    name
-                                  ]}
-                                />
-                                <Legend />
-                              </PieChart>
-                            </ResponsiveContainer>
-                          </div>
-                        </div>
-
-                        {/* Theme Stats Grid */}
-                        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
-                          {themeStats.map((theme) => (
-                            <div key={theme.theme} className="bg-muted/50 rounded-lg p-4">
-                              <h3 className="font-medium text-foreground capitalize">{theme.theme}</h3>
-                              <p className="text-2xl font-bold text-primary mt-1">{theme.count}</p>
-                              <p className="text-sm text-muted-foreground">teams registered</p>
-                            </div>
-                          ))}
-                        </div>
-                      </>
-                    ) : (
-                      <p className="text-muted-foreground">No registrations yet.</p>
-                    )}
-                  </AccordionContent>
-                </AccordionItem>
-
                 <AccordionItem value="all-teams" className="bg-card rounded-xl shadow-card">
                   <AccordionTrigger className="px-6 py-4 hover:no-underline">
                     <h2 className="text-xl font-poppins font-semibold text-foreground text-left">
