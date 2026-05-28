@@ -365,7 +365,41 @@ export function TimelineSection() {
     }
   };
 
-  const removeHeaderPhoto = () => {
+  // Helper to permanently delete header photos from Supabase storage
+  const deleteHeaderPhotos = async (urls: string[]) => {
+    try {
+      const bucketName = "resources";
+      const paths = urls
+        .map((url) => {
+          try {
+            const parsed = new URL(url);
+            // Pathname looks like: /storage/v1/object/public/resources/home_timeline_header/file.png
+            // We need only the part after the bucket name: home_timeline_header/file.png
+            const bucketPrefix = `/storage/v1/object/public/${bucketName}/`;
+            const idx = parsed.pathname.indexOf(bucketPrefix);
+            if (idx !== -1) {
+              return parsed.pathname.substring(idx + bucketPrefix.length);
+            }
+            return null;
+          } catch {
+            return null;
+          }
+        })
+        .filter(Boolean) as string[];
+      if (paths.length === 0) return;
+      console.log("Deleting storage paths:", paths);
+      const { data, error } = await supabase.storage.from(bucketName).remove(paths);
+      if (error) throw error;
+      console.log("Storage delete result:", data);
+    } catch (err: any) {
+      console.error("Failed to delete header photos:", err);
+      toast.error(err?.message || "Unable to delete header photos.");
+    }
+  };
+
+  const removeHeaderPhoto = async () => {
+    // Delete the stored images from Supabase before clearing state
+    await deleteHeaderPhotos(editHeader.photo_urls ?? []);
     setEditHeader((current) => ({ ...current, photo_urls: [] }));
   };
 
