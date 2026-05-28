@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict v3JbmafG5eCnM0rmGfguE22FSrXVD7udyJgRVJ2JduD2aaQcyr5acybVr8zGu52
+\restrict NBUkwZgW6O4SPQ3Jc1DqfFSUwdhZRU8jWdddO6l8FcvvxNg8lsOaQ4oOYQEoKef
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 18.3
@@ -3448,6 +3448,7 @@ CREATE TABLE public.contest_settings (
     created_at timestamp with time zone DEFAULT now(),
     department_unlocks_at timestamp with time zone,
     department_closes_at timestamp with time zone,
+    tenant_id uuid,
     CONSTRAINT contest_settings_department_window_chk CHECK ((department_closes_at > department_unlocks_at))
 );
 
@@ -3507,7 +3508,8 @@ CREATE TABLE public.events (
     problem_statement_deadline timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text),
     registration_start_date timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text) NOT NULL,
     has_problem_statement boolean DEFAULT false,
-    resource_person text
+    resource_person text,
+    tenant_id uuid NOT NULL
 );
 
 
@@ -3522,7 +3524,8 @@ CREATE TABLE public.page_content (
     page_name text NOT NULL,
     section_key text NOT NULL,
     content jsonb DEFAULT '{}'::jsonb NOT NULL,
-    updated_at timestamp with time zone DEFAULT now() NOT NULL
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    tenant_id uuid NOT NULL
 );
 
 
@@ -3541,7 +3544,8 @@ CREATE TABLE public.problem_statement_alerts (
     description text NOT NULL,
     priority text DEFAULT 'medium'::text NOT NULL,
     is_read boolean DEFAULT false NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    tenant_id uuid
 );
 
 
@@ -3559,7 +3563,8 @@ CREATE TABLE public.problem_statement_attachments (
     object_path text NOT NULL,
     mime_type text,
     file_size bigint,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    tenant_id uuid
 );
 
 
@@ -3577,7 +3582,8 @@ CREATE TABLE public.problem_statement_messages (
     recipient_role text,
     content text NOT NULL,
     is_read boolean DEFAULT false NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    tenant_id uuid
 );
 
 
@@ -3592,7 +3598,8 @@ CREATE TABLE public.problem_statement_remarks (
     problem_statement_id uuid NOT NULL,
     remark text NOT NULL,
     author_id uuid NOT NULL,
-    created_at timestamp with time zone DEFAULT now() NOT NULL
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    tenant_id uuid
 );
 
 
@@ -3824,7 +3831,8 @@ ALTER TABLE public.user_queries OWNER TO postgres;
 CREATE TABLE public.user_roles (
     id uuid DEFAULT gen_random_uuid() NOT NULL,
     user_id uuid NOT NULL,
-    role public.app_role NOT NULL
+    role public.app_role NOT NULL,
+    tenant_id uuid
 );
 
 
@@ -4497,11 +4505,11 @@ ALTER TABLE ONLY public.events
 
 
 --
--- Name: page_content page_content_page_name_section_key_key; Type: CONSTRAINT; Schema: public; Owner: postgres
+-- Name: page_content page_content_page_name_section_key_tenant_id_key; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
 ALTER TABLE ONLY public.page_content
-    ADD CONSTRAINT page_content_page_name_section_key_key UNIQUE (page_name, section_key);
+    ADD CONSTRAINT page_content_page_name_section_key_tenant_id_key UNIQUE (page_name, section_key, tenant_id);
 
 
 --
@@ -5257,6 +5265,13 @@ CREATE INDEX webauthn_credentials_user_id_idx ON auth.webauthn_credentials USING
 
 
 --
+-- Name: idx_contest_settings_tenant_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_contest_settings_tenant_id ON public.contest_settings USING btree (tenant_id);
+
+
+--
 -- Name: idx_event_registrations_event_id; Type: INDEX; Schema: public; Owner: postgres
 --
 
@@ -5268,6 +5283,13 @@ CREATE INDEX idx_event_registrations_event_id ON public.event_registrations USIN
 --
 
 CREATE INDEX idx_event_registrations_user_id ON public.event_registrations USING btree (user_id);
+
+
+--
+-- Name: idx_page_content_tenant_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_page_content_tenant_id ON public.page_content USING btree (tenant_id);
 
 
 --
@@ -5348,6 +5370,34 @@ CREATE INDEX idx_profiles_tenant_id ON public.profiles USING btree (tenant_id);
 
 
 --
+-- Name: idx_ps_alerts_tenant_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_ps_alerts_tenant_id ON public.problem_statement_alerts USING btree (tenant_id);
+
+
+--
+-- Name: idx_ps_attachments_tenant_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_ps_attachments_tenant_id ON public.problem_statement_attachments USING btree (tenant_id);
+
+
+--
+-- Name: idx_ps_messages_tenant_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_ps_messages_tenant_id ON public.problem_statement_messages USING btree (tenant_id);
+
+
+--
+-- Name: idx_ps_remarks_tenant_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_ps_remarks_tenant_id ON public.problem_statement_remarks USING btree (tenant_id);
+
+
+--
 -- Name: idx_submission_batch_items_ps; Type: INDEX; Schema: public; Owner: postgres
 --
 
@@ -5387,6 +5437,13 @@ CREATE INDEX idx_team_registrations_user_id ON public.team_registrations USING b
 --
 
 CREATE INDEX idx_user_queries_user_id ON public.user_queries USING btree (user_id);
+
+
+--
+-- Name: idx_user_roles_tenant_id; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE INDEX idx_user_roles_tenant_id ON public.user_roles USING btree (tenant_id);
 
 
 --
@@ -5821,6 +5878,14 @@ ALTER TABLE ONLY auth.webauthn_credentials
 
 
 --
+-- Name: contest_settings contest_settings_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.contest_settings
+    ADD CONSTRAINT contest_settings_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
 -- Name: event_registrations event_registrations_event_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -5834,6 +5899,22 @@ ALTER TABLE ONLY public.event_registrations
 
 ALTER TABLE ONLY public.event_registrations
     ADD CONSTRAINT event_registrations_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE CASCADE;
+
+
+--
+-- Name: events events_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.events
+    ADD CONSTRAINT events_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id);
+
+
+--
+-- Name: page_content page_content_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.page_content
+    ADD CONSTRAINT page_content_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
 
 
 --
@@ -5981,6 +6062,38 @@ ALTER TABLE ONLY public.profiles
 
 
 --
+-- Name: problem_statement_alerts ps_alerts_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.problem_statement_alerts
+    ADD CONSTRAINT ps_alerts_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: problem_statement_attachments ps_attachments_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.problem_statement_attachments
+    ADD CONSTRAINT ps_attachments_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: problem_statement_messages ps_messages_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.problem_statement_messages
+    ADD CONSTRAINT ps_messages_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
+-- Name: problem_statement_remarks ps_remarks_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.problem_statement_remarks
+    ADD CONSTRAINT ps_remarks_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
+
+
+--
 -- Name: resources resources_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -6066,6 +6179,14 @@ ALTER TABLE ONLY public.user_queries
 
 ALTER TABLE ONLY public.user_queries
     ADD CONSTRAINT user_queries_user_id_fkey FOREIGN KEY (user_id) REFERENCES auth.users(id) ON DELETE SET NULL;
+
+
+--
+-- Name: user_roles user_roles_tenant_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.user_roles
+    ADD CONSTRAINT user_roles_tenant_id_fkey FOREIGN KEY (tenant_id) REFERENCES public.tenants(id) ON DELETE CASCADE;
 
 
 --
@@ -6710,6 +6831,116 @@ ALTER TABLE public.submission_batches ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE public.team_registrations ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: problem_statement_alerts tenant alerts access; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant alerts access" ON public.problem_statement_alerts TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))));
+
+
+--
+-- Name: problem_statement_attachments tenant attachments access; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant attachments access" ON public.problem_statement_attachments TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))));
+
+
+--
+-- Name: problem_statement_messages tenant messages access; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant messages access" ON public.problem_statement_messages TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))));
+
+
+--
+-- Name: problem_statements tenant problem statements insert; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant problem statements insert" ON public.problem_statements FOR INSERT TO authenticated WITH CHECK ((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))));
+
+
+--
+-- Name: problem_statements tenant problem statements select; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant problem statements select" ON public.problem_statements FOR SELECT TO authenticated, anon USING (true);
+
+
+--
+-- Name: problem_statements tenant problem statements update; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant problem statements update" ON public.problem_statements FOR UPDATE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
+   FROM public.user_roles ur
+  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+
+
+--
+-- Name: team_registrations tenant registrations delete; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant registrations delete" ON public.team_registrations FOR DELETE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
+   FROM public.user_roles ur
+  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+
+
+--
+-- Name: team_registrations tenant registrations select; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant registrations select" ON public.team_registrations FOR SELECT TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))));
+
+
+--
+-- Name: team_registrations tenant registrations update; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant registrations update" ON public.team_registrations FOR UPDATE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
+   FROM public.user_roles ur
+  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+
+
+--
+-- Name: problem_statement_remarks tenant remarks access; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant remarks access" ON public.problem_statement_remarks TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))));
+
+
+--
+-- Name: resources tenant resources select; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant resources select" ON public.resources FOR SELECT TO authenticated, anon USING (true);
+
+
+--
+-- Name: resources tenant resources update; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant resources update" ON public.resources FOR UPDATE TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
+   FROM public.profiles
+  WHERE (profiles.id = auth.uid()))));
+
 
 --
 -- Name: tenants; Type: ROW SECURITY; Schema: public; Owner: postgres
@@ -8726,5 +8957,5 @@ ALTER EVENT TRIGGER pgrst_drop_watch OWNER TO supabase_admin;
 -- PostgreSQL database dump complete
 --
 
-\unrestrict v3JbmafG5eCnM0rmGfguE22FSrXVD7udyJgRVJ2JduD2aaQcyr5acybVr8zGu52
+\unrestrict NBUkwZgW6O4SPQ3Jc1DqfFSUwdhZRU8jWdddO6l8FcvvxNg8lsOaQ4oOYQEoKef
 

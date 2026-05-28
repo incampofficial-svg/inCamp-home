@@ -112,7 +112,7 @@ export default function Problems() {
   useEffect(() => {
     const fetchUnlockTime = async () => {
       try {
-        const unlockDate = await fetchProblemsUnlockAt();
+        const unlockDate = await fetchProblemsUnlockAt(tenant!.id);
 
         if (!unlockDate) {
           setIsUnlocked(true);

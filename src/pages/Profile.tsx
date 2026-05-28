@@ -9,11 +9,26 @@ import { useAdmin } from "@/hooks/useAdmin";
 import { Link } from "react-router-dom";
 import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
+import { useTenant } from "@/context/TenantContext";
+import { tenantPath } from "@/utils/tenantPath";
+
+interface UserProfile {
+  id: string;
+  name: string | null;
+  email: string | null;
+  phone: string | null;
+  department: string | null;
+  year: string | null;
+  tenant_id: string | null;
+}
 
 export default function Profile() {
   const { user, loading } = useAuth();
+  const { tenant } = useTenant();
   const [usernameValue, setUsernameValue] = useState("");
   const [usernameSaving, setUsernameSaving] = useState(false);
+  const [profile, setProfile] = useState<UserProfile | null>(null);
+  const [profileLoading, setProfileLoading] = useState(false);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -31,6 +46,7 @@ export default function Profile() {
   const [deptAdminSearchLoading, setDeptAdminSearchLoading] = useState(false);
   const [deptAdminActionLoading, setDeptAdminActionLoading] = useState<string | null>(null);
   const [deptAdminError, setDeptAdminError] = useState<string | null>(null);
+  const path = (value: string) => tenantPath(tenant?.slug || "", value);
 
   useEffect(() => {
     if (!user) return;
@@ -42,6 +58,43 @@ export default function Profile() {
     setUsernameValue(initialUsername);
   }, [user]);
 
+  useEffect(() => {
+    if (!user || !tenant?.id) return;
+
+    let cancelled = false;
+
+    const fetchProfile = async () => {
+      setProfileLoading(true);
+      try {
+        const { data, error } = await supabase
+          .from("profiles")
+          .select("id,name,email,phone,department,year,tenant_id")
+          .eq("id", user.id)
+          .eq("tenant_id", tenant.id)
+          .maybeSingle();
+
+        if (error) throw error;
+        if (cancelled) return;
+
+        setProfile(data);
+        if (data?.name) {
+          setUsernameValue(data.name);
+        }
+      } catch (error) {
+        console.error("Failed to load tenant profile:", error);
+        if (!cancelled) setProfile(null);
+      } finally {
+        if (!cancelled) setProfileLoading(false);
+      }
+    };
+
+    fetchProfile();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [user, tenant?.id]);
+
   const searchDepartmentAdminUsers = async () => {
     const searchTerm = deptAdminSearch.trim();
     setDeptAdminError(null);
@@ -52,6 +105,11 @@ export default function Profile() {
       return;
     }
 
+    if (!tenant?.id) {
+      setDeptAdminError("Tenant is still loading. Please try again.");
+      return;
+    }
+
     setDeptAdminSearchLoading(true);
     try {
       const ilikeSearch = `%${searchTerm}%`;
@@ -59,6 +117,7 @@ export default function Profile() {
       let profileQuery = supabase
         .from("profiles")
         .select("id,name,email")
+        .eq("tenant_id", tenant.id)
         .order("created_at", { ascending: false })
         .limit(50);
 
@@ -82,7 +141,8 @@ export default function Profile() {
       const { data: userRoles, error: userRolesError } = await supabase
         .from("user_roles")
         .select("user_id,role")
-        .in("user_id", userIds);
+        .in("user_id", userIds)
+        .eq("tenant_id", tenant.id);
 
       if (userRolesError) throw userRolesError;
 
@@ -117,18 +177,23 @@ export default function Profile() {
     setDeptAdminError(null);
 
     try {
+      if (!tenant?.id) {
+        throw new Error("Tenant is still loading. Please try again.");
+      }
+
       if (profile.role === "deptadmin") {
         const { data: updateData, error: updateError } = await supabase
           .from("user_roles")
-          .update({ role: "student" })
-          .eq("user_id", profile.id);
+          .update({ role: "student", tenant_id: tenant.id })
+          .eq("user_id", profile.id)
+          .select("id");
 
         if (updateError) throw updateError;
 
         if (!updateData || updateData.length === 0) {
           const { error: insertError } = await supabase
             .from("user_roles")
-            .insert({ user_id: profile.id, role: "student" });
+            .insert({ user_id: profile.id, role: "student", tenant_id: tenant.id });
 
           if (insertError) throw insertError;
         }
@@ -141,15 +206,16 @@ export default function Profile() {
       } else {
         const { data: updateData, error: updateError } = await supabase
           .from("user_roles")
-          .update({ role: "deptadmin" })
-          .eq("user_id", profile.id);
+          .update({ role: "deptadmin", tenant_id: tenant.id })
+          .eq("user_id", profile.id)
+          .select("id");
 
         if (updateError) throw updateError;
 
         if (!updateData || updateData.length === 0) {
           const { error: insertError } = await supabase
             .from("user_roles")
-            .insert({ user_id: profile.id, role: "deptadmin" });
+            .insert({ user_id: profile.id, role: "deptadmin", tenant_id: tenant.id });
 
           if (insertError) throw insertError;
         }
@@ -182,6 +248,20 @@ export default function Profile() {
         },
       });
       if (error) throw error;
+
+      if (tenant?.id) {
+        const { error: profileError } = await supabase
+          .from("profiles")
+          .update({ name: usernameValue.trim() })
+          .eq("id", user!.id)
+          .eq("tenant_id", tenant.id);
+
+        if (profileError) throw profileError;
+        setProfile((current) =>
+          current ? { ...current, name: usernameValue.trim() } : current
+        );
+      }
+
       toast.success("Username updated successfully.");
     } catch (error: any) {
       console.error("Failed to update username:", error);
@@ -255,7 +335,7 @@ export default function Profile() {
     }
   };
 
-  if (loading) {
+  if (loading || profileLoading) {
     return (
       <Layout>
         <div className="container mx-auto px-4 py-20 text-center">Loading profile...</div>
@@ -269,7 +349,7 @@ export default function Profile() {
         <div className="container mx-auto px-4 py-20 text-center">
           <p className="text-lg font-semibold">You need to be logged in to view your profile.</p>
           <Button asChild variant="orange" className="mt-6">
-            <Link to="/auth">Go to Login</Link>
+            <Link to={path("/auth")}>Go to Login</Link>
           </Button>
         </div>
       </Layout>
@@ -277,13 +357,13 @@ export default function Profile() {
   }
 
   const username =
+    profile?.name ||
     (user.user_metadata?.full_name as string) ||
     (user.user_metadata?.name as string) ||
     user.email?.split("@")[0] ||
     "User";
 
   const displayedUsername = usernameValue || username;
-  const metadata = user.user_metadata || {};
 
   return (
     <Layout>
@@ -308,8 +388,22 @@ export default function Profile() {
 
               <div className="space-y-2">
                 <p className="text-sm text-muted-foreground">Email</p>
-                <p className="text-lg font-semibold">{user.email}</p>
+                <p className="text-lg font-semibold">{profile?.email || user.email}</p>
               </div>
+
+              {profile?.department && (
+                <div className="space-y-2">
+                  <p className="text-sm text-muted-foreground">Department</p>
+                  <p className="text-lg font-semibold">{profile.department}</p>
+                </div>
+              )}
+
+              {profile?.year && (
+                <div className="space-y-2">
+                  <p className="text-sm text-muted-foreground">Year</p>
+                  <p className="text-lg font-semibold">{profile.year}</p>
+                </div>
+              )}
 
               {user.created_at && (
                 <div className="space-y-2">

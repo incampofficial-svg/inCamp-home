@@ -18,6 +18,24 @@ interface HeroContent {
   frontImage: string;
   backImage: string;
   sliderImages: string[];
+  heroStyles?: {
+    title?: {
+      fontSize?: "text-4xl" | "text-5xl" | "text-6xl" | "text-7xl";
+      fontStyle?: "default" | "serif" | "mono" | "italic";
+      fontWeight?: "normal" | "semibold" | "bold";
+      textEffect?: "none" | "shadow" | "highlight";
+      animation?: "none" | "fadeIn" | "slideUp" | "bounce";
+      textColor?: string;
+    };
+    subtitle?: {
+      fontSize?: "text-base" | "text-lg" | "text-xl" | "text-2xl";
+      fontStyle?: "default" | "serif" | "mono" | "italic";
+      fontWeight?: "normal" | "semibold" | "bold";
+      textEffect?: "none" | "shadow" | "highlight";
+      animation?: "none" | "fadeIn" | "slideUp" | "bounce";
+      textColor?: string;
+    };
+  };
 }
 
 const defaultHeroContent: HeroContent = {
@@ -35,6 +53,53 @@ const defaultHeroContent: HeroContent = {
     "/BackgroundSlider6.jpeg",
     "/BackgroundSlider7.jpeg",
   ],
+  heroStyles: {
+    title: {
+      fontSize: "text-6xl",
+      fontStyle: "default",
+      fontWeight: "bold",
+      textEffect: "none",
+      animation: "fadeIn",
+      textColor: "#ffffff",
+    },
+    subtitle: {
+      fontSize: "text-xl",
+      fontStyle: "default",
+      fontWeight: "normal",
+      textEffect: "none",
+      animation: "fadeIn",
+      textColor: "#e6eef8",
+    },
+  },
+};
+
+const fontStyleClasses: Record<string, string> = {
+  default: "",
+  serif: "font-serif",
+  mono: "font-mono",
+  italic: "italic",
+};
+
+const titleSizeOptions = ["text-4xl", "text-5xl", "text-6xl", "text-7xl"];
+const subtitleSizeOptions = ["text-base", "text-lg", "text-xl", "text-2xl"];
+
+const fontWeightClasses: Record<string, string> = {
+  normal: "font-normal",
+  semibold: "font-semibold",
+  bold: "font-bold",
+};
+
+const textEffectClasses: Record<string, string> = {
+  none: "",
+  shadow: "drop-shadow-lg",
+  highlight: "bg-yellow-200/30 px-2 py-1 rounded",
+};
+
+const animationClasses: Record<string, string> = {
+  none: "",
+  fadeIn: "animate-fade-in",
+  slideUp: "animate-slide-up",
+  bounce: "animate-bounce",
 };
 
 export function HeroSection() {
@@ -171,12 +236,15 @@ export function HeroSection() {
     }));
   };
 
+  // Choose which content to render: live edit preview when editing, otherwise saved hero
+  const displayedContent = editing ? editContent : heroContent;
+
   return (
     <section className="relative min-h-[90vh] flex items-center overflow-hidden">
       {/* Background Image Slider */}
       <div className="absolute inset-0 z-0">
         <img
-          src={heroContent.sliderImages[currentImageIndex]}
+          src={displayedContent.sliderImages[currentImageIndex]}
           alt="Background"
           className="w-full h-full object-cover transition-opacity duration-1000 ease-in-out"
         />
@@ -194,22 +262,28 @@ export function HeroSection() {
         <div className="absolute bottom-20 right-10 w-96 h-96 rounded-full bg-secondary blur-3xl" />
       </div>
 
-      <div className="container mx-auto px-4 py-20 relative z-30">
+        <div className="container mx-auto px-4 py-20 relative z-30">
         <div className="grid lg:grid-cols-2 gap-12 items-start">
           {/* Left Content */}
           <div className="text-center lg:text-left space-y-6">
             <div className="inline-block">
               <span className="bg-secondary/20 text-secondary px-4 py-1.5 rounded-full text-sm font-medium">
-                {heroContent.chipText}
+                {displayedContent.chipText}
               </span>
             </div>
 
-            <h1 className="text-4xl md:text-5xl lg:text-6xl font-poppins font-bold text-primary-foreground leading-tight animate-fade-in-up">
-              {heroContent.title}
+            <h1
+              className={`${displayedContent.heroStyles?.title?.fontSize || "text-6xl"} font-poppins ${fontStyleClasses[displayedContent.heroStyles?.title?.fontStyle || "default"]} ${fontWeightClasses[displayedContent.heroStyles?.title?.fontWeight || "bold"]} leading-tight ${animationClasses[displayedContent.heroStyles?.title?.animation || "fadeIn"]}`}
+              style={{ color: displayedContent.heroStyles?.title?.textColor || undefined }}
+            >
+              {displayedContent.title}
             </h1>
 
-            <p className="text-xl md:text-2xl text-primary-foreground/90 font-light animate-fade-in-up animation-delay-100">
-              {heroContent.subtitle}
+            <p
+              className={`${displayedContent.heroStyles?.subtitle?.fontSize || "text-xl"} ${fontStyleClasses[displayedContent.heroStyles?.subtitle?.fontStyle || "default"]} ${fontWeightClasses[displayedContent.heroStyles?.subtitle?.fontWeight || "normal"]} ${animationClasses[displayedContent.heroStyles?.subtitle?.animation || "fadeIn"]} text-primary-foreground/90 font-light`}
+              style={{ color: displayedContent.heroStyles?.subtitle?.textColor || undefined }}
+            >
+              {displayedContent.subtitle}
             </p>
 
             <div className="flex flex-col sm:flex-row gap-4 justify-center lg:justify-start animate-fade-in-up animation-delay-200">
@@ -275,7 +349,7 @@ export function HeroSection() {
 
         {editing && (
           <div className="mt-10 bg-white/95 rounded-[2rem] p-8 shadow-[0_24px_60px_rgba(15,23,42,0.16)] backdrop-blur-xl">
-            <div className="grid gap-6 lg:grid-cols-2">
+            <div className="grid gap-6 lg:grid-cols-3">
               <div className="space-y-4">
                 <label className="block text-sm font-medium text-foreground">Chip text</label>
                 <Input
@@ -295,6 +369,162 @@ export function HeroSection() {
                   onChange={(e) => setEditContent({ ...editContent, subtitle: e.target.value })}
                   className="min-h-[120px]"
                 />
+
+                <div className="mt-4">
+                  <h4 className="text-sm font-semibold mb-2">Title Style</h4>
+                  <div className="grid grid-cols-2 gap-3">
+                    <select
+                      value={editContent.heroStyles?.title?.fontSize}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), title: { ...(c.heroStyles?.title || {}), fontSize: e.target.value } },
+                        }))
+                      }
+                      className="rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    >
+                      {titleSizeOptions.map((s) => (
+                        <option key={s} value={s}>{s.replace("text-", "")}</option>
+                      ))}
+                    </select>
+
+                    <select
+                      value={editContent.heroStyles?.title?.fontWeight}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), title: { ...(c.heroStyles?.title || {}), fontWeight: e.target.value } },
+                        }))
+                      }
+                      className="rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    >
+                      <option value="normal">Normal</option>
+                      <option value="semibold">Semi Bold</option>
+                      <option value="bold">Bold</option>
+                    </select>
+
+                    <select
+                      value={editContent.heroStyles?.title?.fontStyle}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), title: { ...(c.heroStyles?.title || {}), fontStyle: e.target.value } },
+                        }))
+                      }
+                      className="rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    >
+                      <option value="default">Default</option>
+                      <option value="serif">Serif</option>
+                      <option value="mono">Monospace</option>
+                      <option value="italic">Italic</option>
+                    </select>
+
+                    <select
+                      value={editContent.heroStyles?.title?.animation}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), title: { ...(c.heroStyles?.title || {}), animation: e.target.value } },
+                        }))
+                      }
+                      className="rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    >
+                      <option value="none">None</option>
+                      <option value="fadeIn">Fade In</option>
+                      <option value="slideUp">Slide Up</option>
+                      <option value="bounce">Bounce</option>
+                    </select>
+
+                    <input
+                      type="color"
+                      value={editContent.heroStyles?.title?.textColor || "#ffffff"}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), title: { ...(c.heroStyles?.title || {}), textColor: e.target.value } },
+                        }))
+                      }
+                      className="w-full h-10 rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    />
+                  </div>
+
+                  <h4 className="text-sm font-semibold mt-4 mb-2">Subtitle Style</h4>
+                  <div className="grid grid-cols-2 gap-3">
+                    <select
+                      value={editContent.heroStyles?.subtitle?.fontSize}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), subtitle: { ...(c.heroStyles?.subtitle || {}), fontSize: e.target.value } },
+                        }))
+                      }
+                      className="rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    >
+                      {subtitleSizeOptions.map((s) => (
+                        <option key={s} value={s}>{s.replace("text-", "")}</option>
+                      ))}
+                    </select>
+
+                    <select
+                      value={editContent.heroStyles?.subtitle?.fontWeight}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), subtitle: { ...(c.heroStyles?.subtitle || {}), fontWeight: e.target.value } },
+                        }))
+                      }
+                      className="rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    >
+                      <option value="normal">Normal</option>
+                      <option value="semibold">Semi Bold</option>
+                      <option value="bold">Bold</option>
+                    </select>
+
+                    <select
+                      value={editContent.heroStyles?.subtitle?.fontStyle}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), subtitle: { ...(c.heroStyles?.subtitle || {}), fontStyle: e.target.value } },
+                        }))
+                      }
+                      className="rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    >
+                      <option value="default">Default</option>
+                      <option value="serif">Serif</option>
+                      <option value="mono">Monospace</option>
+                      <option value="italic">Italic</option>
+                    </select>
+
+                    <select
+                      value={editContent.heroStyles?.subtitle?.animation}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), subtitle: { ...(c.heroStyles?.subtitle || {}), animation: e.target.value } },
+                        }))
+                      }
+                      className="rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    >
+                      <option value="none">None</option>
+                      <option value="fadeIn">Fade In</option>
+                      <option value="slideUp">Slide Up</option>
+                      <option value="bounce">Bounce</option>
+                    </select>
+
+                    <input
+                      type="color"
+                      value={editContent.heroStyles?.subtitle?.textColor || "#e6eef8"}
+                      onChange={(e) =>
+                        setEditContent((c) => ({
+                          ...c,
+                          heroStyles: { ...(c.heroStyles || {}), subtitle: { ...(c.heroStyles?.subtitle || {}), textColor: e.target.value } },
+                        }))
+                      }
+                      className="w-full h-10 rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground"
+                    />
+                  </div>
+                </div>
               </div>
 
               <div className="space-y-4">
@@ -336,6 +566,35 @@ export function HeroSection() {
                   </div>
                 </div>
               </div>
+
+              {/* Right-side preview column (sticky so it's visible while editing) */}
+              <div className="space-y-4 col-span-1 sticky top-24 self-start">
+                <h3 className="text-lg font-semibold text-foreground">Preview</h3>
+                <div className="rounded-xl overflow-hidden border border-border">
+                  <div className="relative w-full h-96">
+                    <img
+                      src={editContent.sliderImages[currentImageIndex]}
+                      alt="Preview background"
+                      className="w-full h-full object-cover"
+                    />
+                    <div className="absolute inset-0" style={{ background: "linear-gradient(135deg, rgba(33, 37, 41, 0.3) 0%, rgba(33, 37, 41, 0.4) 100%)" }} />
+                    <div className="absolute inset-0 z-10 flex items-center justify-center p-6 text-center">
+                      <div>
+                        <span className="inline-block bg-secondary/20 text-secondary px-3 py-1 rounded-full text-sm mb-4">
+                          {editContent.chipText}
+                        </span>
+                        <h2 className={`${editContent.heroStyles?.title?.fontSize || 'text-6xl'} ${fontStyleClasses[editContent.heroStyles?.title?.fontStyle || 'default']} ${fontWeightClasses[editContent.heroStyles?.title?.fontWeight || 'bold']} leading-tight ${textEffectClasses[editContent.heroStyles?.title?.textEffect || 'none']}`} style={{ color: editContent.heroStyles?.title?.textColor || undefined }}>
+                          {editContent.title}
+                        </h2>
+                        <p className={`${editContent.heroStyles?.subtitle?.fontSize || 'text-xl'} ${fontStyleClasses[editContent.heroStyles?.subtitle?.fontStyle || 'default']} ${fontWeightClasses[editContent.heroStyles?.subtitle?.fontWeight || 'normal']} mt-3`} style={{ color: editContent.heroStyles?.subtitle?.textColor || undefined }}>
+                          {editContent.subtitle}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
             </div>
 
             <div className="mt-8">

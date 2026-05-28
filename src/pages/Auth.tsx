@@ -87,7 +87,8 @@ export default function Auth() {
     const { data: roleRows, error: roleError } = await supabase
       .from("user_roles")
       .select("role")
-      .eq("user_id", userId);
+      .eq("user_id", userId)
+      .eq("tenant_id", tenant!.id);
 
     if (roleError) {
       console.error("Error checking user role after login:", roleError);
@@ -116,7 +117,7 @@ export default function Auth() {
     }
 
     navigate(fallbackUrl, { replace: true });
-  }, [navigate, session]);
+  }, [navigate, session, tenant?.id]);
 
   // Redirect if already logged in
   useEffect(() => {

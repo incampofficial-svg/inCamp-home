@@ -120,6 +120,7 @@ export function ResourceUploadDialog({
             file_url: fileUrl,
             file_type: fileType,
             section_key: sectionKey,
+            tenant_id: tenant!.id,
             updated_at: new Date().toISOString(),
           },
         ]);

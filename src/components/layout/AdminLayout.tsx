@@ -9,7 +9,7 @@ interface AdminLayoutProps {
 }
 
 export function AdminLayout({ children }: AdminLayoutProps) {
-  const { loading, hasAdminRoleElsewhere } = useAdmin() as any;
+  const { isAdmin, loading, hasAdminRoleElsewhere } = useAdmin() as any;
 
   // While loading, render normal layout to avoid blocking render cycle
   if (loading) {
@@ -33,6 +33,25 @@ export function AdminLayout({ children }: AdminLayoutProps) {
               <h2 className="text-xl font-semibold mb-2">Access Denied</h2>
               <p className="text-muted-foreground">
                 You have administrative privileges, but not for this tenant. You cannot access admin features for other tenants.
+              </p>
+            </div>
+          </div>
+        </main>
+        <Footer />
+      </div>
+    );
+  }
+
+  if (!isAdmin) {
+    return (
+      <div className="min-h-screen flex flex-col">
+        <Navbar />
+        <main className="flex-1 pt-16 lg:pt-20">
+          <div className="container mx-auto px-4 py-24">
+            <div className="max-w-xl mx-auto bg-card rounded-lg p-8 shadow">
+              <h2 className="text-xl font-semibold mb-2">Access Denied</h2>
+              <p className="text-muted-foreground">
+                This admin page is only available to admins for this tenant.
               </p>
             </div>
           </div>

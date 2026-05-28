@@ -168,7 +168,8 @@ try {
 
     supabase
       .from("user_roles")
-      .select("user_id, role"),
+      .select("user_id, role")
+      .eq("tenant_id", tenant!.id),
 
     supabase
       .from("profiles")
@@ -413,8 +414,9 @@ try {
       const newRole = user.role === "deptadmin" ? "student" : "deptadmin";
       const { data: updateData, error: updateError } = await supabase
         .from("user_roles")
-        .update({ role: newRole })
-        .eq("user_id", user.id);
+        .update({ role: newRole, tenant_id: tenant!.id })
+        .eq("user_id", user.id)
+        .select("id");
 
       if (updateError) {
         throw updateError;
@@ -423,7 +425,7 @@ try {
       if (!updateData || updateData.length === 0) {
         const { error: insertError } = await supabase
           .from("user_roles")
-          .insert({ user_id: user.id, role: newRole });
+          .insert({ user_id: user.id, role: newRole, tenant_id: tenant!.id });
 
         if (insertError) {
           throw insertError;
