@@ -1,4 +1,5 @@
 import { Link } from "react-router-dom";
+import { deleteStorageFiles } from "@/utils/storageCleanup";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -173,6 +174,12 @@ export function HeroSection() {
   const uploadImage = async (field: keyof Pick<HeroContent, "frontImage" | "backImage">, file: File) => {
     setUploadingFor(field);
     try {
+      // Delete old image from storage if it was uploaded (not a default static asset)
+      const oldUrl = editContent[field];
+      if (oldUrl && oldUrl.includes("/storage/v1/")) {
+        await deleteStorageFiles([oldUrl]);
+      }
+
       const sanitized = `${Date.now()}-${file.name.replace(/[^a-zA-Z0-9_.-]/g, "_")}`;
       const filePath = `home_hero_images/${sanitized}`;
 
@@ -229,7 +236,12 @@ export function HeroSection() {
     }
   };
 
-  const removeSliderImage = (index: number) => {
+  const removeSliderImage = async (index: number) => {
+    const urlToDelete = editContent.sliderImages[index];
+    // Only delete from storage if it's a Supabase-uploaded image (not a static default)
+    if (urlToDelete && urlToDelete.includes("/storage/v1/")) {
+      await deleteStorageFiles([urlToDelete]);
+    }
     setEditContent((current) => ({
       ...current,
       sliderImages: current.sliderImages.filter((_, idx) => idx !== index),

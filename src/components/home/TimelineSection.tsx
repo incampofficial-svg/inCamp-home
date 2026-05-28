@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { deleteStorageFiles } from "@/utils/storageCleanup";
 import { useAdmin } from "@/hooks/useAdmin";
 import { useTenant } from "@/context/TenantContext";
 import { supabase } from "@/integrations/supabase/client";
@@ -253,8 +254,19 @@ export function TimelineSection() {
     ]);
   };
 
-  const removeCard = (id: string) => {
-    setEditCards((current) => current.filter((card) => card.id !== id));
+  const removeCard = async (id: string) => {
+    const card = editCards.find((c) => c.id === id);
+    if (card) {
+      // Delete card icon from storage
+      if (card.icon_url) {
+        await deleteStorageFiles([card.icon_url]);
+      }
+      // Delete card photos from storage
+      if (card.image_urls?.length) {
+        await deleteStorageFiles(card.image_urls);
+      }
+    }
+    setEditCards((current) => current.filter((c) => c.id !== id));
   };
 
   const uploadIcon = async (id: string, file: File) => {
@@ -365,41 +377,10 @@ export function TimelineSection() {
     }
   };
 
-  // Helper to permanently delete header photos from Supabase storage
-  const deleteHeaderPhotos = async (urls: string[]) => {
-    try {
-      const bucketName = "resources";
-      const paths = urls
-        .map((url) => {
-          try {
-            const parsed = new URL(url);
-            // Pathname looks like: /storage/v1/object/public/resources/home_timeline_header/file.png
-            // We need only the part after the bucket name: home_timeline_header/file.png
-            const bucketPrefix = `/storage/v1/object/public/${bucketName}/`;
-            const idx = parsed.pathname.indexOf(bucketPrefix);
-            if (idx !== -1) {
-              return parsed.pathname.substring(idx + bucketPrefix.length);
-            }
-            return null;
-          } catch {
-            return null;
-          }
-        })
-        .filter(Boolean) as string[];
-      if (paths.length === 0) return;
-      console.log("Deleting storage paths:", paths);
-      const { data, error } = await supabase.storage.from(bucketName).remove(paths);
-      if (error) throw error;
-      console.log("Storage delete result:", data);
-    } catch (err: any) {
-      console.error("Failed to delete header photos:", err);
-      toast.error(err?.message || "Unable to delete header photos.");
-    }
-  };
-
   const removeHeaderPhoto = async () => {
-    // Delete the stored images from Supabase before clearing state
-    await deleteHeaderPhotos(editHeader.photo_urls ?? []);
+    // Permanently delete header photos from Supabase storage
+    const ok = await deleteStorageFiles(editHeader.photo_urls ?? []);
+    if (!ok) toast.error("Some header photos could not be deleted from storage.");
     setEditHeader((current) => ({ ...current, photo_urls: [] }));
   };
 
