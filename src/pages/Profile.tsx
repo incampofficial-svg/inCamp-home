@@ -11,6 +11,7 @@ import { supabase } from "@/integrations/supabase/client";
 import { toast } from "sonner";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
+import { Eye, EyeOff } from "lucide-react";
 
 interface UserProfile {
   id: string;
@@ -31,21 +32,10 @@ export default function Profile() {
   const [profileLoading, setProfileLoading] = useState(false);
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
-  const [confirmPassword, setConfirmPassword] = useState("");
-  const [passwordVerified, setPasswordVerified] = useState(false);
-  const [verifyingPassword, setVerifyingPassword] = useState(false);
   const [updatingPassword, setUpdatingPassword] = useState(false);
+  const [showCurrentPassword, setShowCurrentPassword] = useState(false);
+  const [showNewPassword, setShowNewPassword] = useState(false);
   const { isAdmin, loading: adminLoading } = useAdmin();
-  const [deptAdminSearch, setDeptAdminSearch] = useState("");
-  const [deptAdminResults, setDeptAdminResults] = useState<{
-    id: string;
-    name: string | null;
-    email: string | null;
-    role: "student" | "deptadmin";
-  }[]>([]);
-  const [deptAdminSearchLoading, setDeptAdminSearchLoading] = useState(false);
-  const [deptAdminActionLoading, setDeptAdminActionLoading] = useState<string | null>(null);
-  const [deptAdminError, setDeptAdminError] = useState<string | null>(null);
   const path = (value: string) => tenantPath(tenant?.slug || "", value);
 
   useEffect(() => {
@@ -95,145 +85,6 @@ export default function Profile() {
     };
   }, [user, tenant?.id]);
 
-  const searchDepartmentAdminUsers = async () => {
-    const searchTerm = deptAdminSearch.trim();
-    setDeptAdminError(null);
-    setDeptAdminResults([]);
-
-    if (!searchTerm) {
-      setDeptAdminError("Please enter a user name or email to search.");
-      return;
-    }
-
-    if (!tenant?.id) {
-      setDeptAdminError("Tenant is still loading. Please try again.");
-      return;
-    }
-
-    setDeptAdminSearchLoading(true);
-    try {
-      const ilikeSearch = `%${searchTerm}%`;
-      const emailSearch = searchTerm.includes("@") ? searchTerm.trim().toLowerCase() : null;
-      let profileQuery = supabase
-        .from("profiles")
-        .select("id,name,email")
-        .eq("tenant_id", tenant.id)
-        .order("created_at", { ascending: false })
-        .limit(50);
-
-      if (emailSearch) {
-        profileQuery = profileQuery.or(
-          `email.eq.${emailSearch},name.ilike.${ilikeSearch},email.ilike.${ilikeSearch}`
-        );
-      } else {
-        profileQuery = profileQuery.or(`name.ilike.${ilikeSearch},email.ilike.${ilikeSearch}`);
-      }
-
-      const { data: profiles, error: profileError } = await profileQuery;
-
-      if (profileError) throw profileError;
-      if (!profiles || profiles.length === 0) {
-        setDeptAdminError("No user profiles found with that name or email.");
-        return;
-      }
-
-      const userIds = profiles.map((profile) => profile.id);
-      const { data: userRoles, error: userRolesError } = await supabase
-        .from("user_roles")
-        .select("user_id,role")
-        .in("user_id", userIds)
-        .eq("tenant_id", tenant.id);
-
-      if (userRolesError) throw userRolesError;
-
-      const roleByUser = userRoles?.reduce((acc, userRole) => {
-        acc[userRole.user_id] = userRole.role as "student" | "deptadmin";
-        return acc;
-      }, {} as Record<string, "student" | "deptadmin">) || {};
-
-      setDeptAdminResults(
-        profiles.map((profile) => ({
-          id: profile.id,
-          name: profile.name,
-          email: profile.email,
-          role: roleByUser[profile.id] || "student",
-        }))
-      );
-    } catch (error: any) {
-      console.error("Department admin search failed:", error);
-      setDeptAdminError(error?.message || "Unable to search users. Check your permissions.");
-    } finally {
-      setDeptAdminSearchLoading(false);
-    }
-  };
-
-  const toggleDepartmentAdminRole = async (profile: {
-    id: string;
-    name: string | null;
-    email: string | null;
-    role: "student" | "deptadmin";
-  }) => {
-    setDeptAdminActionLoading(profile.id);
-    setDeptAdminError(null);
-
-    try {
-      if (!tenant?.id) {
-        throw new Error("Tenant is still loading. Please try again.");
-      }
-
-      if (profile.role === "deptadmin") {
-        const { data: updateData, error: updateError } = await supabase
-          .from("user_roles")
-          .update({ role: "student", tenant_id: tenant.id })
-          .eq("user_id", profile.id)
-          .select("id");
-
-        if (updateError) throw updateError;
-
-        if (!updateData || updateData.length === 0) {
-          const { error: insertError } = await supabase
-            .from("user_roles")
-            .insert({ user_id: profile.id, role: "student", tenant_id: tenant.id });
-
-          if (insertError) throw insertError;
-        }
-
-        setDeptAdminResults((current) =>
-          current.map((result) =>
-            result.id === profile.id ? { ...result, role: "student" } : result
-          )
-        );
-      } else {
-        const { data: updateData, error: updateError } = await supabase
-          .from("user_roles")
-          .update({ role: "deptadmin", tenant_id: tenant.id })
-          .eq("user_id", profile.id)
-          .select("id");
-
-        if (updateError) throw updateError;
-
-        if (!updateData || updateData.length === 0) {
-          const { error: insertError } = await supabase
-            .from("user_roles")
-            .insert({ user_id: profile.id, role: "deptadmin", tenant_id: tenant.id });
-
-          if (insertError) throw insertError;
-        }
-
-        setDeptAdminResults((current) =>
-          current.map((result) =>
-            result.id === profile.id ? { ...result, role: "deptadmin" } : result
-          )
-        );
-      }
-    } catch (error: any) {
-      console.error("Department admin role update failed:", error);
-      setDeptAdminError(error?.message || "Unable to update department admin permission.");
-    } finally {
-      setDeptAdminActionLoading(null);
-    }
-  };
-
   const handleUsernameSave = async () => {
     if (!usernameValue.trim()) {
       toast.error("Username cannot be empty.");
@@ -271,62 +122,52 @@ export default function Profile() {
     }
   };
 
-  const verifyCurrentPassword = async () => {
-    if (!currentPassword) {
-      toast.error("Enter your current password to verify.");
-      return;
-    }
-
-    if (!user?.email) {
-      toast.error("Unable to verify password without an email address.");
-      return;
-    }
-
-    setVerifyingPassword(true);
-    try {
-      const { error } = await supabase.auth.signInWithPassword({
-        email: user.email,
-        password: currentPassword,
-      });
-      if (error) throw error;
-      setPasswordVerified(true);
-      toast.success("Current password verified.");
-    } catch (error: any) {
-      console.error("Password verification failed:", error);
-      setPasswordVerified(false);
-      toast.error(error?.message || "Current password is incorrect.");
-    } finally {
-      setVerifyingPassword(false);
-    }
-  };
-
   const handlePasswordChange = async () => {
-    if (!passwordVerified) {
-      toast.error("Verify your current password first.");
+    if (!currentPassword) {
+      toast.error("Please enter your current password.");
+      return;
+    }
+
+    if (!newPassword) {
+      toast.error("Please enter a new password.");
       return;
     }
 
     if (newPassword.length < 8) {
-      toast.error("New password must be at least 8 characters.");
+      toast.error("New password must be at least 8 characters long.");
       return;
     }
 
-    if (newPassword !== confirmPassword) {
-      toast.error("New password and confirm password do not match.");
+    if (currentPassword === newPassword) {
+      toast.error("New password must be different from current password.");
       return;
     }
 
     setUpdatingPassword(true);
     try {
-      const { error } = await supabase.auth.updateUser({
+      const { error: signInError } = await supabase.auth.signInWithPassword({
+        email: user!.email!,
+        password: currentPassword,
+      });
+
+      if (signInError) {
+        toast.error("Incorrect current password. Please try again.");
+        setUpdatingPassword(false);
+        return;
+      }
+
+      const { error: updateError } = await supabase.auth.updateUser({
         password: newPassword,
       });
-      if (error) throw error;
+
+      if (updateError) {
+        toast.error(updateError.message || "Failed to update password. It might be too weak.");
+        return;
+      }
+
       toast.success("Password changed successfully.");
       setCurrentPassword("");
       setNewPassword("");
-      setConfirmPassword("");
-      setPasswordVerified(false);
     } catch (error: any) {
       console.error("Failed to change password:", error);
       toast.error(error?.message || "Unable to change password.");
@@ -415,89 +256,6 @@ export default function Profile() {
             </CardContent>
           </Card>
 
-          {isAdmin && !adminLoading && (
-            <Card>
-              <CardContent className="space-y-6">
-                <div>
-                  <h2 className="text-xl font-semibold">Manage Department Admins</h2>
-                  <p className="text-sm text-muted-foreground">
-                    Search existing user profiles by name or email and assign or revoke department admin access.
-                  </p>
-                </div>
-
-                <div className="space-y-4">
-                  <div className="space-y-2">
-                    <Label htmlFor="dept-admin-search">Search profiles</Label>
-                    <Input
-                      id="dept-admin-search"
-                      value={deptAdminSearch}
-                      onChange={(e) => setDeptAdminSearch(e.target.value)}
-                      placeholder="Search by name or email"
-                    />
-                  </div>
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                    <Button
-                      variant="orange"
-                      onClick={searchDepartmentAdminUsers}
-                      disabled={deptAdminSearchLoading || !deptAdminSearch.trim()}
-                    >
-                      {deptAdminSearchLoading ? "Searching..." : "Search Profiles"}
-                    </Button>
-                    <p className="text-sm text-muted-foreground">
-                      Only users with an existing profile may be assigned department admin access.
-                    </p>
-                  </div>
-
-                  {deptAdminError && (
-                    <p className="text-sm text-destructive">{deptAdminError}</p>
-                  )}
-
-                  {deptAdminResults.length > 0 && (
-                    <div className="overflow-x-auto">
-                      <table className="w-full text-left">
-                        <thead>
-                          <tr className="border-b border-border">
-                            <th className="py-3 px-4 text-sm font-medium text-foreground">Name</th>
-                            <th className="py-3 px-4 text-sm font-medium text-foreground">Email</th>
-                            <th className="py-3 px-4 text-sm font-medium text-foreground">Status</th>
-                            <th className="py-3 px-4 text-sm font-medium text-foreground">Action</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {deptAdminResults.map((result) => (
-                            <tr key={result.id} className="border-b border-border/50">
-                              <td className="py-3 px-4 text-foreground">{result.name || "—"}</td>
-                              <td className="py-3 px-4 text-foreground">{result.email || "—"}</td>
-                              <td className="py-3 px-4 text-foreground text-sm">
-                                {result.role === "deptadmin" ? "Department admin" : "Student"}
-                              </td>
-                              <td className="py-3 px-4">
-                                <Button
-                                  variant={result.role === "deptadmin" ? "outline" : "orange"}
-                                  size="sm"
-                                  onClick={() => toggleDepartmentAdminRole(result)}
-                                  disabled={deptAdminActionLoading === result.id}
-                                >
-                                  {deptAdminActionLoading === result.id
-                                    ? result.role === "deptadmin"
-                                      ? "Revoking..."
-                                      : "Assigning..."
-                                    : result.role === "deptadmin"
-                                    ? "Revoke"
-                                    : "Make deptadmin"}
-                                </Button>
-                              </td>
-                            </tr>
-                          ))}
-                        </tbody>
-                      </table>
-                    </div>
-                  )}
-                </div>
-              </CardContent>
-            </Card>
-          )}
-
           <Card>
             <CardContent className="space-y-6">
               <div>
@@ -533,60 +291,60 @@ export default function Profile() {
               <div>
                 <h2 className="text-xl font-semibold">Change password</h2>
                 <p className="text-sm text-muted-foreground">
-                  Enter your current password first. Only verified users can change their password.
+                  Provide your current password and a new password to update.
                 </p>
               </div>
 
               <div className="space-y-4">
                 <div className="space-y-2">
                   <label className="text-sm font-medium text-foreground">Current password</label>
-                  <Input
-                    type="password"
-                    value={currentPassword}
-                    onChange={(e) => setCurrentPassword(e.target.value)}
-                    placeholder="Current password"
-                  />
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={verifyCurrentPassword}
-                  disabled={verifyingPassword || !currentPassword}
-                >
-                  {verifyingPassword ? "Verifying..." : passwordVerified ? "Verified" : "Verify current password"}
-                </Button>
-              </div>
-
-              {passwordVerified && (
-                <div className="space-y-4 pt-4 border-t border-border">
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-foreground">New password</label>
+                  <div className="relative">
                     <Input
-                      type="password"
+                      type={showCurrentPassword ? "text" : "password"}
+                      value={currentPassword}
+                      onChange={(e) => setCurrentPassword(e.target.value)}
+                      placeholder="Current password"
+                      className="pr-10"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowCurrentPassword(!showCurrentPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground z-10"
+                    >
+                      {showCurrentPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-sm font-medium text-foreground">New password</label>
+                  <div className="relative">
+                    <Input
+                      type={showNewPassword ? "text" : "password"}
                       value={newPassword}
                       onChange={(e) => setNewPassword(e.target.value)}
                       placeholder="New password"
+                      className="pr-10"
                     />
+                    <button
+                      type="button"
+                      onClick={() => setShowNewPassword(!showNewPassword)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground z-10"
+                    >
+                      {showNewPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
                   </div>
-                  <div className="space-y-2">
-                    <label className="text-sm font-medium text-foreground">Confirm password</label>
-                    <Input
-                      type="password"
-                      value={confirmPassword}
-                      onChange={(e) => setConfirmPassword(e.target.value)}
-                      placeholder="Confirm new password"
-                    />
-                  </div>
-                  <Button
-                    variant="orange"
-                    size="sm"
-                    onClick={handlePasswordChange}
-                    disabled={updatingPassword || !newPassword || !confirmPassword}
-                  >
-                    {updatingPassword ? "Updating..." : "Change password"}
-                  </Button>
                 </div>
-              )}
+
+                <Button
+                  variant="orange"
+                  size="sm"
+                  onClick={handlePasswordChange}
+                  disabled={updatingPassword || !currentPassword || !newPassword}
+                >
+                  {updatingPassword ? "Updating..." : "Change password"}
+                </Button>
+              </div>
             </CardContent>
           </Card>
         </div>

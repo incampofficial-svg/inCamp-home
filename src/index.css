@@ -192,3 +192,9 @@
 .animation-delay-400 {
   animation-delay: 400ms;
 }
+
+/* Hide native browser password reveal button in Edge/Chrome */
+input[type="password"]::-ms-reveal,
+input[type="password"]::-ms-clear {
+  display: none;
+}

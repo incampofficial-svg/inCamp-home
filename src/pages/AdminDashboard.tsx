@@ -38,16 +38,32 @@ interface TeamRegistration {
   problem_id: string;
   member1_name: string;
   member1_roll: string;
+  member1_year: string;
+  member1_department: string;
+  member1_phone: string;
+  member1_email: string;
   member2_name?: string;
   member2_roll?: string;
+  member2_year?: string;
+  member2_department?: string;
+  member2_phone?: string;
+  member2_email?: string;
   member3_name?: string;
   member3_roll?: string;
+  member3_year?: string;
+  member3_department?: string;
+  member3_phone?: string;
+  member3_email?: string;
   member4_name?: string;
   member4_roll?: string;
-  year: string;
-  department: string;
-  phone: string;
-  email: string;
+  member4_year?: string;
+  member4_department?: string;
+  member4_phone?: string;
+  member4_email?: string;
+  year?: string;
+  department?: string;
+  phone?: string;
+  email?: string;
   document_url?: string;
   document_filename?: string;
   created_at: string;
@@ -257,6 +273,10 @@ try {
             ...reg,
             problem_title: problem?.title || "Unknown Problem",
             theme: problem?.theme || "Unknown Theme",
+            year: reg.member1_year || reg.year || "",
+            department: reg.member1_department || reg.department || "",
+            email: reg.member1_email || reg.email || "",
+            phone: reg.member1_phone || reg.phone || "",
           };
         });
 
@@ -620,10 +640,29 @@ try {
   const handleSaveTeam = async (data: Omit<TeamRegistration, "id" | "created_at" | "problem_title" | "theme">) => {
     try {
       if (selectedTeam) {
-        // Update existing team
+        // Update existing team using correct database column mappings
+        const updateData = {
+          team_name: data.team_name,
+          problem_id: data.problem_id,
+          member1_name: data.member1_name,
+          member1_roll: data.member1_roll,
+          member2_name: data.member2_name || null,
+          member2_roll: data.member2_roll || null,
+          member3_name: data.member3_name || null,
+          member3_roll: data.member3_roll || null,
+          member4_name: data.member4_name || null,
+          member4_roll: data.member4_roll || null,
+          member1_year: data.year,
+          member1_department: data.department,
+          member1_phone: data.phone,
+          member1_email: data.email,
+          document_url: data.document_url || null,
+          tenant_id: tenant!.id,
+        };
+
         const { error } = await (supabase as any)
           .from("team_registrations")
-          .update({ ...data, tenant_id: tenant!.id })
+          .update(updateData)
           .eq("id", selectedTeam.id)
           .eq("tenant_id", tenant!.id);
 
@@ -635,6 +674,10 @@ try {
             ? {
                 ...team,
                 ...data,
+                member1_year: data.year,
+                member1_department: data.department,
+                member1_phone: data.phone,
+                member1_email: data.email,
                 problem_title: problems.find(p => p.problem_statement_id === data.problem_id)?.title || "Unknown Problem",
                 theme: problems.find(p => p.problem_statement_id === data.problem_id)?.theme || "Unknown Theme"
               }
@@ -1220,44 +1263,100 @@ try {
 
                         <div className="overflow-x-auto">
                           {filteredTeams.length > 0 ? (
-                            <table className="w-full min-w-[1000px] border-separate border-spacing-y-2">
+                            <table className="w-full min-w-[900px] border-collapse">
                               <thead>
-                                <tr className="text-left text-sm font-semibold text-foreground border-b border-border">
-                                  <th className="py-3 px-4">Team Name</th>
-                                  <th className="py-3 px-4">Problem</th>
-                                  <th className="py-3 px-4">Members</th>
-                                  <th className="py-3 px-4">Year</th>
-                                  <th className="py-3 px-4">Department</th>
-                                  <th className="py-3 px-4">Contact</th>
-                                  <th className="py-3 px-4">Registered</th>
-                                  <th className="py-3 px-4">Actions</th>
+                                <tr className="text-left text-sm font-semibold text-foreground border-b-2 border-border pb-3">
+                                  <th className="py-3 px-4 w-[15%]">Team Name</th>
+                                  <th className="py-3 px-4 w-[15%]">Problem</th>
+                                  <th className="py-3 px-4 w-[50%]">Members & Contact Details</th>
+                                  <th className="py-3 px-4 w-[10%]">Registered</th>
+                                  <th className="py-3 px-4 w-[10%]">Actions</th>
                                 </tr>
                               </thead>
                               <tbody>
                                 {filteredTeams.map((team) => (
-                                  <tr key={team.id} className="border-b border-border/50">
-                                    <td className="py-3 px-4 text-foreground font-medium">{team.team_name}</td>
-                                    <td className="py-3 px-4 text-foreground">{team.problem_title}</td>
-                                    <td className="py-3 px-4 text-foreground">
-                                      <div className="text-sm">
-                                        <div>{team.member1_name} ({team.member1_roll})</div>
-                                        {team.member2_name && <div>{team.member2_name} ({team.member2_roll})</div>}
-                                        {team.member3_name && <div>{team.member3_name} ({team.member3_roll})</div>}
-                                        {team.member4_name && <div>{team.member4_name} ({team.member4_roll})</div>}
+                                  <tr key={team.id} className="border-b-2 border-border/80 hover:bg-muted/10 transition-colors">
+                                    <td className="py-6 px-4 text-foreground font-semibold align-top">{team.team_name}</td>
+                                    <td className="py-6 px-4 text-foreground align-top">{team.problem_title}</td>
+                                    <td className="py-6 px-4 text-foreground align-top">
+                                      <div className="space-y-3 max-w-xl">
+                                        {[
+                                          {
+                                            role: "Member 1 (Leader)",
+                                            name: team.member1_name,
+                                            roll: team.member1_roll,
+                                            year: team.member1_year,
+                                            dept: team.member1_department,
+                                            phone: team.member1_phone,
+                                            email: team.member1_email,
+                                          },
+                                          team.member2_name ? {
+                                            role: "Member 2",
+                                            name: team.member2_name,
+                                            roll: team.member2_roll,
+                                            year: team.member2_year,
+                                            dept: team.member2_department,
+                                            phone: team.member2_phone,
+                                            email: team.member2_email,
+                                          } : null,
+                                          team.member3_name ? {
+                                            role: "Member 3",
+                                            name: team.member3_name,
+                                            roll: team.member3_roll,
+                                            year: team.member3_year,
+                                            dept: team.member3_department,
+                                            phone: team.member3_phone,
+                                            email: team.member3_email,
+                                          } : null,
+                                          team.member4_name ? {
+                                            role: "Member 4",
+                                            name: team.member4_name,
+                                            roll: team.member4_roll,
+                                            year: team.member4_year,
+                                            dept: team.member4_department,
+                                            phone: team.member4_phone,
+                                            email: team.member4_email,
+                                          } : null,
+                                        ]
+                                          .filter(Boolean)
+                                          .map((member: any, idx) => (
+                                            <div
+                                              key={idx}
+                                              className="border border-border/60 rounded-xl p-3 bg-muted/30 shadow-sm transition-all hover:bg-muted/50"
+                                            >
+                                              <div className="flex items-center justify-between font-semibold text-sm text-foreground mb-1">
+                                                <span>
+                                                  {member.name}{" "}
+                                                  <span className="text-xs font-normal text-muted-foreground">
+                                                    ({member.roll})
+                                                  </span>
+                                                </span>
+                                                <span className="text-[10px] px-2.5 py-0.5 rounded-full bg-primary/10 text-primary border border-primary/20 font-medium">
+                                                  {member.role}
+                                                </span>
+                                              </div>
+                                              <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">
+                                                <div>
+                                                  <span className="font-medium text-foreground/75">Dept:</span> {member.dept || "--"}
+                                                </div>
+                                                <div>
+                                                  <span className="font-medium text-foreground/75">Year:</span> {member.year || "--"}
+                                                </div>
+                                                <div className="col-span-2">
+                                                  <span className="font-medium text-foreground/75">Email:</span> {member.email || "--"}
+                                                </div>
+                                                <div className="col-span-2">
+                                                  <span className="font-medium text-foreground/75">Phone:</span> {member.phone || "--"}
+                                                </div>
+                                              </div>
+                                            </div>
+                                          ))}
                                       </div>
                                     </td>
-                                    <td className="py-3 px-4 text-foreground">{team.year}</td>
-                                    <td className="py-3 px-4 text-foreground">{team.department}</td>
-                                    <td className="py-3 px-4 text-foreground">
-                                      <div className="text-sm">
-                                        <div>{team.email}</div>
-                                        <div>{team.phone}</div>
-                                      </div>
-                                    </td>
-                                    <td className="py-3 px-4 text-foreground text-sm">
+                                    <td className="py-6 px-4 text-foreground text-sm align-top">
                                       {new Date(team.created_at).toLocaleDateString()}
                                     </td>
-                                    <td className="py-3 px-4">
+                                    <td className="py-6 px-4 align-top">
                                       <div className="flex gap-2">
                                         {team.document_url && (
                                           <>
