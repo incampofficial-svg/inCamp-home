@@ -3,7 +3,7 @@ import { Layout } from "@/components/layout/Layout";
 import { Card, CardContent } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import { FileText, Download, HelpCircle, Calendar, BookOpen, FileSpreadsheet, Upload, Trash2, Edit, Save, X, Plus } from "lucide-react";
+import { FileText, Download, HelpCircle, Upload, Trash2, Edit, Save, X, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
 import { useAdmin } from "@/hooks/useAdmin";
@@ -13,13 +13,7 @@ import { QuerySubmissionForm } from "@/components/resources/QuerySubmissionForm"
 import { AdminQueryList } from "@/components/resources/AdminQueryList";
 import { toast } from "sonner";
 import { useTenant } from "@/context/TenantContext";
-
-const iconMap: Record<string, React.ElementType> = {
-  ppt_template: FileText,
-  evaluation_rubrics: FileSpreadsheet,
-  rules_guidelines: BookOpen,
-  timeline_pdf: Calendar,
-};
+import { RESOURCE_ICON_MAP, getResourceIconKey } from "@/lib/resourceIcons";
 
 interface Resource {
   id: string;
@@ -379,7 +373,7 @@ export default function Resources() {
           ) : (
             <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-6">
               {resources.map((resource) => {
-                const Icon = iconMap[resource.section_key] || FileText;
+                const Icon = RESOURCE_ICON_MAP[getResourceIconKey(resource.section_key)] || FileText;
                 return (
                   <Card
                     key={resource.id}

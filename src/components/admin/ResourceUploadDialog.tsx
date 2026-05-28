@@ -8,6 +8,12 @@ import { supabase } from "@/integrations/supabase/client";
 import { Upload, X } from "lucide-react";
 import { toast } from "sonner";
 import { useTenant } from "@/context/TenantContext";
+import {
+  DEFAULT_RESOURCE_ICON_KEY,
+  RESOURCE_ICON_OPTIONS,
+  RESOURCE_ICON_SEPARATOR,
+  getResourceIconKey,
+} from "@/lib/resourceIcons";
 
 interface Resource {
   id: string;
@@ -34,6 +40,7 @@ export function ResourceUploadDialog({
   const isEditMode = Boolean(resource);
   const [title, setTitle] = useState(resource?.title || "");
   const [description, setDescription] = useState(resource?.description || "");
+  const [iconKey, setIconKey] = useState(getResourceIconKey(resource?.section_key));
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -43,6 +50,7 @@ export function ResourceUploadDialog({
     if (open) {
       setTitle(resource?.title || "");
       setDescription(resource?.description || "");
+      setIconKey(getResourceIconKey(resource?.section_key));
       setFile(null);
     }
   }, [open, resource]);
@@ -60,6 +68,26 @@ export function ResourceUploadDialog({
       .replace(/[^a-z0-9]+/g, "_")
       .replace(/^_|_$/g, "");
     return slug || `resource_${Date.now()}`;
+  };
+
+  const getSectionSlug = (sectionKey?: string | null) => {
+    if (!sectionKey) return "";
+    const [, encodedSlug] = sectionKey.split(RESOURCE_ICON_SEPARATOR);
+    if (encodedSlug) return encodedSlug;
+    if (RESOURCE_ICON_OPTIONS.some((option) => option.key === sectionKey)) return "";
+    return sectionKey;
+  };
+
+  const buildSectionKey = () => {
+    const selectedIconKey = iconKey || DEFAULT_RESOURCE_ICON_KEY;
+    const currentSlug = getSectionSlug(resource?.section_key);
+    const slug = currentSlug || generateSectionKey(title);
+
+    if (resource?.section_key === selectedIconKey) {
+      return selectedIconKey;
+    }
+
+    return `${selectedIconKey}${RESOURCE_ICON_SEPARATOR}${slug}`;
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -103,6 +131,7 @@ export function ResourceUploadDialog({
             description,
             file_url: fileUrl,
             file_type: fileType,
+            section_key: buildSectionKey(),
             tenant_id: tenant!.id,
             updated_at: new Date().toISOString(),
           })
@@ -119,7 +148,7 @@ export function ResourceUploadDialog({
             description,
             file_url: fileUrl,
             file_type: fileType,
-            section_key: sectionKey,
+            section_key: `${iconKey}${RESOURCE_ICON_SEPARATOR}${sectionKey}`,
             tenant_id: tenant!.id,
             updated_at: new Date().toISOString(),
           },
@@ -163,6 +192,33 @@ export function ResourceUploadDialog({
               onChange={(e) => setDescription(e.target.value)}
               rows={3}
             />
+          </div>
+          <div>
+            <Label>Icon Template</Label>
+            <div className="mt-2 grid grid-cols-2 gap-2 sm:grid-cols-5">
+              {RESOURCE_ICON_OPTIONS.map(({ key, label, Icon }) => {
+                const isSelected = iconKey === key;
+
+                return (
+                  <button
+                    key={key}
+                    type="button"
+                    aria-label={`Use ${label} icon`}
+                    aria-pressed={isSelected}
+                    title={label}
+                    onClick={() => setIconKey(key)}
+                    className={`flex h-16 flex-col items-center justify-center gap-1 rounded-md border text-xs transition-colors ${
+                      isSelected
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-input bg-background text-muted-foreground hover:border-primary/50 hover:text-foreground"
+                    }`}
+                  >
+                    <Icon className="h-5 w-5" />
+                    <span className="max-w-full truncate px-1">{label}</span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
           <div>
             <Label>File</Label>

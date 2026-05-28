@@ -341,6 +341,37 @@ export function TimelineSection() {
     }
   };
 
+  const removeCardPhoto = async (cardId: string, photoUrl: string) => {
+    const ok = await deleteStorageFiles([photoUrl]);
+    if (!ok) toast.error("Photo could not be deleted from storage.");
+
+    setEditCards((current) =>
+      current.map((card) =>
+        card.id === cardId
+          ? {
+              ...card,
+              image_urls: (card.image_urls ?? []).filter((url) => url !== photoUrl),
+            }
+          : card
+      )
+    );
+  };
+
+  const removeCardPhotos = async (cardId: string) => {
+    const card = editCards.find((currentCard) => currentCard.id === cardId);
+    const photoUrls = card?.image_urls ?? [];
+    if (!photoUrls.length) return;
+
+    const ok = await deleteStorageFiles(photoUrls);
+    if (!ok) toast.error("Some photos could not be deleted from storage.");
+
+    setEditCards((current) =>
+      current.map((currentCard) =>
+        currentCard.id === cardId ? { ...currentCard, image_urls: [] } : currentCard
+      )
+    );
+  };
+
   const uploadHeaderPhoto = async (files: FileList) => {
     setUploadingPhoto(true);
     try {
@@ -605,16 +636,32 @@ export function TimelineSection() {
                     />
                     {card.image_urls?.length ? (
                       <div className="space-y-6 pt-6">
-                        <div className="text-sm font-medium text-muted-foreground">Uploaded photos</div>
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div className="text-sm font-medium text-muted-foreground">Uploaded photos</div>
+                          <Button variant="outline" size="sm" onClick={() => removeCardPhotos(card.id)}>
+                            <Trash2 className="w-4 h-4 mr-2" />
+                            Remove Photos
+                          </Button>
+                        </div>
                         <div className="flex flex-col items-center gap-8">
                           {card.image_urls.map((url, idx) => (
-                            <div key={`${url}-${idx}`} className="w-full flex justify-center">
+                            <div key={`${url}-${idx}`} className="relative w-full flex justify-center rounded-lg border border-border bg-slate-50 p-3">
                               <img
                                 src={url}
                                 alt={`${card.title} photo ${idx + 1}`}
                                 className="mx-auto block"
                                 style={{ width: "auto", maxWidth: "100%", height: "auto" }}
                               />
+                              <Button
+                                type="button"
+                                variant="destructive"
+                                size="sm"
+                                onClick={() => removeCardPhoto(card.id, url)}
+                                className="absolute right-3 top-3"
+                              >
+                                <Trash2 className="w-4 h-4 mr-2" />
+                                Remove
+                              </Button>
                             </div>
                           ))}
                         </div>
