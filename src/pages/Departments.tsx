@@ -22,6 +22,7 @@ interface ProblemRow {
   status?: string;
   created_at?: string;
   approved_at?: string;
+  max_registrations?: number | null;
 }
 
 export default function DepartmentsPage() {
@@ -29,7 +30,7 @@ export default function DepartmentsPage() {
   const [departments, setDepartments] = useState<string[]>([]);
 
   const [loading, setLoading] = useState(true);
-  const [selectedTheme, setSelectedTheme] = useState<string>("All");
+  const [selectedTheme, setSelectedTheme] = useState<string>("");
   const [selectedDept, setSelectedDept] = useState<string>("All");
   const { isAdmin } = useAdmin();
   const { tenant } = useTenant();
@@ -262,34 +263,128 @@ export default function DepartmentsPage() {
       </section>
 
       <div className="container mx-auto p-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
-          <div className="flex gap-4">
-            <select
-              value={selectedTheme}
-              onChange={(e) => setSelectedTheme(e.target.value)}
-              className="border border-input rounded-md px-3 py-2 bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            >
-              <option value="All">All Themes</option>
-              {Object.keys(grouped || {})
-                .sort()
-                .map((t) => (
-                  <option key={t} value={t}>
-                    {t}
-                  </option>
-                ))}
-            </select>
-            <select
-              value={selectedDept}
-              onChange={(e) => setSelectedDept(e.target.value)}
-              className="border border-input rounded-md px-3 py-2 bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            >
-              <option value="All">All Departments</option>
-              {departments.map((d) => (
-                <option key={d} value={d}>
-                  {d}
-                </option>
-              ))}
-            </select>
+        <div className="flex flex-col gap-6 mb-6">
+          <div className="flex flex-wrap gap-4 items-center">
+            {["Academic", "Non-Academic", "Community Innovation"].map((theme) => {
+              const deptsMap = (grouped || {})[theme] || {};
+              const count = Object.values(deptsMap || {}).reduce(
+                (s: number, dm: any) => s + Object.values(dm).reduce((t: number, arr: any) => t + (arr?.length || 0), 0),
+                0
+              );
+
+              return (
+                <button
+                  key={theme}
+                  onClick={() => {
+                    setSelectedTheme(theme);
+                    setSelectedDept("All");
+                  }}
+                  className={`px-4 py-2 rounded-lg font-semibold flex items-center gap-3 ${selectedTheme === theme ? "bg-secondary text-white" : "bg-card border border-border text-foreground"}`}
+                >
+                  <span>{theme}</span>
+                  <span className="ml-2 inline-flex items-center justify-center rounded-full bg-muted px-2 py-0.5 text-xs">{count}</span>
+                </button>
+              );
+            })}
+          </div>
+
+          <div>
+            {selectedTheme === "" ? (
+              <p className="text-muted-foreground">Choose a category above to view departments and problem statements.</p>
+            ) : (
+              <div className="mt-4">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-lg font-semibold">{selectedTheme}</h2>
+                  <div className="flex items-center gap-2">
+                    <button
+                      className="text-sm text-muted-foreground underline"
+                      onClick={() => setSelectedTheme("")}
+                    >
+                      Back
+                    </button>
+                    <span className="text-sm text-muted-foreground">Departments: {Object.keys((grouped || {})[selectedTheme] || {}).length}</span>
+                  </div>
+                </div>
+
+                {/* Departments list */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {Object.keys((grouped || {})[selectedTheme] || {}).sort().map((dept) => {
+                    const deptsMap = (grouped || {})[selectedTheme] || {};
+                    const total = Object.values(deptsMap[dept] || {}).reduce((t: number, arr: any) => t + (arr?.length || 0), 0);
+                    return (
+                      <div
+                        key={dept}
+                        className={`p-4 rounded-lg border cursor-pointer ${selectedDept === dept ? "border-secondary bg-secondary/5" : "border-border bg-card"}`}
+                        onClick={() => setSelectedDept(dept)}
+                      >
+                        <div className="flex items-center justify-between">
+                          <div className="font-medium">{dept}</div>
+                          <div className="text-sm text-muted-foreground">{total} PS</div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {/* Problems for selected department */}
+                {selectedDept !== "All" && selectedDept !== "" && (
+                  <div className="mt-6">
+                    <div className="flex items-center justify-between mb-3">
+                      <h3 className="text-md font-semibold">{selectedDept} — Problem Statements</h3>
+                      <button className="text-sm text-muted-foreground underline" onClick={() => setSelectedDept("All")}>Back to departments</button>
+                    </div>
+
+                    <div className="space-y-3">
+                      {(() => {
+                        const deptsMap = (grouped || {})[selectedTheme] || {};
+                        const cats = Object.keys(deptsMap[selectedDept] || {});
+                        const flat: ProblemRow[] = [];
+                        cats.forEach((c) => (flat.push(...(deptsMap[selectedDept][c] || []))));
+                        return flat.map((p, idx) => (
+                          <div key={p.id} className="bg-card rounded-xl border border-border p-4 flex items-center justify-between">
+                            <div>
+                              <div className="text-sm text-muted-foreground">{idx + 1}. {p.problem_statement_id}</div>
+                              <h4 className="font-semibold">{p.title}</h4>
+                              <p className="text-sm text-muted-foreground line-clamp-2">{p.description}</p>
+                            </div>
+
+                            <div className="flex flex-col items-end gap-2">
+                              {isAdmin && (
+                                <>
+                                  <div className="flex gap-2">
+                                    <Button variant="outline" size="icon" onClick={() => openEdit(p)} title="Edit">
+                                      <Edit className="w-4 h-4" />
+                                    </Button>
+                                    <Button variant="outline" size="icon" onClick={() => { setSelected(p); setDeleteOpen(true); }} title="Delete">
+                                      <Trash2 className="w-4 h-4" />
+                                    </Button>
+                                  </div>
+                                  <div className="flex gap-2">
+                                    <Button size="sm" className="bg-green-600 hover:bg-green-700 text-white" onClick={() => openAcceptDialog(p)}>
+                                      <Check className="w-4 h-4 mr-1" />
+                                      Accept
+                                    </Button>
+                                    <Button size="sm" variant="destructive" onClick={() => openRejectDialog(p)}>
+                                      <X className="w-4 h-4 mr-1" />
+                                      Reject
+                                    </Button>
+                                  </div>
+                                </>
+                              )}
+
+                              <Button size="sm" variant="orange" onClick={() => openModal(p)}>
+                                View Details
+                                <ArrowRight className="w-4 h-4 ml-1" />
+                              </Button>
+                            </div>
+                          </div>
+                        ));
+                      })()}
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
         </div>
 

@@ -192,6 +192,7 @@ export default function Problems() {
         detailed_description,
         category,
         theme,
+        max_registrations,
       } = data;
 
       const problemDataForSave = {
@@ -202,6 +203,7 @@ export default function Problems() {
         category,
         theme,
         department_id: department_id,
+        max_registrations: max_registrations != null && max_registrations !== "" ? Number(max_registrations) : null,
       };
 
       if (selectedProblem) {

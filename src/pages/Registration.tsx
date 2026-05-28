@@ -117,6 +117,55 @@ export default function Registration() {
     blankMember(),
   ]);
   const [problemId, setProblemId] = useState("");
+  // Persist form state key (per-tenant)
+  const storageKey = `registration_form_${tenant?.id || 'public'}`;
+
+  // Load saved form state on mount (or when tenant changes)
+  useEffect(() => {
+    try {
+      if (!tenant?.id) return;
+      const raw = localStorage.getItem(storageKey);
+      if (!raw) return;
+      const parsed = JSON.parse(raw);
+      if (parsed.teamName) setTeamName(parsed.teamName);
+      if (parsed.teamSize) setTeamSize(parsed.teamSize);
+      if (parsed.members && Array.isArray(parsed.members)) {
+        // merge into members keeping shape
+        const merged = [blankMember(), blankMember(), blankMember(), blankMember()];
+        parsed.members.forEach((m: any, i: number) => {
+          if (i < 4) merged[i] = { ...merged[i], ...m };
+        });
+        setMembers(merged);
+      }
+      if (parsed.problemId) setProblemId(parsed.problemId);
+      // we intentionally do NOT restore file inputs for security/size reasons
+    } catch (err) {
+      console.warn('Failed to load saved registration form:', err);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tenant?.id]);
+
+  // Save form state to localStorage with debounce
+  useEffect(() => {
+    if (!tenant?.id) return;
+    const toSave = {
+      teamName,
+      teamSize,
+      members,
+      problemId,
+      savedAt: new Date().toISOString(),
+    };
+
+    const id = setTimeout(() => {
+      try {
+        localStorage.setItem(storageKey, JSON.stringify(toSave));
+      } catch (e) {
+        console.warn('Failed to save registration form:', e);
+      }
+    }, 500);
+
+    return () => clearTimeout(id);
+  }, [teamName, teamSize, members, problemId, tenant?.id]);
 
   const validatePhone = (phone: string): string => {
     if (!phone) return "";
@@ -375,8 +424,14 @@ export default function Registration() {
       setIsSubmitted(true);
       toast({
         title: "Registration Successful!",
-        description: "Your team has been registered for inCamp Chapter 1.",
+        description: "Your team has been registered.",
       });
+      // clear saved draft
+      try {
+        localStorage.removeItem(storageKey);
+      } catch (e) {
+        /* ignore */
+      }
     } catch (error) {
       toast({
         title: "Error",
@@ -401,7 +456,7 @@ export default function Registration() {
                 Registration Complete!
               </h1>
               <p className="mt-4 text-muted-foreground">
-                Thank you for registering for inCamp Chapter 1. You will receive a confirmation email shortly with further instructions.
+                Thank you for registering. You will receive a confirmation email shortly with further instructions.
               </p>
               <Button
                 variant="default"
@@ -433,7 +488,7 @@ export default function Registration() {
             Team Registration
           </h1>
           <p className="mt-4 text-primary-foreground/80 text-lg max-w-2xl mx-auto">
-            Register your team for inCamp Chapter 1. Fill in all the required details below.
+            Register your team. Fill in all the required details below.
           </p>
         </div>
       </section>

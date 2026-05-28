@@ -21,6 +21,7 @@ interface ProblemStatement {
   detailed_description: string;
   category: string;
   theme: string;
+  max_registrations?: number | null;
 }
 
 interface ProblemFormDialogProps {
@@ -46,6 +47,7 @@ export function ProblemFormDialog({
     category: "",
     theme: "",
     department: "",
+    max_registrations: "",
   });
   const [departments, setDepartments] = useState<Department[]>([]);
 
@@ -72,6 +74,7 @@ export function ProblemFormDialog({
         category: problem.category,
         theme: problem.theme,
         department: (problem as any).department || "",
+        max_registrations: (problem as any).max_registrations != null ? String((problem as any).max_registrations) : "",
       });
     } else {
       setFormData({
@@ -82,6 +85,7 @@ export function ProblemFormDialog({
         category: "",
         theme: "",
         department: "",
+        max_registrations: "",
       });
     }
   }, [problem, open]);
@@ -108,6 +112,17 @@ export function ProblemFormDialog({
               onChange={(e) => setFormData({ ...formData, problem_statement_id: e.target.value })}
               placeholder="e.g., 25001"
               required
+            />
+          </div>
+          <div>
+            <Label htmlFor="max_registrations">Max Registrations</Label>
+            <Input
+              id="max_registrations"
+              type="number"
+              min={1}
+              value={formData.max_registrations as any}
+              onChange={(e) => setFormData({ ...formData, max_registrations: e.target.value })}
+              placeholder="e.g., 10 (leave blank for unlimited)"
             />
           </div>
           <div>
