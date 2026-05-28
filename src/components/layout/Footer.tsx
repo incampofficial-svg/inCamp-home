@@ -1,7 +1,9 @@
+import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
-import { Mail, MapPin } from "lucide-react";
+import { Mail, Phone } from "lucide-react";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
+import { supabase } from "@/integrations/supabase/client";
 
 const quickLinks = [
   { name: "Problem Statements", path: "/problems" },
@@ -14,6 +16,69 @@ const quickLinks = [
 export function Footer() {
   const { tenant } = useTenant();
   const slug = tenant?.slug || "";
+  const [contactInfo, setContactInfo] = useState<{ email: string; phone: string }>({
+    email: "hello.geenovate@gcet.edu.in",
+    phone: "",
+  });
+
+  useEffect(() => {
+    if (!tenant?.id) return;
+
+    const fetchContactInfo = async () => {
+      try {
+        const { data, error } = await (supabase as any)
+          .from("page_content")
+          .select("*")
+          .eq("page_name", "contact")
+          .eq("tenant_id", tenant.id);
+
+        if (data && !error) {
+          const itemsData = data.find((d: any) => d.section_key === "general_enquiries");
+          const infoData = data.find((d: any) => d.section_key === "general_info");
+
+          let email = "";
+          let phone = "";
+
+          if (itemsData) {
+            const parsed = typeof itemsData.content === "string"
+              ? JSON.parse(itemsData.content)
+              : itemsData.content;
+            
+            if (Array.isArray(parsed)) {
+              const emailItem = parsed.find((item: any) => 
+                item.icon === "Mail" || item.title?.toLowerCase().includes("email")
+              );
+              const phoneItem = parsed.find((item: any) => 
+                item.icon === "Phone" || item.title?.toLowerCase().includes("phone") || item.title?.toLowerCase().includes("help")
+              );
+
+              if (emailItem) email = emailItem.description;
+              if (phoneItem) phone = phoneItem.description;
+            }
+          } else if (infoData) {
+            const parsed = typeof infoData.content === "string"
+              ? JSON.parse(infoData.content)
+              : infoData.content;
+            if (parsed) {
+              email = parsed.email || "";
+              phone = parsed.phone || "";
+            }
+          }
+
+          if (email || phone) {
+            setContactInfo({
+              email: email || "hello.geenovate@gcet.edu.in",
+              phone: phone || "",
+            });
+          }
+        }
+      } catch (err) {
+        console.error("Error fetching footer contact info:", err);
+      }
+    };
+
+    void fetchContactInfo();
+  }, [tenant?.id]);
 
   return (
     <footer className="bg-primary text-primary-foreground">
@@ -53,17 +118,24 @@ export function Footer() {
           <div>
             <h4 className="font-poppins font-semibold text-lg mb-4">Contact Us</h4>
             <div className="space-y-3">
-              <a
-                href="mailto:hello.geenovate@gcet.edu.in"
-                className="flex items-center gap-2 text-primary-foreground/80 hover:text-secondary transition-colors text-sm"
-              >
-                <Mail className="w-4 h-4" />
-                hello.geenovate@gcet.edu.in
-              </a>
-              <div className="flex items-start gap-2 text-primary-foreground/80 text-sm">
-                <MapPin className="w-4 h-4 mt-0.5 flex-shrink-0" />
-                <span>GCET Campus, Greater Noida, India</span>
-              </div>
+              {contactInfo.email && (
+                <a
+                  href={`mailto:${contactInfo.email}`}
+                  className="flex items-center gap-2 text-primary-foreground/80 hover:text-secondary transition-colors text-sm"
+                >
+                  <Mail className="w-4 h-4" />
+                  {contactInfo.email}
+                </a>
+              )}
+              {contactInfo.phone && (
+                <a
+                  href={`tel:${contactInfo.phone}`}
+                  className="flex items-center gap-2 text-primary-foreground/80 hover:text-secondary transition-colors text-sm"
+                >
+                  <Phone className="w-4 h-4" />
+                  {contactInfo.phone}
+                </a>
+              )}
             </div>
           </div>
         </div>

@@ -335,7 +335,7 @@ export default function Profile() {
     }
   };
 
-  if (loading || profileLoading) {
+  if (loading || profileLoading || adminLoading) {
     return (
       <Layout>
         <div className="container mx-auto px-4 py-20 text-center">Loading profile...</div>
@@ -391,14 +391,14 @@ export default function Profile() {
                 <p className="text-lg font-semibold">{profile?.email || user.email}</p>
               </div>
 
-              {profile?.department && (
+              {!isAdmin && profile?.department && (
                 <div className="space-y-2">
                   <p className="text-sm text-muted-foreground">Department</p>
                   <p className="text-lg font-semibold">{profile.department}</p>
                 </div>
               )}
 
-              {profile?.year && (
+              {!isAdmin && profile?.year && (
                 <div className="space-y-2">
                   <p className="text-sm text-muted-foreground">Year</p>
                   <p className="text-lg font-semibold">{profile.year}</p>

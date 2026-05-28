@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { AdminLayout } from "@/components/layout/AdminLayout";
 import { supabase } from "@/integrations/supabase/client";
-import { FileText, Shield, TrendingUp, Edit, Trash2, Eye, Download, Calendar, ChevronUp } from "lucide-react";
+import { FileText, Shield, TrendingUp, Edit, Trash2, Eye, Download, Calendar, ChevronUp, Users } from "lucide-react";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from "recharts";
 import { Button } from "@/components/ui/button";
@@ -103,7 +103,7 @@ export default function AdminDashboard() {
   const [allUsers, setAllUsers] = useState<UserProfile[]>([]);
   const [deptAdmins, setDeptAdmins] = useState<UserProfile[]>([]);
   const [dialogOpen, setDialogOpen] = useState(false);
-  const [dialogView, setDialogView] = useState<"problems" | "themes" | "deptAdmins" | "studentUsers" | null>(null);
+  const [dialogView, setDialogView] = useState<"problems" | "themes" | "deptAdmins" | "studentUsers" | "allTeams" | null>(null);
   const [studentDepartmentFilter, setStudentDepartmentFilter] = useState<string>("all");
   const [studentYearFilter, setStudentYearFilter] = useState<string>("all");
   const [deptAdminActionLoading, setDeptAdminActionLoading] = useState<string | null>(null);
@@ -326,7 +326,7 @@ try {
     setFilteredTeams(filtered);
   }, [teamRegistrations, problemFilter, themeFilter, sortField, sortDirection]);
 
-  const handleOpenDialog = (view: "problems" | "themes" | "deptAdmins" | "studentUsers") => {
+  const handleOpenDialog = (view: "problems" | "themes" | "deptAdmins" | "studentUsers" | "allTeams") => {
     setDialogView(view);
     setDialogOpen(true);
   };
@@ -400,6 +400,63 @@ try {
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
     link.download = `student-users-${studentDepartmentFilter}-${studentYearFilter}.${extension}`.replace(/[^a-zA-Z0-9-_.]/g, "_");
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(link.href);
+  };
+
+  const downloadTeamData = () => {
+    const rows = filteredTeams;
+    if (rows.length === 0) return;
+
+    const header = [
+      "Team Name",
+      "Problem Statement",
+      "Member 1 Name",
+      "Member 1 Roll",
+      "Member 2 Name",
+      "Member 2 Roll",
+      "Member 3 Name",
+      "Member 3 Roll",
+      "Member 4 Name",
+      "Member 4 Roll",
+      "Year",
+      "Department",
+      "Email",
+      "Phone",
+      "Registered Date"
+    ];
+    
+    const csvBody = rows
+      .map((row) =>
+        [
+          row.team_name || "",
+          row.problem_title || "",
+          row.member1_name || "",
+          row.member1_roll || "",
+          row.member2_name || "",
+          row.member2_roll || "",
+          row.member3_name || "",
+          row.member3_roll || "",
+          row.member4_name || "",
+          row.member4_roll || "",
+          row.year || "",
+          row.department || "",
+          row.email || "",
+          row.phone || "",
+          row.created_at ? new Date(row.created_at).toLocaleDateString() : "",
+        ]
+          .map((value) => `"${String(value || "").replace(/"/g, '""')}"`)
+          .join(",")
+      )
+      .join("\r\n");
+
+    const csv = [header.join(","), csvBody].join("\r\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `registered-teams-${problemFilter}-${themeFilter}.csv`.replace(/[^a-zA-Z0-9-_.]/g, "_");
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -680,6 +737,13 @@ try {
       color: "bg-muted",
       view: "studentUsers" as const,
     },
+    {
+      title: "All Registered Teams",
+      value: teamRegistrations.length,
+      icon: Users,
+      color: "bg-primary",
+      view: "allTeams" as const,
+    },
   ];
 
   return (
@@ -713,7 +777,7 @@ try {
                   {dashboardError}
                 </div>
               )}
-              <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-6 mb-12">
+              <div className="grid sm:grid-cols-2 lg:grid-cols-5 gap-6 mb-12">
                 {statCards.map((stat) => {
                   const Icon = stat.icon;
                   return (
@@ -747,12 +811,14 @@ try {
                       {dialogView === "themes" && "Team Registrations by Theme"}
                       {dialogView === "deptAdmins" && "Department Admins"}
                       {dialogView === "studentUsers" && "Student Users"}
+                      {dialogView === "allTeams" && "All Registered Teams"}
                     </DialogTitle>
                     <DialogDescription>
                       {dialogView === "problems" && "Search, filter, and sort problem statements by registered team count."}
                       {dialogView === "themes" && "Review team registrations grouped by theme."}
                       {dialogView === "deptAdmins" && "View all users with department admin access."}
                       {dialogView === "studentUsers" && "View student profiles filtered by department or year, then download the visible data."}
+                      {dialogView === "allTeams" && "View registered teams, apply filters, and download team information."}
                     </DialogDescription>
                   </DialogHeader>
 
@@ -1040,10 +1106,7 @@ try {
                           </div>
                           <div className="flex flex-wrap gap-2">
                             <Button onClick={() => downloadStudentData("csv")}>
-                              Download CSV
-                            </Button>
-                            <Button onClick={() => downloadStudentData("excel")}>
-                              Download Excel
+                              Download info
                             </Button>
                           </div>
                         </div>
@@ -1084,179 +1147,173 @@ try {
                         </div>
                       </div>
                     )}
-                  </div>
-                </DialogContent>
-              </Dialog>
 
-              {/* Registration Statistics */}
-              <Accordion type="multiple" className="w-full space-y-4">
-                <AccordionItem value="all-teams" className="bg-card rounded-xl shadow-card">
-                  <AccordionTrigger className="px-6 py-4 hover:no-underline">
-                    <h2 className="text-xl font-poppins font-semibold text-foreground text-left">
-                      All Registered Teams
-                    </h2>
-                  </AccordionTrigger>
-                  <AccordionContent className="px-6 pb-4">
-                    {teamRegistrations.length > 0 ? (
-                      <>
-                        {/* Filter and Sort Controls */}
-                        <div className="mb-6 space-y-4">
-                          <div className="flex flex-wrap gap-4">
-                            <div className="flex-1 min-w-[200px]">
-                              <label className="block text-sm font-medium text-foreground mb-2">
-                                Filter by Problem Statement
-                              </label>
+                    {dialogView === "allTeams" && (
+                      <div className="space-y-6">
+                        {/* Filter, Sort, and Download Controls */}
+                        <div className="grid md:grid-cols-4 gap-4 items-end">
+                          <div>
+                            <Label htmlFor="team-filter-problem">Filter by Problem Statement</Label>
+                            <select
+                              id="team-filter-problem"
+                              value={problemFilter}
+                              onChange={(e) => setProblemFilter(e.target.value)}
+                              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                            >
+                              <option value="all">All Problems</option>
+                              {problems.map((problem) => (
+                                <option key={problem.problem_statement_id} value={problem.problem_statement_id}>
+                                  {problem.title}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <Label htmlFor="team-filter-theme">Filter by Theme</Label>
+                            <select
+                              id="team-filter-theme"
+                              value={themeFilter}
+                              onChange={(e) => setThemeFilter(e.target.value)}
+                              className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                            >
+                              <option value="all">All Themes</option>
+                              {problemThemes.map((theme) => (
+                                <option key={theme} value={theme}>
+                                  {theme.charAt(0).toUpperCase() + theme.slice(1)}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <div>
+                            <Label htmlFor="team-sort">Sort by</Label>
+                            <div className="flex gap-2">
                               <select
-                                value={problemFilter}
-                                onChange={(e) => setProblemFilter(e.target.value)}
-                                className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
-                              >
-                                <option value="all">All Problems</option>
-                                {problemStats.map((problem) => (
-                                  <option key={problem.id} value={problem.id}>
-                                    {problem.title}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                            <div className="flex-1 min-w-[200px]">
-                              <label className="block text-sm font-medium text-foreground mb-2">
-                                Filter by Theme
-                              </label>
-                              <select
-                                value={themeFilter}
-                                onChange={(e) => setThemeFilter(e.target.value)}
-                                className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
-                              >
-                                <option value="all">All Themes</option>
-                                {[...new Set(themeStats.map(t => t.theme))].map((theme) => (
-                                  <option key={theme} value={theme}>
-                                    {theme.charAt(0).toUpperCase() + theme.slice(1)}
-                                  </option>
-                                ))}
-                              </select>
-                            </div>
-                            <div className="flex-1 min-w-[200px]">
-                              <label className="block text-sm font-medium text-foreground mb-2">
-                                Sort by
-                              </label>
-                              <select
+                                id="team-sort"
                                 value={sortField}
                                 onChange={(e) => setSortField(e.target.value)}
-                                className="w-full px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
+                                className="flex-1 px-3 py-2 border border-border rounded-md bg-background text-foreground focus:outline-none focus:ring-2 focus:ring-primary"
                               >
                                 <option value="created_at">Registration Date</option>
                                 <option value="team_name">Team Name</option>
                                 <option value="year">Year</option>
                                 <option value="department">Department</option>
                               </select>
-                            </div>
-                            <div className="flex items-end">
-                              <button
+                              <Button
+                                variant="outline"
                                 onClick={() => setSortDirection(sortDirection === "asc" ? "desc" : "asc")}
-                                className="px-4 py-2 border border-border rounded-md bg-background text-foreground hover:bg-accent transition-colors"
+                                className="px-3"
                               >
-                                {sortDirection === "asc" ? "↑ Ascending" : "↓ Descending"}
-                              </button>
+                                {sortDirection === "asc" ? "↑" : "↓"}
+                              </Button>
                             </div>
                           </div>
-                          <div className="text-sm text-muted-foreground">
-                            Showing {filteredTeams.length} of {teamRegistrations.length} teams
+                          <div>
+                            <Button className="w-full" onClick={() => downloadTeamData()}>
+                              Download info
+                            </Button>
                           </div>
                         </div>
 
-                        <div className="overflow-x-auto">
-                          <table className="w-full">
-                          <thead>
-                            <tr className="border-b border-border">
-                              <th className="text-left py-2 px-4 font-medium text-foreground">Team Name</th>
-                              <th className="text-left py-2 px-4 font-medium text-foreground">Problem</th>
-                              <th className="text-left py-2 px-4 font-medium text-foreground">Members</th>
-                              <th className="text-left py-2 px-4 font-medium text-foreground">Year</th>
-                              <th className="text-left py-2 px-4 font-medium text-foreground">Department</th>
-                              <th className="text-left py-2 px-4 font-medium text-foreground">Contact</th>
-                              <th className="text-left py-2 px-4 font-medium text-foreground">Registered</th>
-                              <th className="text-left py-2 px-4 font-medium text-foreground">Actions</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {filteredTeams.map((team) => (
-                              <tr key={team.id} className="border-b border-border/50">
-                                <td className="py-3 px-4 text-foreground font-medium">{team.team_name}</td>
-                                <td className="py-3 px-4 text-foreground">{team.problem_title}</td>
-                                <td className="py-3 px-4 text-foreground">
-                                  <div className="text-sm">
-                                    <div>{team.member1_name} ({team.member1_roll})</div>
-                                    {team.member2_name && <div>{team.member2_name} ({team.member2_roll})</div>}
-                                    {team.member3_name && <div>{team.member3_name} ({team.member3_roll})</div>}
-                                    {team.member4_name && <div>{team.member4_name} ({team.member4_roll})</div>}
-                                  </div>
-                                </td>
-                                <td className="py-3 px-4 text-foreground">{team.year}</td>
-                                <td className="py-3 px-4 text-foreground">{team.department}</td>
-                                <td className="py-3 px-4 text-foreground">
-                                  <div className="text-sm">
-                                    <div>{team.email}</div>
-                                    <div>{team.phone}</div>
-                                  </div>
-                                </td>
-                                <td className="py-3 px-4 text-foreground text-sm">
-                                  {new Date(team.created_at).toLocaleDateString()}
-                                </td>
-                                <td className="py-3 px-4">
-                                  <div className="flex gap-2">
-                                    {team.document_url && (
-                                      <>
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          onClick={() => handleViewDocument(team)}
-                                          className="h-8 w-8 p-0"
-                                          title="View Document"
-                                        >
-                                          <Eye className="h-4 w-4" />
-                                        </Button>
-                                        <Button
-                                          variant="outline"
-                                          size="sm"
-                                          onClick={() => handleDownloadPPT(team)}
-                                          className="h-8 w-8 p-0"
-                                          title="Download PPT"
-                                        >
-                                          <Download className="h-4 w-4" />
-                                        </Button>
-                                      </>
-                                    )}
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      onClick={() => handleEditTeam(team)}
-                                      className="h-8 w-8 p-0"
-                                    >
-                                      <Edit className="h-4 w-4" />
-                                    </Button>
-                                    <Button
-                                      variant="outline"
-                                      size="sm"
-                                      onClick={() => handleDeleteTeam(team)}
-                                      className="h-8 w-8 p-0 text-destructive hover:text-destructive"
-                                    >
-                                      <Trash2 className="h-4 w-4" />
-                                    </Button>
-                                  </div>
-                                </td>
-                              </tr>
-                            ))}
-                          </tbody>
-                        </table>
+                        <div className="text-sm text-muted-foreground">
+                          Showing {filteredTeams.length} of {teamRegistrations.length} teams
                         </div>
-                      </>
-                    ) : (
-                      <p className="text-muted-foreground">No team registrations yet.</p>
+
+                        <div className="overflow-x-auto">
+                          {filteredTeams.length > 0 ? (
+                            <table className="w-full min-w-[1000px] border-separate border-spacing-y-2">
+                              <thead>
+                                <tr className="text-left text-sm font-semibold text-foreground border-b border-border">
+                                  <th className="py-3 px-4">Team Name</th>
+                                  <th className="py-3 px-4">Problem</th>
+                                  <th className="py-3 px-4">Members</th>
+                                  <th className="py-3 px-4">Year</th>
+                                  <th className="py-3 px-4">Department</th>
+                                  <th className="py-3 px-4">Contact</th>
+                                  <th className="py-3 px-4">Registered</th>
+                                  <th className="py-3 px-4">Actions</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {filteredTeams.map((team) => (
+                                  <tr key={team.id} className="border-b border-border/50">
+                                    <td className="py-3 px-4 text-foreground font-medium">{team.team_name}</td>
+                                    <td className="py-3 px-4 text-foreground">{team.problem_title}</td>
+                                    <td className="py-3 px-4 text-foreground">
+                                      <div className="text-sm">
+                                        <div>{team.member1_name} ({team.member1_roll})</div>
+                                        {team.member2_name && <div>{team.member2_name} ({team.member2_roll})</div>}
+                                        {team.member3_name && <div>{team.member3_name} ({team.member3_roll})</div>}
+                                        {team.member4_name && <div>{team.member4_name} ({team.member4_roll})</div>}
+                                      </div>
+                                    </td>
+                                    <td className="py-3 px-4 text-foreground">{team.year}</td>
+                                    <td className="py-3 px-4 text-foreground">{team.department}</td>
+                                    <td className="py-3 px-4 text-foreground">
+                                      <div className="text-sm">
+                                        <div>{team.email}</div>
+                                        <div>{team.phone}</div>
+                                      </div>
+                                    </td>
+                                    <td className="py-3 px-4 text-foreground text-sm">
+                                      {new Date(team.created_at).toLocaleDateString()}
+                                    </td>
+                                    <td className="py-3 px-4">
+                                      <div className="flex gap-2">
+                                        {team.document_url && (
+                                          <>
+                                            <Button
+                                              variant="outline"
+                                              size="sm"
+                                              onClick={() => handleViewDocument(team)}
+                                              className="h-8 w-8 p-0"
+                                              title="View Document"
+                                            >
+                                              <Eye className="h-4 w-4" />
+                                            </Button>
+                                            <Button
+                                              variant="outline"
+                                              size="sm"
+                                              onClick={() => handleDownloadPPT(team)}
+                                              className="h-8 w-8 p-0"
+                                              title="Download PPT"
+                                            >
+                                              <Download className="h-4 w-4" />
+                                            </Button>
+                                          </>
+                                        )}
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => handleEditTeam(team)}
+                                          className="h-8 w-8 p-0"
+                                        >
+                                          <Edit className="h-4 w-4" />
+                                        </Button>
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => handleDeleteTeam(team)}
+                                          className="h-8 w-8 p-0 text-destructive hover:text-destructive"
+                                        >
+                                          <Trash2 className="h-4 w-4" />
+                                        </Button>
+                                      </div>
+                                    </td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          ) : (
+                            <p className="text-center py-6 text-muted-foreground">No team registrations match the filters.</p>
+                          )}
+                        </div>
+                      </div>
                     )}
-                  </AccordionContent>
-                </AccordionItem>
-              </Accordion>
+                  </div>
+                </DialogContent>
+              </Dialog>
+
+              {/* Registration Statistics placeholder - accordion removed */}
 
               {/* Quick Actions */}
               <div className="bg-card rounded-xl p-6 shadow-card mt-8">
