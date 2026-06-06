@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { deleteStorageFiles } from "@/utils/storageCleanup";
 import { useAdmin } from "@/hooks/useAdmin";
 import { useTenant } from "@/context/TenantContext";
 import { supabase } from "@/integrations/supabase/client";
@@ -253,8 +254,19 @@ export function TimelineSection() {
     ]);
   };
 
-  const removeCard = (id: string) => {
-    setEditCards((current) => current.filter((card) => card.id !== id));
+  const removeCard = async (id: string) => {
+    const card = editCards.find((c) => c.id === id);
+    if (card) {
+      // Delete card icon from storage
+      if (card.icon_url) {
+        await deleteStorageFiles([card.icon_url]);
+      }
+      // Delete card photos from storage
+      if (card.image_urls?.length) {
+        await deleteStorageFiles(card.image_urls);
+      }
+    }
+    setEditCards((current) => current.filter((c) => c.id !== id));
   };
 
   const uploadIcon = async (id: string, file: File) => {
@@ -329,6 +341,37 @@ export function TimelineSection() {
     }
   };
 
+  const removeCardPhoto = async (cardId: string, photoUrl: string) => {
+    const ok = await deleteStorageFiles([photoUrl]);
+    if (!ok) toast.error("Photo could not be deleted from storage.");
+
+    setEditCards((current) =>
+      current.map((card) =>
+        card.id === cardId
+          ? {
+              ...card,
+              image_urls: (card.image_urls ?? []).filter((url) => url !== photoUrl),
+            }
+          : card
+      )
+    );
+  };
+
+  const removeCardPhotos = async (cardId: string) => {
+    const card = editCards.find((currentCard) => currentCard.id === cardId);
+    const photoUrls = card?.image_urls ?? [];
+    if (!photoUrls.length) return;
+
+    const ok = await deleteStorageFiles(photoUrls);
+    if (!ok) toast.error("Some photos could not be deleted from storage.");
+
+    setEditCards((current) =>
+      current.map((currentCard) =>
+        currentCard.id === cardId ? { ...currentCard, image_urls: [] } : currentCard
+      )
+    );
+  };
+
   const uploadHeaderPhoto = async (files: FileList) => {
     setUploadingPhoto(true);
     try {
@@ -365,7 +408,10 @@ export function TimelineSection() {
     }
   };
 
-  const removeHeaderPhoto = () => {
+  const removeHeaderPhoto = async () => {
+    // Permanently delete header photos from Supabase storage
+    const ok = await deleteStorageFiles(editHeader.photo_urls ?? []);
+    if (!ok) toast.error("Some header photos could not be deleted from storage.");
     setEditHeader((current) => ({ ...current, photo_urls: [] }));
   };
 
@@ -401,15 +447,14 @@ export function TimelineSection() {
               />
               <div className="flex flex-col items-center gap-3">
                 {editHeader.photo_urls?.length ? (
-                  <div className="w-full max-w-3xl border border-border shadow-sm bg-slate-100 flex flex-wrap justify-center gap-4 px-2 py-4">
+                  <div className="w-full flex flex-col items-center gap-4 py-2">
                     {editHeader.photo_urls.map((url, index) => (
-                      <div key={`${url}-${index}`} className="flex justify-center w-full">
-                        <img
-                          src={url}
-                          alt={`Timeline header photo ${index + 1}`}
-                          className="mx-auto block max-w-full h-auto"
-                        />
-                      </div>
+                      <img
+                        key={`${url}-${index}`}
+                        src={url}
+                        alt={`Timeline header photo ${index + 1}`}
+                        className="max-w-full h-auto object-contain rounded-lg shadow-sm"
+                      />
                     ))}
                   </div>
                 ) : (
@@ -451,18 +496,15 @@ export function TimelineSection() {
                 </p>
               )}
               {header.photo_urls?.length ? (
-                <div className="mt-8 flex justify-center">
-                  <div className="w-full max-w-3xl border border-border shadow-sm bg-slate-100 flex flex-wrap justify-center gap-4 px-2 py-4">
-                    {header.photo_urls.map((url, index) => (
-                      <div key={`${url}-${index}`} className="flex justify-center w-full">
-                        <img
-                          src={url}
-                          alt={`Timeline header photo ${index + 1}`}
-                          className="mx-auto block max-w-full h-auto"
-                        />
-                      </div>
-                    ))}
-                  </div>
+                <div className="mt-8 flex flex-col items-center gap-4">
+                  {header.photo_urls.map((url, index) => (
+                    <img
+                      key={`${url}-${index}`}
+                      src={url}
+                      alt={`Timeline header photo ${index + 1}`}
+                      className="max-w-full h-auto object-contain transition-transform duration-300 hover:scale-[1.01]"
+                    />
+                  ))}
                 </div>
               ) : null}
             </>
@@ -564,21 +606,6 @@ export function TimelineSection() {
                               </div>
                             </PopoverContent>
                           </Popover>
-                          <span className="text-sm text-muted-foreground px-1">or</span>
-                          <label className="cursor-pointer rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm hover:bg-slate-100">
-                            <Upload className="w-4 h-4 inline-block mr-2" />
-                            {uploadingIconId === card.id ? "Uploading..." : "Upload Icon"}
-                            <input
-                              type="file"
-                              accept="image/*"
-                              className="hidden"
-                              onChange={(e) => {
-                                if (e.target.files?.[0]) {
-                                  uploadIcon(card.id, e.target.files[0]);
-                                }
-                              }}
-                            />
-                          </label>
                           <label className="cursor-pointer rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm hover:bg-slate-100">
                             <Upload className="w-4 h-4 inline-block mr-2" />
                             {uploadingCardPhotosId === card.id ? "Uploading..." : "Upload Photos"}
@@ -609,16 +636,32 @@ export function TimelineSection() {
                     />
                     {card.image_urls?.length ? (
                       <div className="space-y-6 pt-6">
-                        <div className="text-sm font-medium text-muted-foreground">Uploaded photos</div>
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div className="text-sm font-medium text-muted-foreground">Uploaded photos</div>
+                          <Button variant="outline" size="sm" onClick={() => removeCardPhotos(card.id)}>
+                            <Trash2 className="w-4 h-4 mr-2" />
+                            Remove Photos
+                          </Button>
+                        </div>
                         <div className="flex flex-col items-center gap-8">
                           {card.image_urls.map((url, idx) => (
-                            <div key={`${url}-${idx}`} className="w-full flex justify-center">
+                            <div key={`${url}-${idx}`} className="relative w-full flex justify-center rounded-lg border border-border bg-slate-50 p-3">
                               <img
                                 src={url}
                                 alt={`${card.title} photo ${idx + 1}`}
                                 className="mx-auto block"
                                 style={{ width: "auto", maxWidth: "100%", height: "auto" }}
                               />
+                              <Button
+                                type="button"
+                                variant="destructive"
+                                size="sm"
+                                onClick={() => removeCardPhoto(card.id, url)}
+                                className="absolute right-3 top-3"
+                              >
+                                <Trash2 className="w-4 h-4 mr-2" />
+                                Remove
+                              </Button>
                             </div>
                           ))}
                         </div>

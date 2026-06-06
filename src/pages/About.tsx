@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { deleteStorageFiles } from "@/utils/storageCleanup";
 import { Layout } from "@/components/layout/Layout";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -305,8 +306,13 @@ export default function About() {
     ]);
   };
 
-  const removeTeamCard = (id: string) => {
-    setEditTeamCards((current) => current.filter((card) => card.id !== id));
+  const removeTeamCard = async (id: string) => {
+    const card = editTeamCards.find((c) => c.id === id);
+    // Delete the card's image from storage if present
+    if (card?.image_url) {
+      await deleteStorageFiles([card.image_url]);
+    }
+    setEditTeamCards((current) => current.filter((c) => c.id !== id));
   };
 
   const updateTeamCard = (id: string, field: keyof AboutCard, value: string) => {
@@ -318,6 +324,12 @@ export default function About() {
   const uploadCardImage = async (id: string, file: File) => {
     setUploadingImage(true);
     try {
+      // Delete old image from storage if exists
+      const existingCard = editTeamCards.find((c) => c.id === id);
+      if (existingCard?.image_url) {
+        await deleteStorageFiles([existingCard.image_url]);
+      }
+
       const sanitized = `${Date.now()}_${file.name.replace(/[^a-zA-Z0-9_.-]/g, "_")}`;
       const filePath = `about_cards/${sanitized}`;
 

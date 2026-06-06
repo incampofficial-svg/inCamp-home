@@ -22,6 +22,21 @@ interface ContactHeader {
   subtitle: string;
   organizingTitle: string;
   enquiriesTitle: string;
+  styles?: ContactHeaderStyles;
+}
+
+interface TextStyle {
+  fontSize: string;
+  fontType: string;
+  fontWeight: string;
+  color: string;
+  effect: string;
+}
+
+interface ContactHeaderStyles {
+  backgroundColor: string;
+  title: TextStyle;
+  subtitle: TextStyle;
 }
 
 interface ContactEnquiry {
@@ -34,13 +49,31 @@ interface ContactEnquiry {
 export default function Contact() {
   const { isAdmin } = useAdmin();
   const { tenant } = useTenant();
-  const [coordinators, setCoordinators] = useState<Coordinator[]>([]);
-  const [header, setHeader] = useState<ContactHeader>({
+  const defaultHeader: ContactHeader = {
     title: "Contact Us",
     subtitle: "Have questions? Reach out to our organizing team for assistance.",
     organizingTitle: "Organizing Team",
     enquiriesTitle: "General Enquiries",
-  });
+    styles: {
+      backgroundColor: "#0b3a82",
+      title: {
+        fontSize: "text-5xl",
+        fontType: "font-poppins",
+        fontWeight: "font-bold",
+        color: "#ffffff",
+        effect: "none",
+      },
+      subtitle: {
+        fontSize: "text-lg",
+        fontType: "font-sans",
+        fontWeight: "font-normal",
+        color: "#dbeafe",
+        effect: "none",
+      },
+    },
+  };
+  const [coordinators, setCoordinators] = useState<Coordinator[]>([]);
+  const [header, setHeader] = useState<ContactHeader>(defaultHeader);
   const [generalEnquiries, setGeneralEnquiries] = useState<ContactEnquiry[]>([]);
   const [loading, setLoading] = useState(true);
   const [editing, setEditing] = useState(false);
@@ -48,13 +81,61 @@ export default function Contact() {
 
   // Edit states
   const [editCoordinators, setEditCoordinators] = useState<Coordinator[]>([]);
-  const [editHeader, setEditHeader] = useState<ContactHeader>({
-    title: "Contact Us",
-    subtitle: "Have questions? Reach out to our organizing team for assistance.",
-    organizingTitle: "Organizing Team",
-    enquiriesTitle: "General Enquiries",
-  });
+  const [editHeader, setEditHeader] = useState<ContactHeader>(defaultHeader);
   const [editGeneralEnquiries, setEditGeneralEnquiries] = useState<ContactEnquiry[]>([]);
+
+  const normalizeHeader = (content?: Partial<ContactHeader>): ContactHeader => ({
+    ...defaultHeader,
+    ...content,
+    styles: {
+      ...defaultHeader.styles!,
+      ...(content?.styles ?? {}),
+      title: {
+        ...defaultHeader.styles!.title,
+        ...(content?.styles?.title ?? {}),
+      },
+      subtitle: {
+        ...defaultHeader.styles!.subtitle,
+        ...(content?.styles?.subtitle ?? {}),
+      },
+    },
+  });
+
+  const fontSizeOptions = {
+    title: [
+      { value: "text-3xl", label: "Small" },
+      { value: "text-4xl", label: "Medium" },
+      { value: "text-5xl", label: "Large" },
+      { value: "text-6xl", label: "Hero" },
+    ],
+    subtitle: [
+      { value: "text-base", label: "Small" },
+      { value: "text-lg", label: "Medium" },
+      { value: "text-xl", label: "Large" },
+      { value: "text-2xl", label: "Hero" },
+    ],
+  };
+
+  const fontTypeOptions = [
+    { value: "font-sans", label: "Sans" },
+    { value: "font-poppins", label: "Poppins" },
+    { value: "font-serif", label: "Serif" },
+    { value: "font-mono", label: "Mono" },
+  ];
+
+  const fontWeightOptions = [
+    { value: "font-normal", label: "Regular" },
+    { value: "font-medium", label: "Medium" },
+    { value: "font-semibold", label: "Semibold" },
+    { value: "font-bold", label: "Bold" },
+  ];
+
+  const effectOptions = [
+    { value: "none", label: "None" },
+    { value: "uppercase", label: "Uppercase" },
+    { value: "tracking-wide", label: "Wide" },
+    { value: "drop-shadow-lg", label: "Shadow" },
+  ];
 
   useEffect(() => {
     fetchContent();
@@ -87,8 +168,9 @@ export default function Contact() {
         const parsed = typeof headerData.content === "string"
           ? JSON.parse(headerData.content)
           : headerData.content;
-        setHeader({ ...header, ...parsed });
-        setEditHeader({ ...editHeader, ...parsed });
+        const normalizedHeader = normalizeHeader(parsed);
+        setHeader(normalizedHeader);
+        setEditHeader(normalizedHeader);
       }
 
       if (itemsData) {
@@ -208,6 +290,61 @@ if (error) throw error;
     setEditGeneralEnquiries(editGeneralEnquiries.filter((_, idx) => idx !== index));
   };
 
+  const updateHeaderTextStyle = (
+    target: "title" | "subtitle",
+    field: keyof TextStyle,
+    value: string
+  ) => {
+    setEditHeader((current) => ({
+      ...current,
+      styles: {
+        ...normalizeHeader(current).styles!,
+        [target]: {
+          ...normalizeHeader(current).styles![target],
+          [field]: value,
+        },
+      },
+    }));
+  };
+
+  const renderSelect = (
+    label: string,
+    value: string,
+    onChange: (value: string) => void,
+    options: { value: string; label: string }[]
+  ) => (
+    <label className="block text-sm font-medium text-foreground">
+      {label}
+      <select
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="mt-2 block w-full rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground shadow-sm focus:border-primary focus:outline-none focus:ring-2 focus:ring-primary/10"
+      >
+        {options.map((option) => (
+          <option key={option.value} value={option.value}>
+            {option.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+
+  const renderColorInput = (
+    label: string,
+    value: string,
+    onChange: (value: string) => void
+  ) => (
+    <label className="block text-sm font-medium text-foreground">
+      {label}
+      <Input
+        type="color"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className="mt-2 h-10 bg-background p-1"
+      />
+    </label>
+  );
+
   const enquiryIconOptions = ["Mail", "Phone", "MapPin", "MessageCircle", "Globe", "Info", "HelpCircle", "AtSign"];
 
   const getIconComponent = (icon: string) => {
@@ -244,12 +381,16 @@ if (error) throw error;
 
   const displayCoordinators = editing ? editCoordinators : coordinators;
   const displayEnquiries = editing ? editGeneralEnquiries : generalEnquiries;
-  const displayHeader = editing ? editHeader : header;
+  const displayHeader = normalizeHeader(editing ? editHeader : header);
+  const editHeaderWithDefaults = normalizeHeader(editHeader);
 
   return (
     <Layout>
       {/* Header */}
-      <section className="bg-primary py-16 lg:py-24">
+      <section
+        className="py-16 lg:py-24"
+        style={{ backgroundColor: displayHeader.styles?.backgroundColor }}
+      >
         <div className="container mx-auto px-4 text-center">
           {editing ? (
             <div className="mx-auto max-w-3xl space-y-4">
@@ -280,13 +421,50 @@ if (error) throw error;
                   className="bg-white text-foreground"
                 />
               </div>
+              <div className="rounded-lg border border-white/20 bg-white p-4 text-left shadow-sm">
+                <h3 className="mb-4 text-sm font-semibold text-foreground">Header Style</h3>
+                <div className="grid gap-4 md:grid-cols-2">
+                  {renderColorInput("Title Color", editHeaderWithDefaults.styles!.title.color, (value) =>
+                    updateHeaderTextStyle("title", "color", value)
+                  )}
+                  {renderColorInput("Subtitle Color", editHeaderWithDefaults.styles!.subtitle.color, (value) =>
+                    updateHeaderTextStyle("subtitle", "color", value)
+                  )}
+                </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-4">
+                  {renderSelect("Title Size", editHeaderWithDefaults.styles!.title.fontSize, (value) =>
+                    updateHeaderTextStyle("title", "fontSize", value), fontSizeOptions.title)}
+                  {renderSelect("Title Type", editHeaderWithDefaults.styles!.title.fontType, (value) =>
+                    updateHeaderTextStyle("title", "fontType", value), fontTypeOptions)}
+                  {renderSelect("Title Weight", editHeaderWithDefaults.styles!.title.fontWeight, (value) =>
+                    updateHeaderTextStyle("title", "fontWeight", value), fontWeightOptions)}
+                  {renderSelect("Title Effect", editHeaderWithDefaults.styles!.title.effect, (value) =>
+                    updateHeaderTextStyle("title", "effect", value), effectOptions)}
+                </div>
+                <div className="mt-4 grid gap-4 md:grid-cols-4">
+                  {renderSelect("Subtitle Size", editHeaderWithDefaults.styles!.subtitle.fontSize, (value) =>
+                    updateHeaderTextStyle("subtitle", "fontSize", value), fontSizeOptions.subtitle)}
+                  {renderSelect("Subtitle Type", editHeaderWithDefaults.styles!.subtitle.fontType, (value) =>
+                    updateHeaderTextStyle("subtitle", "fontType", value), fontTypeOptions)}
+                  {renderSelect("Subtitle Weight", editHeaderWithDefaults.styles!.subtitle.fontWeight, (value) =>
+                    updateHeaderTextStyle("subtitle", "fontWeight", value), fontWeightOptions)}
+                  {renderSelect("Subtitle Effect", editHeaderWithDefaults.styles!.subtitle.effect, (value) =>
+                    updateHeaderTextStyle("subtitle", "effect", value), effectOptions)}
+                </div>
+              </div>
             </div>
           ) : (
             <>
-              <h1 className="text-3xl lg:text-5xl font-poppins font-bold text-primary-foreground">
+              <h1
+                className={`${displayHeader.styles!.title.fontSize} ${displayHeader.styles!.title.fontType} ${displayHeader.styles!.title.fontWeight} ${displayHeader.styles!.title.effect} leading-tight`}
+                style={{ color: displayHeader.styles!.title.color }}
+              >
                 {displayHeader.title}
               </h1>
-              <p className="mt-4 text-primary-foreground/80 text-lg max-w-2xl mx-auto">
+              <p
+                className={`mt-4 max-w-2xl mx-auto ${displayHeader.styles!.subtitle.fontSize} ${displayHeader.styles!.subtitle.fontType} ${displayHeader.styles!.subtitle.fontWeight} ${displayHeader.styles!.subtitle.effect}`}
+                style={{ color: displayHeader.styles!.subtitle.color }}
+              >
                 {displayHeader.subtitle}
               </p>
             </>
