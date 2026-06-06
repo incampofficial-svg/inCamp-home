@@ -10,6 +10,7 @@ import { Label } from "@/components/ui/label";
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription } from "@/components/ui/dialog";
 import { TeamFormDialog } from "@/components/admin/TeamFormDialog";
 import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
+import ThemeManager from "@/components/admin/ThemeManager";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
 import { useAuth } from "@/contexts/AuthContext";
@@ -120,6 +121,7 @@ export default function AdminDashboard() {
   const [deptAdmins, setDeptAdmins] = useState<UserProfile[]>([]);
   const [dialogOpen, setDialogOpen] = useState(false);
   const [dialogView, setDialogView] = useState<"problems" | "themes" | "deptAdmins" | "studentUsers" | "allTeams" | null>(null);
+  const [themeManagerOpen, setThemeManagerOpen] = useState(false);
   const [studentDepartmentFilter, setStudentDepartmentFilter] = useState<string>("all");
   const [studentYearFilter, setStudentYearFilter] = useState<string>("all");
   const [deptAdminActionLoading, setDeptAdminActionLoading] = useState<string | null>(null);
@@ -1010,6 +1012,16 @@ try {
 
                     {dialogView === "themes" && (
                       <div>
+                        <div className="flex justify-end mb-4">
+                          <Button onClick={() => setThemeManagerOpen((s) => !s)} size="sm">
+                            {themeManagerOpen ? "Close theme manager" : "Manage themes"}
+                          </Button>
+                        </div>
+                        {themeManagerOpen && (
+                          <div className="mb-6">
+                            <ThemeManager onClose={() => setThemeManagerOpen(false)} />
+                          </div>
+                        )}
                         {themeStats.length > 0 ? (
                           <>
                             <div className="mb-8">

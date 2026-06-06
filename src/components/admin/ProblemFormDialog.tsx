@@ -5,6 +5,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { supabase } from "@/integrations/supabase/client";
+import { useTenant } from "@/context/TenantContext";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 
 interface Department {
@@ -50,6 +51,8 @@ export function ProblemFormDialog({
     max_registrations: "",
   });
   const [departments, setDepartments] = useState<Department[]>([]);
+  const [themes, setThemes] = useState<string[]>([]);
+  const { tenant } = useTenant();
 
   useEffect(() => {
     const fetchDepartments = async () => {
@@ -63,6 +66,22 @@ export function ProblemFormDialog({
 
     fetchDepartments();
   }, []);
+
+  useEffect(() => {
+    const fetchThemes = async () => {
+      if (!tenant) return;
+      const { data, error } = await supabase.from("themes").select("name").eq("tenant_id", tenant.id).order("name", { ascending: true });
+      if (error) {
+        console.error("Error fetching themes:", error);
+        // fallback to defaults
+        setThemes(["Academic", "Non-Academic", "Community Innovation"]);
+      } else if (data) {
+        setThemes((data as any).map((t: any) => t.name));
+      }
+    };
+
+    fetchThemes();
+  }, [tenant?.id]);
 
   useEffect(() => {
     if (problem) {
@@ -182,9 +201,19 @@ export function ProblemFormDialog({
                 <SelectValue placeholder="Select theme" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="Academic">Academic</SelectItem>
-                <SelectItem value="Non-Academic">Non-Academic</SelectItem>
-                <SelectItem value="Community Innovation">Community Innovation</SelectItem>
+                {themes.length === 0 ? (
+                  <>
+                    <SelectItem value="Academic">Academic</SelectItem>
+                    <SelectItem value="Non-Academic">Non-Academic</SelectItem>
+                    <SelectItem value="Community Innovation">Community Innovation</SelectItem>
+                  </>
+                ) : (
+                  themes.map((t) => (
+                    <SelectItem key={t} value={t}>
+                      {t}
+                    </SelectItem>
+                  ))
+                )}
               </SelectContent>
             </Select>
           </div>

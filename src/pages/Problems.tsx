@@ -13,29 +13,24 @@ import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
 import { fetchProblemsUnlockAt } from "@/lib/contestSettings";
 
-const themes = [
-  {
-    id: "academic",
-    name: "Academic",
+// Default theme metadata used when a tenant has no custom themes
+const DEFAULT_THEME_META: { [key: string]: { icon: any; description: string; color: string } } = {
+  Academic: {
     icon: GraduationCap,
     description: "Problems related to teaching, learning, examinations, and academic infrastructure.",
     color: "bg-primary",
   },
-  {
-    id: "non-academic",
-    name: "Non-Academic",
+  "Non-Academic": {
     icon: Users,
     description: "Problems related to campus operations, administration, and student services.",
     color: "bg-secondary",
   },
-  {
-    id: "community",
-    name: "Community Innovation",
+  "Community Innovation": {
     icon: Lightbulb,
     description: "Problems addressing societal challenges and community development.",
     color: "bg-accent",
   },
-];
+};
 
 interface ProblemStatement {
   id: string;
@@ -57,6 +52,7 @@ export default function Problems() {
   const [activeTheme, setActiveTheme] = useState("All");
   const [searchQuery, setSearchQuery] = useState("");
   const [problems, setProblems] = useState<ProblemStatement[]>([]);
+  const [themes, setThemes] = useState<{ name: string; id?: string; description?: string; color?: string }[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [unlockTime, setUnlockTime] = useState<Date | null>(null);
@@ -109,6 +105,26 @@ export default function Problems() {
     setLoading(false);
   };
 
+  const fetchThemes = async () => {
+    try {
+      if (!tenant?.id) return;
+      const { data, error } = await supabase.from("themes").select("id, name").eq("tenant_id", tenant.id).order("name", { ascending: true });
+      if (error) {
+        console.error("Error fetching themes:", error);
+        // fallback to defaults
+        setThemes(Object.keys(DEFAULT_THEME_META).map((name) => ({ name })));
+      } else if (data && (data as any).length > 0) {
+        setThemes((data as any).map((t: any) => ({ id: t.id, name: t.name })));
+      } else {
+        // No themes in DB: use defaults
+        setThemes(Object.keys(DEFAULT_THEME_META).map((name) => ({ name })));
+      }
+    } catch (err) {
+      console.error("Error loading themes:", err);
+      setThemes(Object.keys(DEFAULT_THEME_META).map((name) => ({ name })));
+    }
+  };
+
   useEffect(() => {
     const fetchUnlockTime = async () => {
       try {
@@ -143,6 +159,7 @@ export default function Problems() {
     if (isUnlocked) {
       fetchProblems();
     }
+    fetchThemes();
   }, [isUnlocked, tenant?.id]);
 
   useEffect(() => {
@@ -306,24 +323,20 @@ export default function Problems() {
     });
 
   const getThemeColor = (theme: string) => {
-    switch (theme) {
-      case "Academic":
-        return "bg-primary text-primary-foreground";
-      case "Non-Academic":
-        return "bg-secondary text-secondary-foreground";
-      case "Community Innovation":
-        return "bg-accent text-accent-foreground";
-      default:
-        return "bg-muted text-muted-foreground";
-    }
+    const meta = DEFAULT_THEME_META[theme];
+    if (meta) return `${meta.color} text-white`;
+    return "bg-muted text-muted-foreground";
   };
 
-  const problemCounts = {
-    All: problems.length,
-    Academic: problems.filter((p) => p.theme === "Academic").length,
-    "Non-Academic": problems.filter((p) => p.theme === "Non-Academic").length,
-    "Community Innovation": problems.filter((p) => p.theme === "Community Innovation").length,
+  const getThemeIcon = (theme: string) => {
+    const meta = DEFAULT_THEME_META[theme];
+    return meta?.icon || Lightbulb;
   };
+
+  const problemCounts: Record<string, number> = { All: problems.length };
+  themes.forEach((t) => {
+    problemCounts[t.name] = problems.filter((p) => p.theme === t.name).length;
+  });
 
   const Countdown = () => (
     <div className="text-center py-24 bg-card rounded-3xl border border-border">
@@ -350,7 +363,7 @@ export default function Problems() {
               <p className="text-sm">Total Problems</p>
             </div>
             <div className="text-center">
-              <span className="text-3xl font-bold">3</span>
+              <span className="text-3xl font-bold">{themes.length}</span>
               <p className="text-sm">Themes</p>
             </div>
           </div>
@@ -378,7 +391,7 @@ export default function Problems() {
               </h2>
               <div className="grid md:grid-cols-3 gap-6">
                 {themes.map((theme) => {
-                  const Icon = theme.icon;
+                  const Icon = getThemeIcon(theme.name);
                   const isActive = activeTheme === theme.name;
                   return (
                     <button
@@ -396,10 +409,10 @@ export default function Problems() {
                         {theme.name}
                       </h3>
                       <p className="text-muted-foreground text-sm mb-3">
-                        {theme.description}
+                        {DEFAULT_THEME_META[theme.name]?.description || "Problems under this theme."}
                       </p>
                       <span className="text-secondary font-medium text-sm">
-                        {problemCounts[theme.name as keyof typeof problemCounts]} Problems
+                        {problemCounts[theme.name]} Problems
                       </span>
                     </button>
                   );
@@ -414,18 +427,18 @@ export default function Problems() {
               <div className="flex flex-col lg:flex-row gap-4 items-center justify-between">
                 {/* Theme Pills */}
                 <div className="flex flex-wrap gap-2">
-                  {["All", "Academic", "Non-Academic", "Community Innovation"].map((theme) => (
-                    <button
-                      key={theme}
-                      onClick={() => setActiveTheme(theme)}
-                      className={`px-4 py-2 rounded-full text-sm font-medium transition-colors ${activeTheme === theme
-                        ? "bg-primary text-primary-foreground"
-                        : "bg-muted text-muted-foreground hover:bg-accent"
-                        }`}
-                    >
-                      {theme} ({problemCounts[theme as keyof typeof problemCounts]})
-                    </button>
-                  ))}
+                    {["All", ...themes.map((t) => t.name)].map((theme) => (
+                      <button
+                        key={theme}
+                        onClick={() => setActiveTheme(theme)}
+                        className={`px-4 py-2 rounded-full text-sm font-medium transition-colors ${activeTheme === theme
+                          ? "bg-primary text-primary-foreground"
+                          : "bg-muted text-muted-foreground hover:bg-accent"
+                          }`}
+                      >
+                        {theme} ({problemCounts[theme] ?? 0})
+                      </button>
+                    ))}
                 </div>
 
                 {/* Search */}

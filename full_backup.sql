@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict R1robehfQ2TnWua9EkG1fU44ixlQhTFeZeT5U8R1eS6plBFa9rQk1LAuiw1DOLC
+\restrict zNBmaSPEVW02Irboi5BooricXbleH5JVGtGOfWFqFABTmxtwIcQjVvX2v6Z9oCY
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 18.3
@@ -27,6 +27,20 @@ CREATE SCHEMA auth;
 
 
 ALTER SCHEMA auth OWNER TO supabase_admin;
+
+--
+-- Name: pg_cron; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_cron WITH SCHEMA pg_catalog;
+
+
+--
+-- Name: EXTENSION pg_cron; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION pg_cron IS 'Job scheduler for PostgreSQL';
+
 
 --
 -- Name: extensions; Type: SCHEMA; Schema: -; Owner: postgres
@@ -824,6 +838,56 @@ CREATE FUNCTION pgbouncer.get_auth(p_usename text) RETURNS TABLE(username text, 
 ALTER FUNCTION pgbouncer.get_auth(p_usename text) OWNER TO supabase_admin;
 
 --
+-- Name: archive_completed_events(interval); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.archive_completed_events(p_older_than interval DEFAULT '00:00:00'::interval) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+BEGIN
+  -- Move rows into archive
+  WITH moved AS (
+    INSERT INTO public.events_archive
+    SELECT *
+    FROM public.events
+    WHERE (status = 'completed' OR end_at < now())
+      AND (p_older_than IS NULL OR end_at < now() - p_older_than)
+    RETURNING id
+  )
+  DELETE FROM public.events e
+  USING moved m
+  WHERE e.id = m.id;
+END;
+$$;
+
+
+ALTER FUNCTION public.archive_completed_events(p_older_than interval) OWNER TO postgres;
+
+--
+-- Name: archive_past_events(interval); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.archive_past_events(p_older_than interval DEFAULT '00:00:00'::interval) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+BEGIN
+  WITH moved AS (
+    INSERT INTO public.events_archive
+    SELECT *
+    FROM public.events
+    WHERE event_date < now() - p_older_than
+    RETURNING id
+  )
+  DELETE FROM public.events e
+  USING moved m
+  WHERE e.id = m.id;
+END;
+$$;
+
+
+ALTER FUNCTION public.archive_past_events(p_older_than interval) OWNER TO postgres;
+
+--
 -- Name: can_access_problem_statement(uuid); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -894,6 +958,23 @@ $$;
 ALTER FUNCTION public.current_department_id() OWNER TO postgres;
 
 --
+-- Name: current_tenant_id(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.current_tenant_id() RETURNS uuid
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select p.tenant_id
+  from public.profiles p
+  where p.id = auth.uid()
+  limit 1
+$$;
+
+
+ALTER FUNCTION public.current_tenant_id() OWNER TO postgres;
+
+--
 -- Name: deactivate_past_events(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -937,17 +1018,74 @@ CREATE FUNCTION public.handle_new_user() RETURNS trigger
     LANGUAGE plpgsql SECURITY DEFINER
     SET search_path TO 'public'
     AS $$
+DECLARE
+  v_tenant_id uuid;
 BEGIN
-  INSERT INTO public.profiles (id, name, email, role)
-  VALUES (
-    NEW.id,
-    COALESCE(NEW.raw_user_meta_data ->> 'name', ''),
-    NEW.email,
-    'student'
-  );
+  -- Safely parse tenant_id to avoid casting exceptions
+  BEGIN
+    IF NEW.raw_user_meta_data ->> 'tenant_id' IS NOT NULL AND NEW.raw_user_meta_data ->> 'tenant_id' <> '' THEN
+      v_tenant_id := (NEW.raw_user_meta_data ->> 'tenant_id')::uuid;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    v_tenant_id := NULL;
+  END;
 
-  INSERT INTO public.user_roles (user_id, role)
-  VALUES (NEW.id, 'student');
+  -- Verify if the tenant actually exists in the tenants table to avoid foreign key violations
+  IF v_tenant_id IS NOT NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM public.tenants WHERE id = v_tenant_id) THEN
+      v_tenant_id := NULL;
+    END IF;
+  END IF;
+
+  -- Insert or update profile (uses EXCEPTION block to be completely immune to constraint definition differences)
+  BEGIN
+    INSERT INTO public.profiles (id, name, email, role, department, year, tenant_id)
+    VALUES (
+      NEW.id,
+      COALESCE(NEW.raw_user_meta_data ->> 'name', ''),
+      NEW.email,
+      'student',
+      COALESCE(NULLIF(NEW.raw_user_meta_data ->> 'department', ''), 'Unknown'),
+      COALESCE(NULLIF(NEW.raw_user_meta_data ->> 'year', ''), 'Unknown'),
+      v_tenant_id
+    );
+  EXCEPTION WHEN UNIQUE_VIOLATION THEN
+    UPDATE public.profiles
+    SET
+      name = COALESCE(NEW.raw_user_meta_data ->> 'name', ''),
+      email = NEW.email,
+      department = COALESCE(NULLIF(NEW.raw_user_meta_data ->> 'department', ''), 'Unknown'),
+      year = COALESCE(NULLIF(NEW.raw_user_meta_data ->> 'year', ''), 'Unknown'),
+      tenant_id = v_tenant_id
+    WHERE id = NEW.id;
+  END;
+
+  -- Insert or update user role dynamically checking for tenant_id column existence and using EXCEPTION for unique constraints
+  IF EXISTS (
+    SELECT 1 
+    FROM information_schema.columns 
+    WHERE table_schema = 'public' 
+      AND table_name = 'user_roles' 
+      AND column_name = 'tenant_id'
+  ) THEN
+    BEGIN
+      INSERT INTO public.user_roles (user_id, role, tenant_id)
+      VALUES (NEW.id, 'student', v_tenant_id);
+    EXCEPTION WHEN UNIQUE_VIOLATION THEN
+      UPDATE public.user_roles 
+      SET role = 'student', tenant_id = v_tenant_id 
+      WHERE user_id = NEW.id;
+    END;
+  ELSE
+    BEGIN
+      INSERT INTO public.user_roles (user_id, role)
+      VALUES (NEW.id, 'student');
+    EXCEPTION WHEN UNIQUE_VIOLATION THEN
+      UPDATE public.user_roles 
+      SET role = 'student' 
+      WHERE user_id = NEW.id;
+    END;
+  END IF;
 
   RETURN NEW;
 END;
@@ -974,6 +1112,26 @@ $$;
 
 
 ALTER FUNCTION public.has_role(_user_id uuid, _role public.app_role) OWNER TO postgres;
+
+--
+-- Name: has_tenant_role(public.app_role, uuid); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select exists (
+    select 1
+    from public.user_roles ur
+    where ur.user_id = auth.uid()
+      and ur.role = _role
+      and ur.tenant_id = _tenant_id
+  )
+$$;
+
+
+ALTER FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) OWNER TO postgres;
 
 --
 -- Name: increment_curr_registrations(uuid); Type: FUNCTION; Schema: public; Owner: postgres
@@ -1013,6 +1171,36 @@ $$;
 ALTER FUNCTION public.is_admin_user() OWNER TO postgres;
 
 --
+-- Name: is_tenant_admin(uuid); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.is_tenant_admin(_tenant_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select public.has_tenant_role('admin', _tenant_id)
+      or public.has_tenant_role('institution_admin', _tenant_id)
+$$;
+
+
+ALTER FUNCTION public.is_tenant_admin(_tenant_id uuid) OWNER TO postgres;
+
+--
+-- Name: is_tenant_deptadmin(uuid); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select public.has_tenant_role('deptadmin', _tenant_id)
+      or public.has_tenant_role('department_admin', _tenant_id)
+$$;
+
+
+ALTER FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) OWNER TO postgres;
+
+--
 -- Name: problem_statements_set_defaults(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -1030,6 +1218,22 @@ $$;
 
 
 ALTER FUNCTION public.problem_statements_set_defaults() OWNER TO postgres;
+
+--
+-- Name: same_tenant(uuid); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.same_tenant(_tenant_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select auth.uid() is not null
+     and _tenant_id is not null
+     and _tenant_id = public.current_tenant_id()
+$$;
+
+
+ALTER FUNCTION public.same_tenant(_tenant_id uuid) OWNER TO postgres;
 
 --
 -- Name: set_updated_at(); Type: FUNCTION; Schema: public; Owner: postgres
@@ -1067,6 +1271,75 @@ $$;
 ALTER FUNCTION public.sync_profile_role() OWNER TO postgres;
 
 --
+-- Name: sync_profiles_from_user_roles(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.sync_profiles_from_user_roles() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  _user_id uuid;
+BEGIN
+  -- Recursion guard
+  IF current_setting('app.sync_in_progress', true) = 'user_roles_to_profiles' THEN
+    RETURN NEW;
+  END IF;
+
+  _user_id := NEW.user_id;
+
+  PERFORM
+    set_config('app.sync_in_progress', 'user_roles_to_profiles', true);
+
+  INSERT INTO public.profiles (id, tenant_id, role)
+  VALUES (_user_id, NEW.tenant_id, NEW.role)
+  ON CONFLICT (id)
+  DO UPDATE
+    SET tenant_id = EXCLUDED.tenant_id,
+        role = EXCLUDED.role;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.sync_profiles_from_user_roles() OWNER TO postgres;
+
+--
+-- Name: sync_user_roles_from_profiles(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.sync_user_roles_from_profiles() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  _user_id uuid;
+BEGIN
+  -- Recursion guard: if we're already inside the other trigger, do nothing.
+  IF current_setting('app.sync_in_progress', true) = 'profiles_to_user_roles' THEN
+    RETURN NEW;
+  END IF;
+
+  _user_id := NEW.id;
+
+  PERFORM
+    set_config('app.sync_in_progress', 'profiles_to_user_roles', true);
+
+  INSERT INTO public.user_roles (user_id, tenant_id, role)
+  VALUES (_user_id, NEW.tenant_id, NEW.role)
+  ON CONFLICT (user_id)
+  DO UPDATE
+    SET tenant_id = EXCLUDED.tenant_id,
+        role = EXCLUDED.role;
+
+  -- Keep the GUC value for this transaction (doesn't matter much after this).
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.sync_user_roles_from_profiles() OWNER TO postgres;
+
+--
 -- Name: apply_rls(jsonb, integer); Type: FUNCTION; Schema: realtime; Owner: supabase_admin
 --
 
@@ -1074,119 +1347,114 @@ CREATE FUNCTION realtime.apply_rls(wal jsonb, max_record_bytes integer DEFAULT (
     LANGUAGE plpgsql
     AS $$
 declare
--- Regclass of the table e.g. public.notes
-entity_ regclass = (quote_ident(wal ->> 'schema') || '.' || quote_ident(wal ->> 'table'))::regclass;
+    -- Regclass of the table e.g. public.notes
+    entity_ regclass = (quote_ident(wal ->> 'schema') || '.' || quote_ident(wal ->> 'table'))::regclass;
 
--- I, U, D, T: insert, update ...
-action realtime.action = (
-    case wal ->> 'action'
-        when 'I' then 'INSERT'
-        when 'U' then 'UPDATE'
-        when 'D' then 'DELETE'
-        else 'ERROR'
-    end
-);
+    -- I, U, D, T: insert, update ...
+    action realtime.action = (
+        case wal ->> 'action'
+            when 'I' then 'INSERT'
+            when 'U' then 'UPDATE'
+            when 'D' then 'DELETE'
+            else 'ERROR'
+        end
+    );
 
--- Is row level security enabled for the table
-is_rls_enabled bool = relrowsecurity from pg_class where oid = entity_;
+    -- Is row level security enabled for the table
+    is_rls_enabled bool = relrowsecurity from pg_class where oid = entity_;
 
-subscriptions realtime.subscription[] = array_agg(subs)
-    from
-        realtime.subscription subs
-    where
-        subs.entity = entity_
-        -- Filter by action early - only get subscriptions interested in this action
-        -- action_filter column can be: '*' (all), 'INSERT', 'UPDATE', or 'DELETE'
-        and (subs.action_filter = '*' or subs.action_filter = action::text);
+    subscriptions realtime.subscription[] = array_agg(subs)
+        from
+            realtime.subscription subs
+        where
+            subs.entity = entity_
+            -- Filter by action early - only get subscriptions interested in this action
+            -- action_filter column can be: '*' (all), 'INSERT', 'UPDATE', or 'DELETE'
+            and (subs.action_filter = '*' or subs.action_filter = action::text);
 
--- Subscription vars
-roles regrole[] = array_agg(distinct us.claims_role::text)
-    from
-        unnest(subscriptions) us;
+    -- Subscription vars
+    working_role regrole;
+    working_selected_columns text[];
+    claimed_role regrole;
+    claims jsonb;
 
-working_role regrole;
-claimed_role regrole;
-claims jsonb;
+    subscription_id uuid;
+    subscription_has_access bool;
+    visible_to_subscription_ids uuid[] = '{}';
 
-subscription_id uuid;
-subscription_has_access bool;
-visible_to_subscription_ids uuid[] = '{}';
+    -- structured info for wal's columns
+    columns realtime.wal_column[];
+    -- previous identity values for update/delete
+    old_columns realtime.wal_column[];
 
--- structured info for wal's columns
-columns realtime.wal_column[];
--- previous identity values for update/delete
-old_columns realtime.wal_column[];
+    error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
 
-error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
+    -- Primary jsonb output for record
+    output jsonb;
 
--- Primary jsonb output for record
-output jsonb;
+    -- Loop record for iterating unique roles (outer loop)
+    role_record record;
+    -- Loop record for iterating unique selected_columns within a role (inner loop)
+    cols_record record;
+    -- Subscription ids visible at the role level (before fanning out by selected_columns)
+    visible_role_sub_ids uuid[] = '{}';
 
 begin
-perform set_config('role', null, true);
+    perform set_config('role', null, true);
 
-columns =
-    array_agg(
-        (
-            x->>'name',
-            x->>'type',
-            x->>'typeoid',
-            realtime.cast(
-                (x->'value') #>> '{}',
-                coalesce(
-                    (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
-                    (x->>'type')::regtype
-                )
-            ),
-            (pks ->> 'name') is not null,
-            true
-        )::realtime.wal_column
-    )
-    from
-        jsonb_array_elements(wal -> 'columns') x
-        left join jsonb_array_elements(wal -> 'pk') pks
-            on (x ->> 'name') = (pks ->> 'name');
-
-old_columns =
-    array_agg(
-        (
-            x->>'name',
-            x->>'type',
-            x->>'typeoid',
-            realtime.cast(
-                (x->'value') #>> '{}',
-                coalesce(
-                    (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
-                    (x->>'type')::regtype
-                )
-            ),
-            (pks ->> 'name') is not null,
-            true
-        )::realtime.wal_column
-    )
-    from
-        jsonb_array_elements(wal -> 'identity') x
-        left join jsonb_array_elements(wal -> 'pk') pks
-            on (x ->> 'name') = (pks ->> 'name');
-
-for working_role in select * from unnest(roles) loop
-
-    -- Update `is_selectable` for columns and old_columns
     columns =
         array_agg(
             (
-                c.name,
-                c.type_name,
-                c.type_oid,
-                c.value,
-                c.is_pkey,
-                pg_catalog.has_column_privilege(working_role, entity_, c.name, 'SELECT')
+                x->>'name',
+                x->>'type',
+                x->>'typeoid',
+                realtime.cast(
+                    (x->'value') #>> '{}',
+                    coalesce(
+                        (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
+                        (x->>'type')::regtype
+                    )
+                ),
+                (pks ->> 'name') is not null,
+                true
             )::realtime.wal_column
         )
         from
-            unnest(columns) c;
+            jsonb_array_elements(wal -> 'columns') x
+            left join jsonb_array_elements(wal -> 'pk') pks
+                on (x ->> 'name') = (pks ->> 'name');
 
     old_columns =
+        array_agg(
+            (
+                x->>'name',
+                x->>'type',
+                x->>'typeoid',
+                realtime.cast(
+                    (x->'value') #>> '{}',
+                    coalesce(
+                        (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
+                        (x->>'type')::regtype
+                    )
+                ),
+                (pks ->> 'name') is not null,
+                true
+            )::realtime.wal_column
+        )
+        from
+            jsonb_array_elements(wal -> 'identity') x
+            left join jsonb_array_elements(wal -> 'pk') pks
+                on (x ->> 'name') = (pks ->> 'name');
+
+    for role_record in
+        select claims_role
+        from (select distinct claims_role from unnest(subscriptions)) t
+        order by claims_role::text
+    loop
+        working_role := role_record.claims_role;
+
+        -- Update `is_selectable` for columns and old_columns (once per role)
+        columns =
             array_agg(
                 (
                     c.name,
@@ -1198,178 +1466,238 @@ for working_role in select * from unnest(roles) loop
                 )::realtime.wal_column
             )
             from
-                unnest(old_columns) c;
+                unnest(columns) c;
 
-    if action <> 'DELETE' and count(1) = 0 from unnest(columns) c where c.is_pkey then
-        return next (
-            jsonb_build_object(
-                'schema', wal ->> 'schema',
-                'table', wal ->> 'table',
-                'type', action
-            ),
-            is_rls_enabled,
-            -- subscriptions is already filtered by entity
-            (select array_agg(s.subscription_id) from unnest(subscriptions) as s where claims_role = working_role),
-            array['Error 400: Bad Request, no primary key']
-        )::realtime.wal_rls;
-
-    -- The claims role does not have SELECT permission to the primary key of entity
-    elsif action <> 'DELETE' and sum(c.is_selectable::int) <> count(1) from unnest(columns) c where c.is_pkey then
-        return next (
-            jsonb_build_object(
-                'schema', wal ->> 'schema',
-                'table', wal ->> 'table',
-                'type', action
-            ),
-            is_rls_enabled,
-            (select array_agg(s.subscription_id) from unnest(subscriptions) as s where claims_role = working_role),
-            array['Error 401: Unauthorized']
-        )::realtime.wal_rls;
-
-    else
-        output = jsonb_build_object(
-            'schema', wal ->> 'schema',
-            'table', wal ->> 'table',
-            'type', action,
-            'commit_timestamp', to_char(
-                ((wal ->> 'timestamp')::timestamptz at time zone 'utc'),
-                'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-            ),
-            'columns', (
-                select
-                    jsonb_agg(
-                        jsonb_build_object(
-                            'name', pa.attname,
-                            'type', pt.typname
-                        )
-                        order by pa.attnum asc
-                    )
-                from
-                    pg_attribute pa
-                    join pg_type pt
-                        on pa.atttypid = pt.oid
-                where
-                    attrelid = entity_
-                    and attnum > 0
-                    and pg_catalog.has_column_privilege(working_role, entity_, pa.attname, 'SELECT')
-            )
-        )
-        -- Add "record" key for insert and update
-        || case
-            when action in ('INSERT', 'UPDATE') then
-                jsonb_build_object(
-                    'record',
+        old_columns =
+                array_agg(
                     (
+                        c.name,
+                        c.type_name,
+                        c.type_oid,
+                        c.value,
+                        c.is_pkey,
+                        pg_catalog.has_column_privilege(working_role, entity_, c.name, 'SELECT')
+                    )::realtime.wal_column
+                )
+                from
+                    unnest(old_columns) c;
+
+        if action <> 'DELETE' and count(1) = 0 from unnest(columns) c where c.is_pkey then
+            -- Fan out 400 error per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+                return next (
+                    jsonb_build_object(
+                        'schema', wal ->> 'schema',
+                        'table', wal ->> 'table',
+                        'type', action
+                    ),
+                    is_rls_enabled,
+                    (select array_agg(s.subscription_id) from unnest(subscriptions) as s where s.claims_role = working_role and (s.selected_columns is not distinct from working_selected_columns)),
+                    array['Error 400: Bad Request, no primary key']
+                )::realtime.wal_rls;
+            end loop;
+
+        -- The claims role does not have SELECT permission to the primary key of entity
+        elsif action <> 'DELETE' and sum(c.is_selectable::int) <> count(1) from unnest(columns) c where c.is_pkey then
+            -- Fan out 401 error per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+                return next (
+                    jsonb_build_object(
+                        'schema', wal ->> 'schema',
+                        'table', wal ->> 'table',
+                        'type', action
+                    ),
+                    is_rls_enabled,
+                    (select array_agg(s.subscription_id) from unnest(subscriptions) as s where s.claims_role = working_role and (s.selected_columns is not distinct from working_selected_columns)),
+                    array['Error 401: Unauthorized']
+                )::realtime.wal_rls;
+            end loop;
+
+        else
+            -- Create the prepared statement (once per role)
+            if is_rls_enabled and action <> 'DELETE' then
+                if (select 1 from pg_prepared_statements where name = 'walrus_rls_stmt' limit 1) > 0 then
+                    deallocate walrus_rls_stmt;
+                end if;
+                execute realtime.build_prepared_statement_sql('walrus_rls_stmt', entity_, columns);
+            end if;
+
+            -- Collect all visible subscription IDs for this role (filter check + RLS check)
+            visible_role_sub_ids = '{}';
+
+            for subscription_id, claims in (
+                    select
+                        subs.subscription_id,
+                        subs.claims
+                    from
+                        unnest(subscriptions) subs
+                    where
+                        subs.entity = entity_
+                        and subs.claims_role = working_role
+                        and (
+                            realtime.is_visible_through_filters(columns, subs.filters)
+                            or (
+                              action = 'DELETE'
+                              and realtime.is_visible_through_filters(old_columns, subs.filters)
+                            )
+                        )
+            ) loop
+
+                if not is_rls_enabled or action = 'DELETE' then
+                    visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+                else
+                    -- Check if RLS allows the role to see the record
+                    perform
+                        -- Trim leading and trailing quotes from working_role because set_config
+                        -- doesn't recognize the role as valid if they are included
+                        set_config('role', trim(both '"' from working_role::text), true),
+                        set_config('request.jwt.claims', claims::text, true);
+
+                    execute 'execute walrus_rls_stmt' into subscription_has_access;
+
+                    if subscription_has_access then
+                        visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+                    end if;
+                end if;
+            end loop;
+
+            perform set_config('role', null, true);
+
+            -- Inner loop: per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+
+                output = jsonb_build_object(
+                    'schema', wal ->> 'schema',
+                    'table', wal ->> 'table',
+                    'type', action,
+                    'commit_timestamp', to_char(
+                        ((wal ->> 'timestamp')::timestamptz at time zone 'utc'),
+                        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+                    ),
+                    'columns', (
                         select
-                            jsonb_object_agg(
-                                -- if unchanged toast, get column name and value from old record
-                                coalesce((c).name, (oc).name),
-                                case
-                                    when (c).name is null then (oc).value
-                                    else (c).value
-                                end
+                            jsonb_agg(
+                                jsonb_build_object(
+                                    'name', pa.attname,
+                                    'type', pt.typname
+                                )
+                                order by pa.attnum asc
                             )
                         from
-                            unnest(columns) c
-                            full outer join unnest(old_columns) oc
-                                on (c).name = (oc).name
+                            pg_attribute pa
+                            join pg_type pt
+                                on pa.atttypid = pt.oid
+                            left join (
+                                select unnest(conkey) as pkey_attnum
+                                from pg_constraint
+                                where conrelid = entity_ and contype = 'p'
+                            ) pk on pk.pkey_attnum = pa.attnum
                         where
-                            coalesce((c).is_selectable, (oc).is_selectable)
-                            and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                            attrelid = entity_
+                            and attnum > 0
+                            and pg_catalog.has_column_privilege(working_role, entity_, pa.attname, 'SELECT')
+                            and (working_selected_columns is null or pa.attname = any(working_selected_columns) or pk.pkey_attnum is not null)
                     )
                 )
-            else '{}'::jsonb
-        end
-        -- Add "old_record" key for update and delete
-        || case
-            when action = 'UPDATE' then
-                jsonb_build_object(
-                        'old_record',
-                        (
-                            select jsonb_object_agg((c).name, (c).value)
-                            from unnest(old_columns) c
-                            where
-                                (c).is_selectable
-                                and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                -- Add "record" key for insert and update
+                || case
+                    when action in ('INSERT', 'UPDATE') then
+                        jsonb_build_object(
+                            'record',
+                            (
+                                select
+                                    jsonb_object_agg(
+                                        -- if unchanged toast, get column name and value from old record
+                                        coalesce((c).name, (oc).name),
+                                        case
+                                            when (c).name is null then (oc).value
+                                            else (c).value
+                                        end
+                                    )
+                                from
+                                    unnest(columns) c
+                                    full outer join unnest(old_columns) oc
+                                        on (c).name = (oc).name
+                                where
+                                    coalesce((c).is_selectable, (oc).is_selectable)
+                                    and (working_selected_columns is null or coalesce((c).name, (oc).name) = any(working_selected_columns) or coalesce((c).is_pkey, (oc).is_pkey))
+                                    and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                            )
                         )
-                    )
-            when action = 'DELETE' then
-                jsonb_build_object(
-                    'old_record',
+                    else '{}'::jsonb
+                end
+                -- Add "old_record" key for update and delete
+                || case
+                    when action = 'UPDATE' then
+                        jsonb_build_object(
+                                'old_record',
+                                (
+                                    select jsonb_object_agg((c).name, (c).value)
+                                    from unnest(old_columns) c
+                                    where
+                                        (c).is_selectable
+                                        and (working_selected_columns is null or (c).name = any(working_selected_columns) or (c).is_pkey)
+                                        and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                                )
+                            )
+                    when action = 'DELETE' then
+                        jsonb_build_object(
+                            'old_record',
+                            (
+                                select jsonb_object_agg((c).name, (c).value)
+                                from unnest(old_columns) c
+                                where
+                                    (c).is_selectable
+                                    and (working_selected_columns is null or (c).name = any(working_selected_columns) or (c).is_pkey)
+                                    and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                                    and ( not is_rls_enabled or (c).is_pkey ) -- if RLS enabled, we can't secure deletes so filter to pkey
+                            )
+                        )
+                    else '{}'::jsonb
+                end;
+
+                -- Filter visible_role_sub_ids to those matching the current selected_columns group
+                visible_to_subscription_ids = coalesce(
                     (
-                        select jsonb_object_agg((c).name, (c).value)
-                        from unnest(old_columns) c
-                        where
-                            (c).is_selectable
-                            and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
-                            and ( not is_rls_enabled or (c).is_pkey ) -- if RLS enabled, we can't secure deletes so filter to pkey
-                    )
-                )
-            else '{}'::jsonb
-        end;
+                        select array_agg(s.subscription_id)
+                        from unnest(subscriptions) s
+                        where s.claims_role = working_role
+                          and (s.selected_columns is not distinct from working_selected_columns)
+                          and s.subscription_id = any(visible_role_sub_ids)
+                    ),
+                    '{}'::uuid[]
+                );
 
-        -- Create the prepared statement
-        if is_rls_enabled and action <> 'DELETE' then
-            if (select 1 from pg_prepared_statements where name = 'walrus_rls_stmt' limit 1) > 0 then
-                deallocate walrus_rls_stmt;
-            end if;
-            execute realtime.build_prepared_statement_sql('walrus_rls_stmt', entity_, columns);
+                return next (
+                    output,
+                    is_rls_enabled,
+                    visible_to_subscription_ids,
+                    case
+                        when error_record_exceeds_max_size then array['Error 413: Payload Too Large']
+                        else '{}'
+                    end
+                )::realtime.wal_rls;
+            end loop;
+
         end if;
+    end loop;
 
-        visible_to_subscription_ids = '{}';
-
-        for subscription_id, claims in (
-                select
-                    subs.subscription_id,
-                    subs.claims
-                from
-                    unnest(subscriptions) subs
-                where
-                    subs.entity = entity_
-                    and subs.claims_role = working_role
-                    and (
-                        realtime.is_visible_through_filters(columns, subs.filters)
-                        or (
-                          action = 'DELETE'
-                          and realtime.is_visible_through_filters(old_columns, subs.filters)
-                        )
-                    )
-        ) loop
-
-            if not is_rls_enabled or action = 'DELETE' then
-                visible_to_subscription_ids = visible_to_subscription_ids || subscription_id;
-            else
-                -- Check if RLS allows the role to see the record
-                perform
-                    -- Trim leading and trailing quotes from working_role because set_config
-                    -- doesn't recognize the role as valid if they are included
-                    set_config('role', trim(both '"' from working_role::text), true),
-                    set_config('request.jwt.claims', claims::text, true);
-
-                execute 'execute walrus_rls_stmt' into subscription_has_access;
-
-                if subscription_has_access then
-                    visible_to_subscription_ids = visible_to_subscription_ids || subscription_id;
-                end if;
-            end if;
-        end loop;
-
-        perform set_config('role', null, true);
-
-        return next (
-            output,
-            is_rls_enabled,
-            visible_to_subscription_ids,
-            case
-                when error_record_exceeds_max_size then array['Error 413: Payload Too Large']
-                else '{}'
-            end
-        )::realtime.wal_rls;
-
-    end if;
-end loop;
-
-perform set_config('role', null, true);
+    perform set_config('role', null, true);
 end;
 $$;
 
@@ -1562,7 +1890,7 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
         string_agg(
           realtime.quote_wal2json(format('%I.%I', schemaname, tablename)::regclass),
           ','
-        ) filter (WHERE ppt.tablename IS NOT NULL AND ppt.tablename NOT LIKE '% %'),
+        ) filter (WHERE ppt.tablename IS NOT NULL),
         ''
       ) AS w2j_add_tables
     FROM pg_publication pp
@@ -1586,13 +1914,11 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
            'add-tables', pub.w2j_add_tables
          ) x
   ),
-  -- Count raw slot entries before apply_rls/subscription filter
   slot_count AS (
     SELECT count(*)::bigint AS cnt
     FROM w2j
     WHERE w2j.w2j_add_tables <> ''
   ),
-  -- Apply RLS and filter as before
   rls_filtered AS (
     SELECT xyz.wal, xyz.is_rls_enabled, xyz.subscription_ids, xyz.errors
     FROM w2j,
@@ -1603,14 +1929,11 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
     WHERE w2j.w2j_add_tables <> ''
       AND xyz.subscription_ids[1] IS NOT NULL
   )
-  -- Real rows with slot count attached
   SELECT rf.wal, rf.is_rls_enabled, rf.subscription_ids, rf.errors, sc.cnt
   FROM rls_filtered rf, slot_count sc
 
   UNION ALL
 
-  -- Sentinel row: always returned when no real rows exist so Elixir can
-  -- always read slot_changes_count. Identified by wal IS NULL.
   SELECT null, null, null, null, sc.cnt
   FROM slot_count sc
   WHERE NOT EXISTS (SELECT 1 FROM rls_filtered)
@@ -1626,35 +1949,14 @@ ALTER FUNCTION realtime.list_changes(publication name, slot_name name, max_chang
 CREATE FUNCTION realtime.quote_wal2json(entity regclass) RETURNS text
     LANGUAGE sql IMMUTABLE STRICT
     AS $$
-      select
-        (
-          select string_agg('' || ch,'')
-          from unnest(string_to_array(nsp.nspname::text, null)) with ordinality x(ch, idx)
-          where
-            not (x.idx = 1 and x.ch = '"')
-            and not (
-              x.idx = array_length(string_to_array(nsp.nspname::text, null), 1)
-              and x.ch = '"'
-            )
-        )
-        || '.'
-        || (
-          select string_agg('' || ch,'')
-          from unnest(string_to_array(pc.relname::text, null)) with ordinality x(ch, idx)
-          where
-            not (x.idx = 1 and x.ch = '"')
-            and not (
-              x.idx = array_length(string_to_array(nsp.nspname::text, null), 1)
-              and x.ch = '"'
-            )
-          )
-      from
-        pg_class pc
-        join pg_namespace nsp
-          on pc.relnamespace = nsp.oid
-      where
-        pc.oid = entity
-    $$;
+  SELECT
+    realtime.wal2json_escape_identifier(nsp.nspname::text)
+    || '.'
+    || realtime.wal2json_escape_identifier(pc.relname::text)
+  FROM pg_class pc
+  JOIN pg_namespace nsp ON pc.relnamespace = nsp.oid
+  WHERE pc.oid = entity
+$$;
 
 
 ALTER FUNCTION realtime.quote_wal2json(entity regclass) OWNER TO supabase_admin;
@@ -1699,77 +2001,121 @@ $$;
 ALTER FUNCTION realtime.send(payload jsonb, event text, topic text, private boolean) OWNER TO supabase_admin;
 
 --
+-- Name: send_binary(bytea, text, text, boolean); Type: FUNCTION; Schema: realtime; Owner: supabase_admin
+--
+
+CREATE FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean DEFAULT true) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  generated_id uuid;
+BEGIN
+  BEGIN
+    generated_id := gen_random_uuid();
+
+    EXECUTE format('SET LOCAL realtime.topic TO %L', topic);
+
+    INSERT INTO realtime.messages (id, binary_payload, event, topic, private, extension)
+    VALUES (generated_id, payload, event, topic, private, 'broadcast');
+  EXCEPTION
+    WHEN OTHERS THEN
+      RAISE WARNING 'ErrorSendingBroadcastMessage: %', SQLERRM;
+  END;
+END;
+$$;
+
+
+ALTER FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean) OWNER TO supabase_admin;
+
+--
 -- Name: subscription_check_filters(); Type: FUNCTION; Schema: realtime; Owner: supabase_admin
 --
 
 CREATE FUNCTION realtime.subscription_check_filters() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-    /*
-    Validates that the user defined filters for a subscription:
-    - refer to valid columns that the claimed role may access
-    - values are coercable to the correct column type
-    */
-    declare
-        col_names text[] = coalesce(
-                array_agg(c.column_name order by c.ordinal_position),
-                '{}'::text[]
-            )
-            from
-                information_schema.columns c
-            where
-                format('%I.%I', c.table_schema, c.table_name)::regclass = new.entity
-                and pg_catalog.has_column_privilege(
-                    (new.claims ->> 'role'),
-                    format('%I.%I', c.table_schema, c.table_name)::regclass,
-                    c.column_name,
-                    'SELECT'
-                );
-        filter realtime.user_defined_filter;
-        col_type regtype;
-
-        in_val jsonb;
-    begin
-        for filter in select * from unnest(new.filters) loop
-            -- Filtered column is valid
-            if not filter.column_name = any(col_names) then
-                raise exception 'invalid column for filter %', filter.column_name;
-            end if;
-
-            -- Type is sanitized and safe for string interpolation
-            col_type = (
-                select atttypid::regtype
-                from pg_catalog.pg_attribute
-                where attrelid = new.entity
-                      and attname = filter.column_name
+declare
+    col_names text[] = coalesce(
+            array_agg(c.column_name order by c.ordinal_position),
+            '{}'::text[]
+        )
+        from
+            information_schema.columns c
+        where
+            format('%I.%I', c.table_schema, c.table_name)::regclass = new.entity
+            and pg_catalog.has_column_privilege(
+                (new.claims ->> 'role'),
+                format('%I.%I', c.table_schema, c.table_name)::regclass,
+                c.column_name,
+                'SELECT'
             );
-            if col_type is null then
-                raise exception 'failed to lookup type for column %', filter.column_name;
-            end if;
+    table_col_names text[] = coalesce(
+            array_agg(pa.attname),
+            '{}'::text[]
+        )
+        from
+            pg_attribute pa
+        where
+            pa.attrelid = new.entity
+            and pa.attnum > 0;
+    filter realtime.user_defined_filter;
+    col_type regtype;
+    in_val jsonb;
+    selected_col text;
+begin
+    for filter in select * from unnest(new.filters) loop
+        -- Filtered column is valid
+        if not filter.column_name = any(col_names) then
+            raise exception 'invalid column for filter %', filter.column_name;
+        end if;
 
-            -- Set maximum number of entries for in filter
-            if filter.op = 'in'::realtime.equality_op then
-                in_val = realtime.cast(filter.value, (col_type::text || '[]')::regtype);
-                if coalesce(jsonb_array_length(in_val), 0) > 100 then
-                    raise exception 'too many values for `in` filter. Maximum 100';
-                end if;
-            else
-                -- raises an exception if value is not coercable to type
-                perform realtime.cast(filter.value, col_type);
+        -- Type is sanitized and safe for string interpolation
+        col_type = (
+            select atttypid::regtype
+            from pg_catalog.pg_attribute
+            where attrelid = new.entity
+                  and attname = filter.column_name
+        );
+        if col_type is null then
+            raise exception 'failed to lookup type for column %', filter.column_name;
+        end if;
+        if filter.op = 'in'::realtime.equality_op then
+            in_val = realtime.cast(filter.value, (col_type::text || '[]')::regtype);
+            if coalesce(jsonb_array_length(in_val), 0) > 100 then
+                raise exception 'too many values for `in` filter. Maximum 100';
             end if;
+        else
+            -- raises an exception if value is not coercable to type
+            perform realtime.cast(filter.value, col_type);
+        end if;
+    end loop;
 
+    -- Validate that selected_columns reference columns the role can SELECT
+    if new.selected_columns is not null then
+        for selected_col in select * from unnest(new.selected_columns) loop
+            if not selected_col = any(col_names) then
+                raise exception 'invalid column for select %', selected_col;
+            end if;
         end loop;
+    end if;
 
-        -- Apply consistent order to filters so the unique constraint on
-        -- (subscription_id, entity, filters) can't be tricked by a different filter order
-        new.filters = coalesce(
-            array_agg(f order by f.column_name, f.op, f.value),
-            '{}'
-        ) from unnest(new.filters) f;
+    -- Apply consistent order to filters so the unique constraint on
+    -- (subscription_id, entity, filters) can't be tricked by a different filter order
+    new.filters = coalesce(
+        array_agg(f order by f.column_name, f.op, f.value),
+        '{}'
+    ) from unnest(new.filters) f;
 
-        return new;
-    end;
-    $$;
+    -- Normalize selected_columns order so ARRAY['a','b'] and ARRAY['b','a'] are
+    -- treated as the same subscription group in apply_rls
+    new.selected_columns = (
+        select array_agg(c order by c)
+        from unnest(new.selected_columns) c
+    );
+
+    return new;
+end;
+$$;
 
 
 ALTER FUNCTION realtime.subscription_check_filters() OWNER TO supabase_admin;
@@ -1797,6 +2143,20 @@ $$;
 
 
 ALTER FUNCTION realtime.topic() OWNER TO supabase_realtime_admin;
+
+--
+-- Name: wal2json_escape_identifier(text); Type: FUNCTION; Schema: realtime; Owner: supabase_admin
+--
+
+CREATE FUNCTION realtime.wal2json_escape_identifier(name text) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT
+    AS $$
+  -- Prefix `\`, `,`, `.`, and any whitespace with `\`
+  SELECT regexp_replace(name, '([\\,.[:space:]])', '\\\1', 'g')
+$$;
+
+
+ALTER FUNCTION realtime.wal2json_escape_identifier(name text) OWNER TO supabase_admin;
 
 --
 -- Name: allow_any_operation(text[]); Type: FUNCTION; Schema: storage; Owner: supabase_storage_admin
@@ -3509,11 +3869,44 @@ CREATE TABLE public.events (
     registration_start_date timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text) NOT NULL,
     has_problem_statement boolean DEFAULT false,
     resource_person text,
-    tenant_id uuid NOT NULL
+    tenant_id uuid NOT NULL,
+    registration_link text
 );
 
 
 ALTER TABLE public.events OWNER TO postgres;
+
+--
+-- Name: events_archive; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.events_archive (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    title text NOT NULL,
+    description text NOT NULL,
+    event_date timestamp with time zone NOT NULL,
+    location text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    is_active boolean DEFAULT true,
+    event_type text,
+    mode text,
+    image_url text,
+    organizer_name text,
+    organizer_contact text,
+    registration_deadline timestamp with time zone,
+    max_participants integer,
+    problem_statement_deadline timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text),
+    registration_start_date timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text) NOT NULL,
+    has_problem_statement boolean DEFAULT false,
+    resource_person text,
+    tenant_id uuid NOT NULL,
+    registration_link text,
+    archived_at timestamp with time zone DEFAULT now()
+);
+
+
+ALTER TABLE public.events_archive OWNER TO postgres;
 
 --
 -- Name: page_content; Type: TABLE; Schema: public; Owner: postgres
@@ -3850,7 +4243,8 @@ CREATE TABLE realtime.messages (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 )
 PARTITION BY RANGE (inserted_at);
 
@@ -3869,7 +4263,8 @@ CREATE TABLE realtime.messages_2026_02_12 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3887,7 +4282,8 @@ CREATE TABLE realtime.messages_2026_02_13 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3905,7 +4301,8 @@ CREATE TABLE realtime.messages_2026_02_14 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3923,7 +4320,8 @@ CREATE TABLE realtime.messages_2026_02_15 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3941,7 +4339,8 @@ CREATE TABLE realtime.messages_2026_02_16 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3972,6 +4371,7 @@ CREATE TABLE realtime.subscription (
     claims_role regrole GENERATED ALWAYS AS (realtime.to_regrole((claims ->> 'role'::text))) STORED NOT NULL,
     created_at timestamp without time zone DEFAULT timezone('utc'::text, now()) NOT NULL,
     action_filter text DEFAULT '*'::text,
+    selected_columns text[],
     CONSTRAINT subscription_action_filter_check CHECK ((action_filter = ANY (ARRAY['*'::text, 'INSERT'::text, 'UPDATE'::text, 'DELETE'::text])))
 );
 
@@ -4238,8 +4638,6 @@ COPY auth.flow_state (id, user_id, auth_code, code_challenge_method, code_challe
 
 COPY auth.identities (provider_id, user_id, identity_data, provider, last_sign_in_at, created_at, updated_at, id) FROM stdin;
 ea5561b5-6918-4212-83d9-5e48dec790ce	ea5561b5-6918-4212-83d9-5e48dec790ce	{"sub": "ea5561b5-6918-4212-83d9-5e48dec790ce", "name": "Jay", "email": "23r11a0544@gcet.edu.in", "email_verified": true, "phone_verified": false}	email	2026-02-10 15:03:19.44782+00	2026-02-10 15:03:19.447887+00	2026-02-10 15:03:19.447887+00	c6b92ee3-1bae-4a93-9648-b5de4017e93b
-d0162e3c-be25-43b0-8e46-9a744f221149	d0162e3c-be25-43b0-8e46-9a744f221149	{"sub": "d0162e3c-be25-43b0-8e46-9a744f221149", "name": "Advika", "email": "23r11a0515@gcet.edu.in", "email_verified": true, "phone_verified": false}	email	2026-02-10 15:02:34.068868+00	2026-02-10 15:02:34.068922+00	2026-02-10 15:02:34.068922+00	7b5e79e4-d911-4271-a5e1-9bbe1379a725
-8f064c44-6ed2-479d-a547-d1beaf8d4a06	8f064c44-6ed2-479d-a547-d1beaf8d4a06	{"sub": "8f064c44-6ed2-479d-a547-d1beaf8d4a06", "name": "Vivek Vardhan", "email": "23r11a0531@gcet.edu.in", "email_verified": true, "phone_verified": false}	email	2026-02-11 04:58:53.853073+00	2026-02-11 04:58:53.853124+00	2026-02-11 04:58:53.853124+00	8da2219d-fbc5-4f3d-9013-7c2df7d5f150
 b280f8c8-b05a-4237-b606-802420092eb1	b280f8c8-b05a-4237-b606-802420092eb1	{"sub": "b280f8c8-b05a-4237-b606-802420092eb1", "name": "advika", "email": "23r11a67c7@gcet.edu.in", "email_verified": true, "phone_verified": false}	email	2026-02-14 05:26:30.892999+00	2026-02-14 05:26:30.893057+00	2026-02-14 05:26:30.893057+00	eaa718e4-7d23-4721-94eb-fe45f5ec569e
 ec79d798-6f6f-4549-8d79-edd15870b43b	ec79d798-6f6f-4549-8d79-edd15870b43b	{"sub": "ec79d798-6f6f-4549-8d79-edd15870b43b", "name": "lilly", "email": "23r11a0566@gcet.edu.in", "email_verified": false, "phone_verified": false}	email	2026-02-15 18:58:18.476636+00	2026-02-15 18:58:18.476689+00	2026-02-15 18:58:18.476689+00	56988b0f-a9e4-4f8c-9610-f980d90ce66b
 b84fe995-c654-433b-949a-5d14b471481b	b84fe995-c654-433b-949a-5d14b471481b	{"sub": "b84fe995-c654-433b-949a-5d14b471481b", "name": "rishik", "email": "23r11a0546@gcet.edu.in", "email_verified": true, "phone_verified": false}	email	2026-03-03 08:25:15.230711+00	2026-03-03 08:25:15.230768+00	2026-03-03 08:25:15.230768+00	5029da16-8ddb-450f-b140-9b637ef239b9
@@ -4248,6 +4646,8 @@ d1645cf0-5274-43f6-94d5-f0db4c6dcabf	d1645cf0-5274-43f6-94d5-f0db4c6dcabf	{"sub"
 595d5afb-c1f6-47a7-b92a-96519c1fc36f	595d5afb-c1f6-47a7-b92a-96519c1fc36f	{"sub": "595d5afb-c1f6-47a7-b92a-96519c1fc36f", "name": "Vaishnavi", "email": "23r11a0513@gcet.edu.in", "email_verified": false, "phone_verified": false}	email	2026-03-06 16:16:51.319081+00	2026-03-06 16:16:51.319127+00	2026-03-06 16:16:51.319127+00	92f81471-1fbc-448a-b910-ece477355755
 f6601227-10dc-4bb5-9be0-a48df646882c	f6601227-10dc-4bb5-9be0-a48df646882c	{"sub": "f6601227-10dc-4bb5-9be0-a48df646882c", "name": "Shivani", "email": "23r11a0505@gcet.edu.in", "email_verified": true, "phone_verified": false}	email	2026-03-10 04:36:59.193759+00	2026-03-10 04:36:59.193807+00	2026-03-10 04:36:59.193807+00	0781a1bb-d9b3-4f4a-a3c7-c68b3bfea323
 f6e82f04-701a-4e83-84a9-b311eaed6db2	f6e82f04-701a-4e83-84a9-b311eaed6db2	{"sub": "f6e82f04-701a-4e83-84a9-b311eaed6db2", "name": "Abhaya", "year": "4", "email": "21r11a05c0@gcet.edu.in", "department": "CSE", "email_verified": true, "phone_verified": false}	email	2026-04-16 16:03:43.336261+00	2026-04-16 16:03:43.336313+00	2026-04-16 16:03:43.336313+00	0f3cc657-73a6-4a95-8c9f-5e95493ea38a
+2e83ba6a-9778-4e84-80b2-168409debced	2e83ba6a-9778-4e84-80b2-168409debced	{"sub": "2e83ba6a-9778-4e84-80b2-168409debced", "name": "Advika", "year": "4", "email": "23r11a0515@gcet.edu.in", "tenant_id": "0ee52668-ea70-4740-9f7b-b15ba5535254", "department": "CSE", "email_verified": true, "phone_verified": false}	email	2026-05-29 05:55:01.09317+00	2026-05-29 05:55:01.093239+00	2026-05-29 05:55:01.093239+00	d6ba2042-04eb-41ce-9184-adcd89740e75
+bc00594c-8776-4bef-9d32-cf6176f89f81	bc00594c-8776-4bef-9d32-cf6176f89f81	{"sub": "bc00594c-8776-4bef-9d32-cf6176f89f81", "name": "Vivek Vardhan", "year": "4", "email": "23r11a0531@gcet.edu.in", "tenant_id": "0ee52668-ea70-4740-9f7b-b15ba5535254", "department": "CSE", "email_verified": true, "phone_verified": false}	email	2026-05-29 07:15:19.787248+00	2026-05-29 07:15:19.787308+00	2026-05-29 07:15:19.787308+00	a57e11e8-12e9-47e1-8c4c-bf94ea4bce8d
 \.
 
 
@@ -4264,26 +4664,26 @@ COPY auth.instances (id, uuid, raw_base_config, created_at, updated_at) FROM std
 --
 
 COPY auth.mfa_amr_claims (session_id, created_at, updated_at, authentication_method, id) FROM stdin;
-4804d2fd-1b39-4e20-a239-f0dc5d0747f4	2026-03-10 06:18:43.243661+00	2026-03-10 06:18:43.243661+00	password	0f005283-d512-4a6d-a098-44fdb0e40124
-a4877bdd-a035-4c36-b79b-8293aadd4c83	2026-04-14 12:11:53.871966+00	2026-04-14 12:11:53.871966+00	password	9bf38704-b1f1-489f-aa08-255c37987d6b
-59e2291c-f891-402f-b846-95a1c390d447	2026-04-15 07:40:58.259109+00	2026-04-15 07:40:58.259109+00	password	7d0f0076-feb2-4d91-9988-61ac015ac07a
-aebee0a3-4e27-4606-a557-6261d4650726	2026-04-15 09:51:11.648057+00	2026-04-15 09:51:11.648057+00	password	e6fddadd-dfe7-46ef-9fbe-51fd403ba4fa
+661ab255-7150-4bb1-af9c-3c55d35128a7	2026-05-28 08:59:22.487088+00	2026-05-28 08:59:22.487088+00	password	8f6d8fbc-9f64-4976-8f7a-0abae9d56e2a
+4efc29ef-893a-41d5-8bc4-5639ef427ee9	2026-05-28 09:25:20.044047+00	2026-05-28 09:25:20.044047+00	password	46bd205a-33b4-49ba-b5d6-33ff9595d963
+49eaad77-5f9f-470d-babe-9c3f22046eef	2026-05-28 09:37:10.747315+00	2026-05-28 09:37:10.747315+00	password	1639cbea-92d9-4123-8345-e410a494241b
+d967d768-9611-4b9d-adcc-0af86ad909bb	2026-05-28 09:37:26.604093+00	2026-05-28 09:37:26.604093+00	password	8b3af0a1-c912-47d9-9c85-7326f9a07c22
+417df4f3-34ce-4af9-a0ac-ef483e3f6cb5	2026-05-28 10:14:30.349515+00	2026-05-28 10:14:30.349515+00	password	c74d3952-88aa-444e-aab6-bc92b6298478
+b8591ffa-b91f-4eb3-b644-075e68adeb47	2026-05-28 07:06:25.316105+00	2026-05-28 07:06:25.316105+00	password	62620a42-b167-4def-8b1b-7ebea5dd9178
+b5e61792-8088-40c1-bdd9-860c9c62cc8b	2026-05-29 06:37:50.369552+00	2026-05-29 06:37:50.369552+00	password	e013f39a-aa51-4edb-9272-d3e361ecaf19
+8603c917-e253-4e42-bd8d-a8be14d40f94	2026-05-28 07:12:18.123713+00	2026-05-28 07:12:18.123713+00	password	15be8e87-1ad5-47fc-8ff2-fb2cbb893c26
+b61a4643-ec2e-40b8-9e12-2ffebe17b920	2026-05-29 06:42:34.800329+00	2026-05-29 06:42:34.800329+00	password	25458360-0c63-488e-a201-34a4cb0390fb
+0ece92fa-53df-42db-a509-8b2b01ce3321	2026-05-29 06:43:01.742993+00	2026-05-29 06:43:01.742993+00	password	cb996039-e6c8-449d-b941-b829e267799e
+3ce6c222-95d3-46c9-8dc5-974ba870abfb	2026-05-29 06:44:50.263804+00	2026-05-29 06:44:50.263804+00	password	442f7ab9-1488-4f3f-9a1f-3c0ced36d7ad
 8d0c8278-d6b4-4290-b0ed-080c07d65a13	2026-04-16 16:04:23.942872+00	2026-04-16 16:04:23.942872+00	otp	ca5d6c54-1dc0-4eeb-97d6-2bbccd9c53fb
-0c389d5a-bcf4-43ca-ac54-d678d650b114	2026-04-17 12:54:49.347439+00	2026-04-17 12:54:49.347439+00	password	6450685b-b0a8-4446-9ec7-e46242c1f9bf
-4d230349-71a4-4692-8538-f9a90420dfc7	2026-04-17 16:26:53.553767+00	2026-04-17 16:26:53.553767+00	password	3b863230-aa80-485b-9347-00949c704ccf
+a76f5fed-6a03-40d9-b2d7-2acf895ce7d8	2026-05-29 06:45:36.330691+00	2026-05-29 06:45:36.330691+00	password	17185761-6fa9-4396-94a8-a8e523dd897a
+afdb3340-8b61-48c7-bbd5-747d425ce99f	2026-05-29 06:46:26.262208+00	2026-05-29 06:46:26.262208+00	password	57f962de-2b6d-4c83-9e77-fdcc86a94136
+b4a49cb0-0b5a-4295-a106-acaf14602e9b	2026-05-29 06:47:35.675982+00	2026-05-29 06:47:35.675982+00	password	0d28d493-7e91-4654-8143-9d7876f26691
 4b4a996f-9979-44e4-8b0c-fe1e62464b30	2026-03-10 04:37:16.070448+00	2026-03-10 04:37:16.070448+00	otp	5473cf53-8e25-4ffe-be15-d59b5ba66494
-1fa0be54-b228-48ec-9ec1-81cadacf639b	2026-05-10 09:43:04.592242+00	2026-05-10 09:43:04.592242+00	password	8a884f21-2629-4411-971a-a49222ee9968
-15ea3606-3fc8-4700-a4c3-df7e6a6bb3dd	2026-05-10 10:11:04.437727+00	2026-05-10 10:11:04.437727+00	password	9b317177-262e-48ce-976d-2e0e41f20dd2
-9471b4f6-ba59-447f-822a-264950e51c92	2026-05-10 10:52:28.352296+00	2026-05-10 10:52:28.352296+00	password	9cd4a510-69ed-48dc-8a29-7879c386f4d5
-d3a49951-867e-4a94-bba4-5b8262885bb0	2026-05-10 11:29:01.257919+00	2026-05-10 11:29:01.257919+00	password	68732b0f-068e-4fd8-a6c8-31284e012770
-6ce74dd6-e66f-47ff-980a-2a5d2727d010	2026-05-23 09:45:27.12819+00	2026-05-23 09:45:27.12819+00	password	b7c92744-65a8-4c00-b831-2f1d9e25756d
-d6f7c2af-5799-42ec-b8b0-c81db84f5707	2026-05-23 09:59:01.503378+00	2026-05-23 09:59:01.503378+00	password	256429e0-0dd2-433c-a2e3-e11e728c6fb7
-6720119f-4991-4290-b103-488354e9673c	2026-05-24 07:39:01.369812+00	2026-05-24 07:39:01.369812+00	password	3b65e5db-218b-4dce-ba9f-d75888418c42
-2efad47b-77ad-4173-acf4-ecdfa38f9c96	2026-05-24 19:14:50.806734+00	2026-05-24 19:14:50.806734+00	password	9554eb31-997d-4805-a82f-32ea18418634
-ce8b5d72-0d36-4457-b1f2-da08f252c4f6	2026-05-25 03:57:20.329425+00	2026-05-25 03:57:20.329425+00	password	38877f51-2fff-4f6c-91c3-607d310ddfd0
-7c1d31c3-aa18-4f9b-b49d-993d5c9ebd1e	2026-05-25 03:59:04.558831+00	2026-05-25 03:59:04.558831+00	password	0f9e2f43-2076-4d84-8775-3c8096fbf5c3
-a2beec6b-502d-420d-8d06-169c7a34baf4	2026-05-25 06:35:36.158208+00	2026-05-25 06:35:36.158208+00	password	d666b4e7-f77b-42f1-b986-3ff9721b275c
-45f98959-e0aa-4e43-9fc9-cab942697e62	2026-05-25 06:51:08.189551+00	2026-05-25 06:51:08.189551+00	password	69fcecb8-51f8-48de-8f73-cfa3fd7756ca
+35f9bd15-a054-4315-b4fd-092eb8d4cb57	2026-05-29 07:20:38.432071+00	2026-05-29 07:20:38.432071+00	otp	1b9a2b95-c4a7-41ec-8853-6fd7974f01f9
+b71c0817-a47b-4c03-8ed3-4d0c8cfd8bad	2026-05-29 07:32:40.951836+00	2026-05-29 07:32:40.951836+00	password	95abc842-6d80-4bb8-a770-775bdd595467
+f8160813-6e1a-443f-bc69-03353095811d	2026-05-30 06:26:54.208984+00	2026-05-30 06:26:54.208984+00	password	5b3bafa6-ea9f-4776-9dde-eadfdaf82786
+7b03a3e4-bfe1-4fe2-924d-3c4b8ccf1dca	2026-06-04 10:22:44.975048+00	2026-06-04 10:22:44.975048+00	password	f8340e79-faf1-422e-9bde-e1654aa4b08e
 \.
 
 
@@ -4341,8 +4741,6 @@ COPY auth.oauth_consents (id, user_id, client_id, scopes, granted_at, revoked_at
 
 COPY auth.one_time_tokens (id, user_id, token_type, token_hash, relates_to, created_at, updated_at) FROM stdin;
 2190ec43-1f67-48b2-95af-55765a9677b8	ec79d798-6f6f-4549-8d79-edd15870b43b	confirmation_token	59c5025a182016539fc625b9dcc945b992f9334734da09d9d8a757e2	23r11a0566@gcet.edu.in	2026-02-15 18:58:22.01992	2026-02-15 18:58:22.01992
-3ef2ed26-d685-480d-9a1a-a4941d180e4e	8f064c44-6ed2-479d-a547-d1beaf8d4a06	email_change_token_current	86258ba66d9aec5281e7fea688494079b75c883a88f2e3ccf3833efc	23r11a0531@gcet.edu.in	2026-03-06 15:09:15.296523	2026-03-06 15:09:15.296523
-213ee939-8c10-4e98-bdf8-c80c789eed4f	8f064c44-6ed2-479d-a547-d1beaf8d4a06	email_change_token_new	b748c41e52cb6a80505a2536814d4e5f1932ba2aef11353c26be2184	23r11a0532@gcet.edu.in	2026-03-06 15:09:15.306255	2026-03-06 15:09:15.306255
 67782db6-33fc-494c-84c9-b12e665c7294	595d5afb-c1f6-47a7-b92a-96519c1fc36f	confirmation_token	a10c1bac50098bc6c2f76bdff270755b9b91c3f6918a39cf378482d5	23r11a0513@gcet.edu.in	2026-03-06 16:16:54.30764	2026-03-06 16:16:54.30764
 \.
 
@@ -4352,36 +4750,111 @@ COPY auth.one_time_tokens (id, user_id, token_type, token_hash, relates_to, crea
 --
 
 COPY auth.refresh_tokens (instance_id, id, token, user_id, revoked, created_at, updated_at, parent, session_id) FROM stdin;
-00000000-0000-0000-0000-000000000000	685	qwm6rl7gvnjg	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-04-14 12:11:53.868348+00	2026-04-14 12:11:53.868348+00	\N	a4877bdd-a035-4c36-b79b-8293aadd4c83
-00000000-0000-0000-0000-000000000000	691	pkurqxdsalsy	d0162e3c-be25-43b0-8e46-9a744f221149	f	2026-04-15 07:40:58.233289+00	2026-04-15 07:40:58.233289+00	\N	59e2291c-f891-402f-b846-95a1c390d447
-00000000-0000-0000-0000-000000000000	764	7zohu3hs3wew	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-25 06:35:36.156833+00	2026-05-25 06:35:36.156833+00	\N	a2beec6b-502d-420d-8d06-169c7a34baf4
+00000000-0000-0000-0000-000000000000	866	e3umr2njgmmd	b84fe995-c654-433b-949a-5d14b471481b	t	2026-05-28 07:06:25.314884+00	2026-05-28 08:52:15.939426+00	\N	b8591ffa-b91f-4eb3-b644-075e68adeb47
+00000000-0000-0000-0000-000000000000	890	ug6dt2jxqcsr	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-28 08:52:15.950196+00	2026-05-28 08:52:15.950196+00	e3umr2njgmmd	b8591ffa-b91f-4eb3-b644-075e68adeb47
+00000000-0000-0000-0000-000000000000	1044	mea7vznsuoal	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:46:26.2512+00	2026-05-29 08:06:41.133358+00	\N	afdb3340-8b61-48c7-bbd5-747d425ce99f
+00000000-0000-0000-0000-000000000000	896	qs7hb3cus7x2	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-28 09:37:10.744061+00	2026-05-28 09:37:10.744061+00	\N	49eaad77-5f9f-470d-babe-9c3f22046eef
+00000000-0000-0000-0000-000000000000	897	rlbpknkdzbbb	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-28 09:37:26.602955+00	2026-05-28 09:37:26.602955+00	\N	d967d768-9611-4b9d-adcc-0af86ad909bb
 00000000-0000-0000-0000-000000000000	577	ofoelurvgmba	f6601227-10dc-4bb5-9be0-a48df646882c	f	2026-03-10 04:37:16.05829+00	2026-03-10 04:37:16.05829+00	\N	4b4a996f-9979-44e4-8b0c-fe1e62464b30
-00000000-0000-0000-0000-000000000000	766	xt4yh5qyt3hb	8f064c44-6ed2-479d-a547-d1beaf8d4a06	f	2026-05-25 06:51:08.161861+00	2026-05-25 06:51:08.161861+00	\N	45f98959-e0aa-4e43-9fc9-cab942697e62
-00000000-0000-0000-0000-000000000000	730	l4cfitanqfmf	8f064c44-6ed2-479d-a547-d1beaf8d4a06	t	2026-05-10 12:14:31.865295+00	2026-05-25 06:51:28.970731+00	mha4fymtxsr3	1fa0be54-b228-48ec-9ec1-81cadacf639b
-00000000-0000-0000-0000-000000000000	767	h2c7grzqb2v2	8f064c44-6ed2-479d-a547-d1beaf8d4a06	f	2026-05-25 06:51:28.973915+00	2026-05-25 06:51:28.973915+00	l4cfitanqfmf	1fa0be54-b228-48ec-9ec1-81cadacf639b
-00000000-0000-0000-0000-000000000000	749	spag3fkmfbko	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-24 19:14:50.773626+00	2026-05-25 06:52:43.226002+00	\N	2efad47b-77ad-4173-acf4-ecdfa38f9c96
-00000000-0000-0000-0000-000000000000	768	hchctfjrmssz	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-25 06:52:43.233227+00	2026-05-25 06:52:43.233227+00	spag3fkmfbko	2efad47b-77ad-4173-acf4-ecdfa38f9c96
-00000000-0000-0000-0000-000000000000	700	ggxw2blvislf	8f064c44-6ed2-479d-a547-d1beaf8d4a06	t	2026-04-15 09:51:11.613554+00	2026-04-15 13:43:41.066643+00	\N	aebee0a3-4e27-4606-a557-6261d4650726
-00000000-0000-0000-0000-000000000000	701	ev7ubndmpuql	8f064c44-6ed2-479d-a547-d1beaf8d4a06	f	2026-04-15 13:43:41.098242+00	2026-04-15 13:43:41.098242+00	ggxw2blvislf	aebee0a3-4e27-4606-a557-6261d4650726
+00000000-0000-0000-0000-000000000000	899	3ttux73pw7l3	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-28 10:14:30.325117+00	2026-05-28 10:14:30.325117+00	\N	417df4f3-34ce-4af9-a0ac-ef483e3f6cb5
+00000000-0000-0000-0000-000000000000	891	nha22hfv57de	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 08:59:22.471861+00	2026-05-28 11:05:50.062019+00	\N	661ab255-7150-4bb1-af9c-3c55d35128a7
+00000000-0000-0000-0000-000000000000	900	6qj5on5foxem	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 11:05:50.099272+00	2026-05-28 12:04:21.101245+00	nha22hfv57de	661ab255-7150-4bb1-af9c-3c55d35128a7
+00000000-0000-0000-0000-000000000000	1064	2m7lxronks4l	f6601227-10dc-4bb5-9be0-a48df646882c	f	2026-05-30 06:26:54.207627+00	2026-05-30 06:26:54.207627+00	\N	f8160813-6e1a-443f-bc69-03353095811d
+00000000-0000-0000-0000-000000000000	901	7qgb2mjy5zrq	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 12:04:21.117998+00	2026-05-28 13:05:09.440816+00	6qj5on5foxem	661ab255-7150-4bb1-af9c-3c55d35128a7
+00000000-0000-0000-0000-000000000000	871	bujalc6ms5eu	f6601227-10dc-4bb5-9be0-a48df646882c	f	2026-05-28 07:12:18.121639+00	2026-05-28 07:12:18.121639+00	\N	8603c917-e253-4e42-bd8d-a8be14d40f94
+00000000-0000-0000-0000-000000000000	1068	q7unc4z27mr6	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-06-04 15:18:15.048163+00	2026-06-04 15:18:15.048163+00	zhk2tteu7ijb	7b03a3e4-bfe1-4fe2-924d-3c4b8ccf1dca
 00000000-0000-0000-0000-000000000000	704	ei66b5rirvtx	f6e82f04-701a-4e83-84a9-b311eaed6db2	f	2026-04-16 16:04:23.922313+00	2026-04-16 16:04:23.922313+00	\N	8d0c8278-d6b4-4290-b0ed-080c07d65a13
-00000000-0000-0000-0000-000000000000	706	3gp5af7oxysk	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-04-17 12:54:49.300223+00	2026-04-17 15:01:24.108796+00	\N	0c389d5a-bcf4-43ca-ac54-d678d650b114
-00000000-0000-0000-0000-000000000000	707	jd5gvsomoy3j	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-04-17 15:01:24.118124+00	2026-04-17 15:01:24.118124+00	3gp5af7oxysk	0c389d5a-bcf4-43ca-ac54-d678d650b114
-00000000-0000-0000-0000-000000000000	709	36qihhbuk5og	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-04-17 16:26:53.542633+00	2026-04-17 16:26:53.542633+00	\N	4d230349-71a4-4692-8538-f9a90420dfc7
-00000000-0000-0000-0000-000000000000	592	63huplwdya77	b84fe995-c654-433b-949a-5d14b471481b	t	2026-03-10 06:18:43.237524+00	2026-03-10 09:23:29.035353+00	\N	4804d2fd-1b39-4e20-a239-f0dc5d0747f4
-00000000-0000-0000-0000-000000000000	597	iu6ov3ymyu7y	b84fe995-c654-433b-949a-5d14b471481b	f	2026-03-10 09:23:29.044477+00	2026-03-10 09:23:29.044477+00	63huplwdya77	4804d2fd-1b39-4e20-a239-f0dc5d0747f4
-00000000-0000-0000-0000-000000000000	720	gxq3xtq2kain	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-10 10:11:04.414007+00	2026-05-10 10:11:04.414007+00	\N	15ea3606-3fc8-4700-a4c3-df7e6a6bb3dd
-00000000-0000-0000-0000-000000000000	724	2myotu2qxvxh	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-10 11:29:01.226972+00	2026-05-10 11:29:01.226972+00	\N	d3a49951-867e-4a94-bba4-5b8262885bb0
-00000000-0000-0000-0000-000000000000	723	2ngtdmy42zuy	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-10 10:52:28.327128+00	2026-05-10 12:09:42.740677+00	\N	9471b4f6-ba59-447f-822a-264950e51c92
-00000000-0000-0000-0000-000000000000	729	stnhsisbqutf	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-10 12:09:42.746667+00	2026-05-10 12:09:42.746667+00	2ngtdmy42zuy	9471b4f6-ba59-447f-822a-264950e51c92
-00000000-0000-0000-0000-000000000000	719	mha4fymtxsr3	8f064c44-6ed2-479d-a547-d1beaf8d4a06	t	2026-05-10 09:43:04.561687+00	2026-05-10 12:14:31.853981+00	\N	1fa0be54-b228-48ec-9ec1-81cadacf639b
-00000000-0000-0000-0000-000000000000	735	tjn7z7jf43xs	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-23 09:59:01.502237+00	2026-05-24 07:57:43.198694+00	\N	d6f7c2af-5799-42ec-b8b0-c81db84f5707
-00000000-0000-0000-0000-000000000000	742	wdpsjf6qmsy6	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-24 07:57:43.223337+00	2026-05-24 07:57:43.223337+00	tjn7z7jf43xs	d6f7c2af-5799-42ec-b8b0-c81db84f5707
-00000000-0000-0000-0000-000000000000	733	oapvalx54fvi	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-23 09:45:27.123304+00	2026-05-24 07:59:48.145849+00	\N	6ce74dd6-e66f-47ff-980a-2a5d2727d010
-00000000-0000-0000-0000-000000000000	744	kf2df5m36lef	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-24 07:59:48.146252+00	2026-05-24 07:59:48.146252+00	oapvalx54fvi	6ce74dd6-e66f-47ff-980a-2a5d2727d010
-00000000-0000-0000-0000-000000000000	750	7l55syezwdix	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-25 03:57:20.287458+00	2026-05-25 03:57:20.287458+00	\N	ce8b5d72-0d36-4457-b1f2-da08f252c4f6
-00000000-0000-0000-0000-000000000000	751	4ci5vkbv2me7	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-25 03:59:04.55574+00	2026-05-25 03:59:04.55574+00	\N	7c1d31c3-aa18-4f9b-b49d-993d5c9ebd1e
-00000000-0000-0000-0000-000000000000	741	5z4bfz4zndla	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-24 07:39:01.337917+00	2026-05-25 04:43:07.502286+00	\N	6720119f-4991-4290-b103-488354e9673c
-00000000-0000-0000-0000-000000000000	752	4qjb63uqrw7t	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-25 04:43:07.515082+00	2026-05-25 04:43:07.515082+00	5z4bfz4zndla	6720119f-4991-4290-b103-488354e9673c
+00000000-0000-0000-0000-000000000000	902	ujksn5mit24e	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 13:05:09.4662+00	2026-05-28 14:47:16.834484+00	7qgb2mjy5zrq	661ab255-7150-4bb1-af9c-3c55d35128a7
+00000000-0000-0000-0000-000000000000	903	n2xtac6puhtu	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-28 14:47:16.859634+00	2026-05-28 14:47:16.859634+00	ujksn5mit24e	661ab255-7150-4bb1-af9c-3c55d35128a7
+00000000-0000-0000-0000-000000000000	893	2z3huwkrnyce	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 09:25:20.031529+00	2026-05-28 14:47:42.496002+00	\N	4efc29ef-893a-41d5-8bc4-5639ef427ee9
+00000000-0000-0000-0000-000000000000	904	yz5vggixnidx	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-28 14:47:42.496352+00	2026-05-28 14:47:42.496352+00	2z3huwkrnyce	4efc29ef-893a-41d5-8bc4-5639ef427ee9
+00000000-0000-0000-0000-000000000000	923	aquf7cdzvufy	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-29 06:37:50.368365+00	2026-05-29 06:37:50.368365+00	\N	b5e61792-8088-40c1-bdd9-860c9c62cc8b
+00000000-0000-0000-0000-000000000000	972	nqm3ub334pmu	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:01.735083+00	2026-05-29 06:43:02.044359+00	\N	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	1045	dmw43uipkj33	2e83ba6a-9778-4e84-80b2-168409debced	f	2026-05-29 06:47:35.674096+00	2026-05-29 06:47:35.674096+00	\N	b4a49cb0-0b5a-4295-a106-acaf14602e9b
+00000000-0000-0000-0000-000000000000	973	ics3i6js4ls4	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:02.046417+00	2026-05-29 06:43:02.642345+00	nqm3ub334pmu	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	974	lsash653uoyn	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:02.64293+00	2026-05-29 06:43:02.929343+00	ics3i6js4ls4	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	975	bfb3zxup3s5m	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:02.929799+00	2026-05-29 06:43:03.214898+00	lsash653uoyn	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	1052	4rynw2dxrraz	bc00594c-8776-4bef-9d32-cf6176f89f81	t	2026-05-29 07:20:38.415153+00	2026-05-29 12:06:58.974365+00	\N	35f9bd15-a054-4315-b4fd-092eb8d4cb57
+00000000-0000-0000-0000-000000000000	976	ixk74vd3qrk7	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:03.215823+00	2026-05-29 06:43:03.504066+00	bfb3zxup3s5m	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	964	m3twdtdgiokz	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:34.799118+00	2026-05-29 06:42:35.090563+00	\N	b61a4643-ec2e-40b8-9e12-2ffebe17b920
+00000000-0000-0000-0000-000000000000	965	3ycmpvuur3cy	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:35.091783+00	2026-05-29 06:42:35.658734+00	m3twdtdgiokz	b61a4643-ec2e-40b8-9e12-2ffebe17b920
+00000000-0000-0000-0000-000000000000	977	kwqdskkdx45n	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:03.505494+00	2026-05-29 06:43:03.795726+00	ixk74vd3qrk7	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	966	nbb2l3cvx7vd	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:35.659155+00	2026-05-29 06:42:35.939472+00	3ycmpvuur3cy	b61a4643-ec2e-40b8-9e12-2ffebe17b920
+00000000-0000-0000-0000-000000000000	967	ielaossqnb5p	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:35.940265+00	2026-05-29 06:42:36.253623+00	nbb2l3cvx7vd	b61a4643-ec2e-40b8-9e12-2ffebe17b920
+00000000-0000-0000-0000-000000000000	978	llwpxdbhfcb3	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:03.796483+00	2026-05-29 06:43:04.085185+00	kwqdskkdx45n	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	968	nvutzjoiiyuj	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:36.254249+00	2026-05-29 06:42:36.541522+00	ielaossqnb5p	b61a4643-ec2e-40b8-9e12-2ffebe17b920
+00000000-0000-0000-0000-000000000000	969	bpxeew6rkkwp	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:36.542768+00	2026-05-29 06:42:36.818569+00	nvutzjoiiyuj	b61a4643-ec2e-40b8-9e12-2ffebe17b920
+00000000-0000-0000-0000-000000000000	979	3akznpzbomb5	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:04.08648+00	2026-05-29 06:43:04.367213+00	llwpxdbhfcb3	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	970	zxq4br3p3dph	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:36.819849+00	2026-05-29 06:42:37.101793+00	bpxeew6rkkwp	b61a4643-ec2e-40b8-9e12-2ffebe17b920
+00000000-0000-0000-0000-000000000000	971	a7rjeb4xgw3w	2e83ba6a-9778-4e84-80b2-168409debced	f	2026-05-29 06:42:37.102847+00	2026-05-29 06:42:37.102847+00	zxq4br3p3dph	b61a4643-ec2e-40b8-9e12-2ffebe17b920
+00000000-0000-0000-0000-000000000000	980	av3pvtgnxfdc	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:04.36747+00	2026-05-29 06:43:04.655574+00	3akznpzbomb5	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	981	go73424uniyn	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:04.655938+00	2026-05-29 06:43:04.930667+00	av3pvtgnxfdc	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	982	twu4tbvyph67	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:04.931561+00	2026-05-29 06:43:05.215948+00	go73424uniyn	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	983	zavh7pdghgly	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:05.216592+00	2026-05-29 06:43:05.499217+00	twu4tbvyph67	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	984	fc3qnxtm2vud	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:05.500164+00	2026-05-29 06:43:05.788815+00	zavh7pdghgly	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	985	5jvbs7ifhiwy	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:05.789363+00	2026-05-29 06:43:06.066612+00	fc3qnxtm2vud	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	986	ljohmjhddctx	2e83ba6a-9778-4e84-80b2-168409debced	f	2026-05-29 06:43:06.067344+00	2026-05-29 06:43:06.067344+00	5jvbs7ifhiwy	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	988	hw25ujgd5s3k	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:50.231883+00	2026-05-29 06:44:50.650648+00	\N	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	989	tjazmq3gt2mg	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:50.652054+00	2026-05-29 06:44:51.241621+00	hw25ujgd5s3k	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	990	xyqpfdb2nmrq	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:51.243369+00	2026-05-29 06:44:51.544028+00	tjazmq3gt2mg	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	991	ojp2kwsv3kfx	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:51.544588+00	2026-05-29 06:44:51.8738+00	xyqpfdb2nmrq	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	992	yitpiswtik4a	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:51.874766+00	2026-05-29 06:44:52.174248+00	ojp2kwsv3kfx	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	993	5qv7u34tayko	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:52.174616+00	2026-05-29 06:44:52.468102+00	yitpiswtik4a	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	994	4uyyf4ak667g	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:52.468761+00	2026-05-29 06:44:52.755771+00	5qv7u34tayko	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	995	hef4vfx3j6ir	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:52.756517+00	2026-05-29 06:44:53.119471+00	4uyyf4ak667g	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	996	uv7yxiv3afsc	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:53.121431+00	2026-05-29 06:44:53.412813+00	hef4vfx3j6ir	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	997	e2co43krotbb	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:53.413204+00	2026-05-29 06:44:53.75378+00	uv7yxiv3afsc	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	998	emtwfbzmigab	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:53.754253+00	2026-05-29 06:44:54.04702+00	e2co43krotbb	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	999	y4b6vh2g3yur	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:54.047499+00	2026-05-29 06:44:54.342129+00	emtwfbzmigab	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1000	qatzxi3nyx54	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:54.343105+00	2026-05-29 06:44:54.633106+00	y4b6vh2g3yur	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1001	wihc7zqt6uqf	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:54.633392+00	2026-05-29 06:44:54.923419+00	qatzxi3nyx54	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1002	ngh6vkjyah7t	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:54.923751+00	2026-05-29 06:44:55.212989+00	wihc7zqt6uqf	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1003	d655sh7bvvwv	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:55.213816+00	2026-05-29 06:44:55.503847+00	ngh6vkjyah7t	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1004	qf6b42o6p2gn	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:55.504469+00	2026-05-29 06:44:55.802394+00	d655sh7bvvwv	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1005	5bkcxjn7byff	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:55.802795+00	2026-05-29 06:44:56.089784+00	qf6b42o6p2gn	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1006	tjp7u7f2rtzc	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:56.091008+00	2026-05-29 06:44:56.380446+00	5bkcxjn7byff	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1007	utow4kr3atzg	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:56.382055+00	2026-05-29 06:44:56.672054+00	tjp7u7f2rtzc	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1008	hxawuqyutgts	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:56.672373+00	2026-05-29 06:44:56.964353+00	utow4kr3atzg	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1009	47r5h47v42mg	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:56.965773+00	2026-05-29 06:44:57.24927+00	hxawuqyutgts	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1056	ezexqay7f75s	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-29 07:32:40.94995+00	2026-05-29 07:32:40.94995+00	\N	b71c0817-a47b-4c03-8ed3-4d0c8cfd8bad
+00000000-0000-0000-0000-000000000000	1010	f7h35os6agwx	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:57.250208+00	2026-05-29 06:44:57.55352+00	47r5h47v42mg	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1058	yoxzaxezgki7	2e83ba6a-9778-4e84-80b2-168409debced	f	2026-05-29 08:06:41.13933+00	2026-05-29 08:06:41.13933+00	mea7vznsuoal	afdb3340-8b61-48c7-bbd5-747d425ce99f
+00000000-0000-0000-0000-000000000000	1011	htx7v6knnzrx	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:57.554596+00	2026-05-29 06:44:57.852909+00	f7h35os6agwx	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1012	turig3ymxscz	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:57.853815+00	2026-05-29 06:44:58.150777+00	htx7v6knnzrx	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1013	vvem6oyq2xg7	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:58.15114+00	2026-05-29 06:44:58.442106+00	turig3ymxscz	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1060	prkbr6vidj2y	bc00594c-8776-4bef-9d32-cf6176f89f81	t	2026-05-29 12:06:59.006505+00	2026-06-02 14:03:30.62955+00	4rynw2dxrraz	35f9bd15-a054-4315-b4fd-092eb8d4cb57
+00000000-0000-0000-0000-000000000000	1014	eufsd7vfwjlq	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:58.443463+00	2026-05-29 06:44:58.733765+00	vvem6oyq2xg7	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1065	z43pfebnpn4p	bc00594c-8776-4bef-9d32-cf6176f89f81	f	2026-06-02 14:03:30.662897+00	2026-06-02 14:03:30.662897+00	prkbr6vidj2y	35f9bd15-a054-4315-b4fd-092eb8d4cb57
+00000000-0000-0000-0000-000000000000	1015	44p6jsopx3u4	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:58.734965+00	2026-05-29 06:44:59.01969+00	eufsd7vfwjlq	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1016	yw2grrsc25vx	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:59.020142+00	2026-05-29 06:44:59.299383+00	44p6jsopx3u4	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1067	zhk2tteu7ijb	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-06-04 10:22:44.940595+00	2026-06-04 15:18:15.027991+00	\N	7b03a3e4-bfe1-4fe2-924d-3c4b8ccf1dca
+00000000-0000-0000-0000-000000000000	1017	4bedbssyrgk6	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:59.300115+00	2026-05-29 06:44:59.596263+00	yw2grrsc25vx	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1018	d6vsfsz6vvtn	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:59.597017+00	2026-05-29 06:44:59.882476+00	4bedbssyrgk6	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1019	w4jlvx5wydjq	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:59.883614+00	2026-05-29 06:45:00.175436+00	d6vsfsz6vvtn	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1020	eym5wwlnuv42	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:00.175989+00	2026-05-29 06:45:00.461849+00	w4jlvx5wydjq	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1021	fskum6ovueq5	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:00.464011+00	2026-05-29 06:45:00.757996+00	eym5wwlnuv42	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1022	knd7q5z6jm3r	2e83ba6a-9778-4e84-80b2-168409debced	f	2026-05-29 06:45:00.759602+00	2026-05-29 06:45:00.759602+00	fskum6ovueq5	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1023	6wyilrcar24j	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:36.328722+00	2026-05-29 06:45:36.639973+00	\N	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1024	syy56ctrje2p	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:36.640701+00	2026-05-29 06:45:37.213827+00	6wyilrcar24j	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1025	cnflzxjto5s4	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:37.215011+00	2026-05-29 06:45:37.50619+00	syy56ctrje2p	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1026	p2ke5cndmlx6	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:37.507526+00	2026-05-29 06:45:37.810353+00	cnflzxjto5s4	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1027	pfao6mdolfh2	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:37.811541+00	2026-05-29 06:45:38.096675+00	p2ke5cndmlx6	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1028	y5vuyjppi4ru	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:38.09796+00	2026-05-29 06:45:38.378201+00	pfao6mdolfh2	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1029	6t6sa5yw7rvj	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:38.378838+00	2026-05-29 06:45:38.660294+00	y5vuyjppi4ru	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1030	tlkzpe6rtvs5	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:38.660616+00	2026-05-29 06:45:38.939581+00	6t6sa5yw7rvj	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1031	t6uhoq2lmp6u	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:38.940135+00	2026-05-29 06:45:39.224903+00	tlkzpe6rtvs5	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1032	e2lefuxlaygi	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:39.226163+00	2026-05-29 06:45:39.514497+00	t6uhoq2lmp6u	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1033	e7jsadyighkj	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:39.51542+00	2026-05-29 06:45:39.81176+00	e2lefuxlaygi	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1034	5ti3fbkwtith	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:39.813359+00	2026-05-29 06:45:40.090285+00	e7jsadyighkj	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1035	zac6jc2igyea	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:40.090973+00	2026-05-29 06:45:40.366979+00	5ti3fbkwtith	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1036	oejlqlskq7qe	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:40.368619+00	2026-05-29 06:45:40.649126+00	zac6jc2igyea	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1037	h4w6slceygvo	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:40.649445+00	2026-05-29 06:45:40.925595+00	oejlqlskq7qe	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1038	xw2htox7i3vc	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:40.926426+00	2026-05-29 06:45:41.228002+00	h4w6slceygvo	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1039	f4rsabrfltq2	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:41.229474+00	2026-05-29 06:45:41.513494+00	xw2htox7i3vc	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1040	gyjjoefe4iqi	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:41.514627+00	2026-05-29 06:45:41.802141+00	f4rsabrfltq2	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1041	imy766aixrb5	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:41.803581+00	2026-05-29 06:45:42.084568+00	gyjjoefe4iqi	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1042	jhogq3ozpl5s	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:45:42.08505+00	2026-05-29 06:45:42.370401+00	imy766aixrb5	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
+00000000-0000-0000-0000-000000000000	1043	zxy6su6kwjqc	2e83ba6a-9778-4e84-80b2-168409debced	f	2026-05-29 06:45:42.371424+00	2026-05-29 06:45:42.371424+00	jhogq3ozpl5s	a76f5fed-6a03-40d9-b2d7-2acf895ce7d8
 \.
 
 
@@ -4491,25 +4964,25 @@ COPY auth.schema_migrations (version) FROM stdin;
 
 COPY auth.sessions (id, user_id, created_at, updated_at, factor_id, aal, not_after, refreshed_at, user_agent, ip, tag, oauth_client_id, refresh_token_hmac_key, refresh_token_counter, scopes) FROM stdin;
 8d0c8278-d6b4-4290-b0ed-080c07d65a13	f6e82f04-701a-4e83-84a9-b311eaed6db2	2026-04-16 16:04:23.906458+00	2026-04-16 16:04:23.906458+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36	49.37.158.3	\N	\N	\N	\N	\N
-4804d2fd-1b39-4e20-a239-f0dc5d0747f4	b84fe995-c654-433b-949a-5d14b471481b	2026-03-10 06:18:43.234174+00	2026-03-10 09:23:29.061521+00	\N	aal1	\N	2026-03-10 09:23:29.060821	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36	119.235.53.243	\N	\N	\N	\N	\N
-59e2291c-f891-402f-b846-95a1c390d447	d0162e3c-be25-43b0-8e46-9a744f221149	2026-04-15 07:40:58.204924+00	2026-04-15 07:40:58.204924+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36	27.59.190.198	\N	\N	\N	\N	\N
 4b4a996f-9979-44e4-8b0c-fe1e62464b30	f6601227-10dc-4bb5-9be0-a48df646882c	2026-03-10 04:37:16.0537+00	2026-03-10 04:37:16.0537+00	\N	aal1	\N	\N	Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Mobile Safari/537.36	119.235.53.243	\N	\N	\N	\N	\N
-0c389d5a-bcf4-43ca-ac54-d678d650b114	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-17 12:54:49.254782+00	2026-04-17 15:01:24.129315+00	\N	aal1	\N	2026-04-17 15:01:24.129202	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36	49.37.159.14	\N	\N	\N	\N	\N
-4d230349-71a4-4692-8538-f9a90420dfc7	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-17 16:26:53.526643+00	2026-04-17 16:26:53.526643+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36	49.37.159.14	\N	\N	\N	\N	\N
-ce8b5d72-0d36-4457-b1f2-da08f252c4f6	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-25 03:57:20.235516+00	2026-05-25 03:57:20.235516+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.157.151	\N	\N	\N	\N	\N
-15ea3606-3fc8-4700-a4c3-df7e6a6bb3dd	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-10 10:11:04.391483+00	2026-05-10 10:11:04.391483+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Code/1.119.0 Chrome/142.0.7444.265 Electron/39.8.8 Safari/537.36	106.200.28.119	\N	\N	\N	\N	\N
-d3a49951-867e-4a94-bba4-5b8262885bb0	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-10 11:29:01.182149+00	2026-05-10 11:29:01.182149+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36	49.37.158.204	\N	\N	\N	\N	\N
-9471b4f6-ba59-447f-822a-264950e51c92	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-10 10:52:28.305885+00	2026-05-10 12:09:42.762145+00	\N	aal1	\N	2026-05-10 12:09:42.762018	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36	106.200.28.119	\N	\N	\N	\N	\N
-7c1d31c3-aa18-4f9b-b49d-993d5c9ebd1e	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-25 03:59:04.547941+00	2026-05-25 03:59:04.547941+00	\N	aal1	\N	\N	Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36	106.192.40.129	\N	\N	\N	\N	\N
-6720119f-4991-4290-b103-488354e9673c	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-24 07:39:01.292728+00	2026-05-25 04:43:07.531475+00	\N	aal1	\N	2026-05-25 04:43:07.531344	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.157.151	\N	\N	\N	\N	\N
-d6f7c2af-5799-42ec-b8b0-c81db84f5707	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-23 09:59:01.501013+00	2026-05-24 07:57:43.245692+00	\N	aal1	\N	2026-05-24 07:57:43.245564	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.195	\N	\N	\N	\N	\N
-6ce74dd6-e66f-47ff-980a-2a5d2727d010	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-23 09:45:27.104776+00	2026-05-24 07:59:48.153467+00	\N	aal1	\N	2026-05-24 07:59:48.152779	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	182.65.154.183	\N	\N	\N	\N	\N
-a4877bdd-a035-4c36-b79b-8293aadd4c83	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-14 12:11:53.85191+00	2026-04-14 12:11:53.85191+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36	49.37.156.9	\N	\N	\N	\N	\N
-45f98959-e0aa-4e43-9fc9-cab942697e62	8f064c44-6ed2-479d-a547-d1beaf8d4a06	2026-05-25 06:51:08.134382+00	2026-05-25 06:51:08.134382+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	182.65.154.183	\N	\N	\N	\N	\N
-aebee0a3-4e27-4606-a557-6261d4650726	8f064c44-6ed2-479d-a547-d1beaf8d4a06	2026-04-15 09:51:11.572154+00	2026-04-15 13:43:41.135215+00	\N	aal1	\N	2026-04-15 13:43:41.135097	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36	122.177.72.81	\N	\N	\N	\N	\N
-1fa0be54-b228-48ec-9ec1-81cadacf639b	8f064c44-6ed2-479d-a547-d1beaf8d4a06	2026-05-10 09:43:04.52439+00	2026-05-25 06:51:28.98027+00	\N	aal1	\N	2026-05-25 06:51:28.980164	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.214.1.77	\N	\N	\N	\N	\N
-a2beec6b-502d-420d-8d06-169c7a34baf4	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-25 06:35:36.142069+00	2026-05-25 06:35:36.142069+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.157.151	\N	\N	\N	\N	\N
-2efad47b-77ad-4173-acf4-ecdfa38f9c96	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-24 19:14:50.746403+00	2026-05-25 06:52:43.250607+00	\N	aal1	\N	2026-05-25 06:52:43.249813	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	182.65.154.183	\N	\N	\N	\N	\N
+b8591ffa-b91f-4eb3-b644-075e68adeb47	b84fe995-c654-433b-949a-5d14b471481b	2026-05-28 07:06:25.313582+00	2026-05-29 06:26:21.510592+00	\N	aal1	\N	2026-05-29 06:26:21.510503	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.214.0.232	\N	\N	\N	\N	\N
+b5e61792-8088-40c1-bdd9-860c9c62cc8b	b84fe995-c654-433b-949a-5d14b471481b	2026-05-29 06:37:50.367103+00	2026-05-29 06:37:50.367103+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.214.0.232	\N	\N	\N	\N	\N
+a76f5fed-6a03-40d9-b2d7-2acf895ce7d8	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:45:36.326827+00	2026-05-29 06:45:42.374544+00	\N	aal1	\N	2026-05-29 06:45:42.374446	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36 Edg/148.0.0.0	49.37.158.12	\N	\N	\N	\N	\N
+8603c917-e253-4e42-bd8d-a8be14d40f94	f6601227-10dc-4bb5-9be0-a48df646882c	2026-05-28 07:12:18.113151+00	2026-05-28 07:12:18.113151+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.214.0.232	\N	\N	\N	\N	\N
+0ece92fa-53df-42db-a509-8b2b01ce3321	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:43:01.726011+00	2026-05-29 06:43:06.070164+00	\N	aal1	\N	2026-05-29 06:43:06.070072	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
+b61a4643-ec2e-40b8-9e12-2ffebe17b920	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:42:34.797751+00	2026-05-29 06:42:37.105919+00	\N	aal1	\N	2026-05-29 06:42:37.105804	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
+b4a49cb0-0b5a-4295-a106-acaf14602e9b	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:47:35.671476+00	2026-05-29 06:47:35.671476+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
+afdb3340-8b61-48c7-bbd5-747d425ce99f	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:46:26.241331+00	2026-05-29 08:06:41.156101+00	\N	aal1	\N	2026-05-29 08:06:41.155389	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	122.183.150.39	\N	\N	\N	\N	\N
+3ce6c222-95d3-46c9-8dc5-974ba870abfb	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:44:50.187517+00	2026-05-29 06:45:00.761756+00	\N	aal1	\N	2026-05-29 06:45:00.761657	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
+49eaad77-5f9f-470d-babe-9c3f22046eef	b84fe995-c654-433b-949a-5d14b471481b	2026-05-28 09:37:10.729574+00	2026-05-28 09:37:10.729574+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.156.51	\N	\N	\N	\N	\N
+d967d768-9611-4b9d-adcc-0af86ad909bb	b84fe995-c654-433b-949a-5d14b471481b	2026-05-28 09:37:26.601753+00	2026-05-28 09:37:26.601753+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.156.51	\N	\N	\N	\N	\N
+b71c0817-a47b-4c03-8ed3-4d0c8cfd8bad	b84fe995-c654-433b-949a-5d14b471481b	2026-05-29 07:32:40.947714+00	2026-05-29 07:32:40.947714+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
+f8160813-6e1a-443f-bc69-03353095811d	f6601227-10dc-4bb5-9be0-a48df646882c	2026-05-30 06:26:54.206007+00	2026-05-30 06:26:54.206007+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.214.0.232	\N	\N	\N	\N	\N
+417df4f3-34ce-4af9-a0ac-ef483e3f6cb5	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 10:14:30.306609+00	2026-05-28 10:14:30.306609+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.214.0.232	\N	\N	\N	\N	\N
+35f9bd15-a054-4315-b4fd-092eb8d4cb57	bc00594c-8776-4bef-9d32-cf6176f89f81	2026-05-29 07:20:38.386562+00	2026-06-02 14:03:30.699735+00	\N	aal1	\N	2026-06-02 14:03:30.699634	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	122.183.36.188	\N	\N	\N	\N	\N
+7b03a3e4-bfe1-4fe2-924d-3c4b8ccf1dca	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-06-04 10:22:44.909447+00	2026-06-04 15:18:15.078673+00	\N	aal1	\N	2026-06-04 15:18:15.078564	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.157.39	\N	\N	\N	\N	\N
+661ab255-7150-4bb1-af9c-3c55d35128a7	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 08:59:22.441108+00	2026-05-28 14:47:16.885173+00	\N	aal1	\N	2026-05-28 14:47:16.885066	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.156.51	\N	\N	\N	\N	\N
+4efc29ef-893a-41d5-8bc4-5639ef427ee9	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 09:25:20.015103+00	2026-05-28 14:47:42.499541+00	\N	aal1	\N	2026-05-28 14:47:42.499444	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.156.51	\N	\N	\N	\N	\N
 \.
 
 
@@ -4535,16 +5008,16 @@ COPY auth.sso_providers (id, resource_id, created_at, updated_at, disabled) FROM
 
 COPY auth.users (instance_id, id, aud, role, email, encrypted_password, email_confirmed_at, invited_at, confirmation_token, confirmation_sent_at, recovery_token, recovery_sent_at, email_change_token_new, email_change, email_change_sent_at, last_sign_in_at, raw_app_meta_data, raw_user_meta_data, is_super_admin, created_at, updated_at, phone, phone_confirmed_at, phone_change, phone_change_token, phone_change_sent_at, email_change_token_current, email_change_confirm_status, banned_until, reauthentication_token, reauthentication_sent_at, is_sso_user, deleted_at, is_anonymous) FROM stdin;
 00000000-0000-0000-0000-000000000000	b280f8c8-b05a-4237-b606-802420092eb1	authenticated	authenticated	23r11a67c7@gcet.edu.in	$2a$10$Hw0R100d6KpNcNHDAVZVou1oP1996BIlcnJYAQqp1rCf5rhBxryOi	2026-02-14 05:26:50.4084+00	\N		2026-02-14 05:26:30.899003+00		\N			\N	2026-02-14 05:27:28.154323+00	{"provider": "email", "providers": ["email"]}	{"sub": "b280f8c8-b05a-4237-b606-802420092eb1", "name": "advika", "email": "23r11a67c7@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-02-14 05:26:30.863318+00	2026-02-14 05:27:28.157119+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	bc00594c-8776-4bef-9d32-cf6176f89f81	authenticated	authenticated	23r11a0531@gcet.edu.in	$2a$10$ILyeD8yB/qHwj.uEbEYng.ZiV2hMNoImNvj4.Dp/CHT9YYTQn6UdW	2026-05-29 07:20:38.363541+00	\N		2026-05-29 07:15:19.796459+00		\N			\N	2026-05-29 07:20:38.384481+00	{"provider": "email", "providers": ["email"]}	{"sub": "bc00594c-8776-4bef-9d32-cf6176f89f81", "name": "Vivek Vardhan", "year": "4", "email": "23r11a0531@gcet.edu.in", "tenant_id": "0ee52668-ea70-4740-9f7b-b15ba5535254", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-05-29 07:15:19.688332+00	2026-06-02 14:03:30.683331+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	2e83ba6a-9778-4e84-80b2-168409debced	authenticated	authenticated	23r11a0515@gcet.edu.in	$2a$10$qxp3ooqfxDqfCR/Er/zWiukQmoP4OOINmMTbO1xPjkWtsBb0/wAvW	2026-05-29 05:55:41.460556+00	\N		2026-05-29 05:55:01.099802+00		\N			\N	2026-05-29 06:47:35.671387+00	{"provider": "email", "providers": ["email"]}	{"sub": "2e83ba6a-9778-4e84-80b2-168409debced", "name": "Advika", "year": "4", "email": "23r11a0515@gcet.edu.in", "tenant_id": "0ee52668-ea70-4740-9f7b-b15ba5535254", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-05-29 05:55:01.037614+00	2026-05-29 08:06:41.14456+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	ea5561b5-6918-4212-83d9-5e48dec790ce	authenticated	authenticated	23r11a0544@gcet.edu.in	$2a$10$qeFWBM14aNcOZHN7sulZFugqnpIJNTFjzope/uzeiZvsTK6a5pE1K	2026-02-10 15:04:07.871251+00	\N		\N		\N			\N	2026-06-04 10:22:44.908418+00	{"provider": "email", "providers": ["email"]}	{"sub": "ea5561b5-6918-4212-83d9-5e48dec790ce", "name": "Jay", "email": "23r11a0544@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-02-10 15:03:19.438845+00	2026-06-04 15:18:15.064262+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	f6601227-10dc-4bb5-9be0-a48df646882c	authenticated	authenticated	23r11a0505@gcet.edu.in	$2a$10$JoIF2WbMXOA.zSsS594QaO8YpgW1j62hLHGszIwLM7AvkcAtvlSGW	2026-03-10 04:37:16.046228+00	\N		2026-03-10 04:36:59.199945+00		\N			\N	2026-05-30 06:26:54.205916+00	{"provider": "email", "providers": ["email"]}	{"sub": "f6601227-10dc-4bb5-9be0-a48df646882c", "name": "Shivani", "email": "23r11a0505@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-10 04:36:59.157124+00	2026-05-30 06:26:54.208685+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	ec79d798-6f6f-4549-8d79-edd15870b43b	authenticated	authenticated	23r11a0566@gcet.edu.in	$2a$10$SoOh1We.JwePj0lg3AAY/.F.frMi9vT9djHexgOn69PS525lgHj0S	\N	\N	59c5025a182016539fc625b9dcc945b992f9334734da09d9d8a757e2	2026-02-15 18:58:18.482872+00		\N			\N	\N	{"provider": "email", "providers": ["email"]}	{"sub": "ec79d798-6f6f-4549-8d79-edd15870b43b", "name": "lilly", "email": "23r11a0566@gcet.edu.in", "email_verified": false, "phone_verified": false}	\N	2026-02-15 18:58:18.435041+00	2026-02-15 18:58:22.009647+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	595d5afb-c1f6-47a7-b92a-96519c1fc36f	authenticated	authenticated	23r11a0513@gcet.edu.in	$2a$10$j8DgzenHXxTfVsX1oCRzN.4PYpBa.WQvq5oIf1dqrLJ5MY4ftBbrS	\N	\N	a10c1bac50098bc6c2f76bdff270755b9b91c3f6918a39cf378482d5	2026-03-06 16:16:51.323563+00		\N			\N	\N	{"provider": "email", "providers": ["email"]}	{"sub": "595d5afb-c1f6-47a7-b92a-96519c1fc36f", "name": "Vaishnavi", "email": "23r11a0513@gcet.edu.in", "email_verified": false, "phone_verified": false}	\N	2026-03-06 16:16:51.299526+00	2026-03-06 16:16:54.303236+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	8f064c44-6ed2-479d-a547-d1beaf8d4a06	authenticated	authenticated	23r11a0531@gcet.edu.in	$2a$10$a4xKXz/mi0wFqeBWmc.5lOFxKMHiI0zAPxRqHyjCEP/LRBmHEyZru	2026-02-11 04:59:20.730808+00	\N		\N		\N	b748c41e52cb6a80505a2536814d4e5f1932ba2aef11353c26be2184	23r11a0532@gcet.edu.in	2026-03-06 15:09:12.278179+00	2026-05-25 06:51:08.132553+00	{"provider": "email", "providers": ["email"]}	{"sub": "8f064c44-6ed2-479d-a547-d1beaf8d4a06", "name": "Vivek Vardhan", "email": "23r11a0531@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-02-11 04:58:53.83344+00	2026-05-25 06:51:28.975541+00	\N	\N			\N	86258ba66d9aec5281e7fea688494079b75c883a88f2e3ccf3833efc	0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	b84fe995-c654-433b-949a-5d14b471481b	authenticated	authenticated	23r11a0546@gcet.edu.in	$2a$10$6PWqyEbPVahnILEsDlnrZ.N/PzHXRzWyYq2f.xDPnVIcB.TFeQEpu	2026-03-03 08:29:21.748028+00	\N		2026-03-03 08:25:15.234103+00		\N			\N	2026-03-10 06:18:43.234085+00	{"provider": "email", "providers": ["email"]}	{"sub": "b84fe995-c654-433b-949a-5d14b471481b", "name": "rishik", "email": "23r11a0546@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-03 08:25:15.22731+00	2026-03-10 09:23:29.047175+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	d1645cf0-5274-43f6-94d5-f0db4c6dcabf	authenticated	authenticated	23r11a0511@gcet.edu.in	$2a$10$EqGeI1x/dT63agnVH5NkcuPU1rolqh2HcvzQ.UX2OYkoN2WmXAcJO	2026-03-03 08:31:35.552407+00	\N		2026-03-03 08:24:42.185096+00		\N			\N	2026-03-10 06:16:23.621741+00	{"provider": "email", "providers": ["email"]}	{"sub": "d1645cf0-5274-43f6-94d5-f0db4c6dcabf", "name": "abhiram", "email": "23r11a0511@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-03 08:24:42.139416+00	2026-03-10 06:16:23.633063+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	f6601227-10dc-4bb5-9be0-a48df646882c	authenticated	authenticated	23r11a0505@gcet.edu.in	$2a$10$JoIF2WbMXOA.zSsS594QaO8YpgW1j62hLHGszIwLM7AvkcAtvlSGW	2026-03-10 04:37:16.046228+00	\N		2026-03-10 04:36:59.199945+00		\N			\N	2026-03-10 04:37:16.053032+00	{"provider": "email", "providers": ["email"]}	{"sub": "f6601227-10dc-4bb5-9be0-a48df646882c", "name": "Shivani", "email": "23r11a0505@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-10 04:36:59.157124+00	2026-03-10 04:37:16.069933+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	f6e82f04-701a-4e83-84a9-b311eaed6db2	authenticated	authenticated	21r11a05c0@gcet.edu.in	$2a$10$HH76AujlPZAvl1Hs6373BeAsc7CMb9ESTvPNT8jYj.MAp7KkHZIpS	2026-04-16 16:04:23.896036+00	\N		2026-04-16 16:03:43.344649+00		\N			\N	2026-04-16 16:04:46.235001+00	{"provider": "email", "providers": ["email"]}	{"sub": "f6e82f04-701a-4e83-84a9-b311eaed6db2", "name": "Abhaya", "year": "4", "email": "21r11a05c0@gcet.edu.in", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-04-16 16:03:43.239968+00	2026-05-25 06:35:07.632343+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	99abb06b-7974-45ae-887a-9a87e6ec9c36	authenticated	authenticated	23r11a0512@gcet.edu.in	$2a$10$6Ca38F.tvBPmdqYlcphwk.ajnAODdCi2i/kvpj2USvrQzl6NbAGOW	2026-03-06 16:07:11.50213+00	\N		2026-03-06 16:05:35.119243+00		\N			\N	2026-03-07 09:15:11.400593+00	{"provider": "email", "providers": ["email"]}	{"sub": "99abb06b-7974-45ae-887a-9a87e6ec9c36", "name": "Rishik", "email": "23r11a0512@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-06 16:05:35.029377+00	2026-03-07 09:15:11.406929+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	ea5561b5-6918-4212-83d9-5e48dec790ce	authenticated	authenticated	23r11a0544@gcet.edu.in	$2a$10$Cw9BGhPAoklno09fhmuRteBFV9iV.p9yFh47qwdrLHPPkzuNJc0ym	2026-02-10 15:04:07.871251+00	\N		\N		\N			\N	2026-05-25 06:40:30.266061+00	{"provider": "email", "providers": ["email"]}	{"sub": "ea5561b5-6918-4212-83d9-5e48dec790ce", "name": "Jay", "email": "23r11a0544@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-02-10 15:03:19.438845+00	2026-05-25 06:52:43.237924+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	d0162e3c-be25-43b0-8e46-9a744f221149	authenticated	authenticated	23r11a0515@gcet.edu.in	$2a$10$HVnLnq7Lk9SOijiZE3gRrO6Z9vNl057S.NM7v9H6O71BojxHjmvke	2026-02-10 15:04:41.366979+00	\N		\N		\N			\N	2026-05-24 19:00:32.450919+00	{"provider": "email", "providers": ["email"]}	{"sub": "d0162e3c-be25-43b0-8e46-9a744f221149", "name": "Advika", "email": "23r11a0515@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-02-10 15:02:33.972594+00	2026-05-24 19:00:32.455837+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	f6e82f04-701a-4e83-84a9-b311eaed6db2	authenticated	authenticated	21r11a05c0@gcet.edu.in	$2a$10$HH76AujlPZAvl1Hs6373BeAsc7CMb9ESTvPNT8jYj.MAp7KkHZIpS	2026-04-16 16:04:23.896036+00	\N		2026-04-16 16:03:43.344649+00		\N			\N	2026-05-28 07:23:05.683282+00	{"provider": "email", "providers": ["email"]}	{"sub": "f6e82f04-701a-4e83-84a9-b311eaed6db2", "name": "Abhaya", "year": "4", "email": "21r11a05c0@gcet.edu.in", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-04-16 16:03:43.239968+00	2026-05-28 07:23:05.712285+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	99abb06b-7974-45ae-887a-9a87e6ec9c36	authenticated	authenticated	23r11a0512@gcet.edu.in	$2a$10$6Ca38F.tvBPmdqYlcphwk.ajnAODdCi2i/kvpj2USvrQzl6NbAGOW	2026-03-06 16:07:11.50213+00	\N		2026-03-06 16:05:35.119243+00		\N			\N	2026-05-28 08:25:11.330989+00	{"provider": "email", "providers": ["email"]}	{"sub": "99abb06b-7974-45ae-887a-9a87e6ec9c36", "name": "Rishik", "email": "23r11a0512@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-06 16:05:35.029377+00	2026-05-29 06:58:22.633727+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	d1645cf0-5274-43f6-94d5-f0db4c6dcabf	authenticated	authenticated	23r11a0511@gcet.edu.in	$2a$10$EqGeI1x/dT63agnVH5NkcuPU1rolqh2HcvzQ.UX2OYkoN2WmXAcJO	2026-03-03 08:31:35.552407+00	\N		2026-03-03 08:24:42.185096+00		\N			\N	2026-05-29 06:42:19.272937+00	{"provider": "email", "providers": ["email"]}	{"sub": "d1645cf0-5274-43f6-94d5-f0db4c6dcabf", "name": "abhiram", "email": "23r11a0511@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-03 08:24:42.139416+00	2026-05-29 07:32:19.771705+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	b84fe995-c654-433b-949a-5d14b471481b	authenticated	authenticated	23r11a0546@gcet.edu.in	$2a$10$6PWqyEbPVahnILEsDlnrZ.N/PzHXRzWyYq2f.xDPnVIcB.TFeQEpu	2026-03-03 08:29:21.748028+00	\N		2026-03-03 08:25:15.234103+00		\N			\N	2026-05-29 07:32:40.947621+00	{"provider": "email", "providers": ["email"]}	{"sub": "b84fe995-c654-433b-949a-5d14b471481b", "name": "rishik", "email": "23r11a0546@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-03 08:25:15.22731+00	2026-05-29 07:32:40.951525+00	\N	\N			\N		0	\N		\N	f	\N	f
 \.
 
 
@@ -4565,11 +5038,37 @@ COPY auth.webauthn_credentials (id, user_id, credential_id, public_key, attestat
 
 
 --
+-- Data for Name: job; Type: TABLE DATA; Schema: cron; Owner: supabase_admin
+--
+
+COPY cron.job (jobid, schedule, command, nodename, nodeport, database, username, active, jobname) FROM stdin;
+1	30 2 * * *	 select public.archive_past_events('7 days'::interval); 	localhost	5432	postgres	postgres	t	archive-past-events-daily
+\.
+
+
+--
+-- Data for Name: job_run_details; Type: TABLE DATA; Schema: cron; Owner: supabase_admin
+--
+
+COPY cron.job_run_details (jobid, runid, job_pid, database, username, command, status, return_message, start_time, end_time) FROM stdin;
+1	1	666301	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-05-29 02:30:00.244129+00	2026-05-29 02:30:00.382624+00
+1	2	782168	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-05-30 02:30:00.188011+00	2026-05-30 02:30:00.311091+00
+1	3	893733	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-05-31 02:30:00.183743+00	2026-05-31 02:30:00.288865+00
+1	4	1005529	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-01 02:30:00.171638+00	2026-06-01 02:30:00.281639+00
+1	5	1119136	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-02 02:30:00.181083+00	2026-06-02 02:30:00.273096+00
+1	6	1234070	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-03 02:30:00.162969+00	2026-06-03 02:30:00.26671+00
+1	7	1348466	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-04 02:30:00.165843+00	2026-06-04 02:30:00.353506+00
+1	8	1464877	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-05 02:30:00.173444+00	2026-06-05 02:30:00.283127+00
+1	9	1578602	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-06 02:30:00.162793+00	2026-06-06 02:30:00.255564+00
+\.
+
+
+--
 -- Data for Name: contest_settings; Type: TABLE DATA; Schema: public; Owner: postgres
 --
 
 COPY public.contest_settings (id, problems_unlock_at, created_at, department_unlocks_at, department_closes_at, tenant_id) FROM stdin;
-2308d17f-6e5d-4ca8-a014-6a80deca9477	2026-04-03 06:04:09+00	2026-04-10 05:35:58.914763+00	2026-04-04 09:00:00+00	2026-04-17 08:30:00+00	\N
+af683964-9811-45aa-9147-b4858ae1d10b	2026-05-29 07:04:23+00	2026-05-29 06:35:18+00	2026-05-29 06:38:24+00	2026-05-30 07:35:32+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -4593,9 +5092,6 @@ c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	Mechanical Engineering	ME	Main Campus	2026-
 --
 
 COPY public.event_registrations (id, event_id, user_id, created_at) FROM stdin;
-2c3d7047-6d13-4338-b780-7d436faae055	46ba0b05-30a7-4480-ab7b-49b09165c1fd	d0162e3c-be25-43b0-8e46-9a744f221149	2026-03-03 09:47:26.269135+00
-42a1801d-47ed-46b8-951d-de192eb2e9b7	46ba0b05-30a7-4480-ab7b-49b09165c1fd	d0162e3c-be25-43b0-8e46-9a744f221149	2026-03-03 09:48:21.468816+00
-9bb1ffc1-b49a-4f7a-9d2b-b69d5af15973	46ba0b05-30a7-4480-ab7b-49b09165c1fd	d0162e3c-be25-43b0-8e46-9a744f221149	2026-03-03 09:51:54.989967+00
 \.
 
 
@@ -4603,12 +5099,22 @@ COPY public.event_registrations (id, event_id, user_id, created_at) FROM stdin;
 -- Data for Name: events; Type: TABLE DATA; Schema: public; Owner: postgres
 --
 
-COPY public.events (id, title, description, event_date, location, created_at, updated_at, is_active, event_type, mode, image_url, organizer_name, organizer_contact, registration_deadline, max_participants, problem_statement_deadline, registration_start_date, has_problem_statement, resource_person, tenant_id) FROM stdin;
-00d57880-e404-4eea-814e-eee8ad747f9b	Hackverse	A hackathon is a time-bound event where participants collaborate to develop innovative solutions to real-world problems using technology.	2026-04-30 20:34:00+00	Seminar Hall 2	2026-04-03 15:05:22.689336+00	2026-04-03 15:05:22.689336+00	t	hackathon	Online		Advika	9876543210	2026-04-22 20:35:00+00	\N	2026-04-03 15:05:22.689336+00	2026-04-03 15:05:22.689336+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254
-1791a3aa-163e-42cd-905e-0e396f3973e8	event1	event1 desc	2026-03-16 11:20:00+00	Innovation Lab	2026-03-10 05:53:07.263283+00	2026-03-10 05:53:07.263283+00	t	Workshop	Hybrid		org1	8765432094	2026-03-14 11:21:00+00	25	2026-03-10 05:53:07.263283+00	2026-03-10 05:53:07.263283+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254
-46ba0b05-30a7-4480-ab7b-49b09165c1fd	event4	4th	2026-02-28 18:50:00+00	keesara	2026-03-03 07:14:36.838933+00	2026-03-03 07:14:36.838933+00	t	hackathon	Offline		lika	bdwubdhwbhb	2026-02-26 18:50:00+00	\N	2026-03-03 07:14:36.838933+00	2026-03-03 07:14:36.838933+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-51411070-c3e4-432c-84fd-f68bf680d71f	event5	event5	2026-02-28 18:51:00+00	ksndndjefk	2026-03-03 07:15:15.736982+00	2026-03-03 07:15:15.736982+00	t	kefbkwje	Online		71736824	l2rkrkjn5r	2026-02-24 18:51:00+00	\N	2026-03-03 07:15:15.736982+00	2026-03-03 07:15:15.736982+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-218058b8-b7a5-459b-9ff7-0f45d5a81577	geenovate	hackathon for students	2026-05-27 10:31:00+00	Seminar Hall 2	2026-05-25 05:02:25.840432+00	2026-05-25 05:02:25.840432+00	t	Workshop	Offline		\N	\N	2026-05-23 10:32:00+00	1	2026-05-25 05:02:25.840432+00	2026-05-25 05:02:25.840432+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254
+COPY public.events (id, title, description, event_date, location, created_at, updated_at, is_active, event_type, mode, image_url, organizer_name, organizer_contact, registration_deadline, max_participants, problem_statement_deadline, registration_start_date, has_problem_statement, resource_person, tenant_id, registration_link) FROM stdin;
+826e7f29-0b3b-4248-81c8-b17c3c7e54b9	hackathon	student hackathon	2026-06-12 23:52:00+00	Seminar Hall 2	2026-05-27 18:22:38.981304+00	2026-05-27 18:22:38.981304+00	t	Workshop	Hybrid	https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/event_images/event_1779906158133.webp	\N	\N	2026-05-31 23:52:00+00	\N	2026-05-27 18:22:38.981304+00	2026-05-27 18:22:38.981304+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	https://www.instagram.com/
+9f2caecd-c52e-4b49-b492-7bcb1f564225	ferfergregr	frgergregr	2026-06-01 10:25:00+00	rewq	2026-05-27 17:56:17.320553+00	2026-05-27 17:56:17.320553+00	t	gfds	Hybrid	https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/event_images/event_1779905902167.webp	\N	\N	2026-05-30 10:26:00+00	\N	2026-05-27 17:56:17.320553+00	2026-05-27 17:56:17.320553+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254	https://docs.google.com/forms/d/1eIpvfF9oODrdHLzZXYnV4kXbifMyoWLXK9N_n7ZJ5ho
+\.
+
+
+--
+-- Data for Name: events_archive; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.events_archive (id, title, description, event_date, location, created_at, updated_at, is_active, event_type, mode, image_url, organizer_name, organizer_contact, registration_deadline, max_participants, problem_statement_deadline, registration_start_date, has_problem_statement, resource_person, tenant_id, registration_link, archived_at) FROM stdin;
+00d57880-e404-4eea-814e-eee8ad747f9b	Hackverse	A hackathon is a time-bound event where participants collaborate to develop innovative solutions to real-world problems using technology.	2026-04-30 20:34:00+00	Seminar Hall 2	2026-04-03 15:05:22.689336+00	2026-04-03 15:05:22.689336+00	t	hackathon	Online		Advika	9876543210	2026-04-22 20:35:00+00	\N	2026-04-03 15:05:22.689336+00	2026-04-03 15:05:22.689336+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254	\N	2026-05-29 02:30:00.244155+00
+1791a3aa-163e-42cd-905e-0e396f3973e8	event1	event1 desc	2026-03-16 11:20:00+00	Innovation Lab	2026-03-10 05:53:07.263283+00	2026-03-10 05:53:07.263283+00	t	Workshop	Hybrid		org1	8765432094	2026-03-14 11:21:00+00	25	2026-03-10 05:53:07.263283+00	2026-03-10 05:53:07.263283+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254	\N	2026-05-29 02:30:00.244155+00
+46ba0b05-30a7-4480-ab7b-49b09165c1fd	event4	4th	2026-02-28 18:50:00+00	keesara	2026-03-03 07:14:36.838933+00	2026-03-03 07:14:36.838933+00	t	hackathon	Offline		lika	bdwubdhwbhb	2026-02-26 18:50:00+00	\N	2026-03-03 07:14:36.838933+00	2026-03-03 07:14:36.838933+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	\N	2026-05-29 02:30:00.244155+00
+51411070-c3e4-432c-84fd-f68bf680d71f	event5	event5	2026-02-28 18:51:00+00	ksndndjefk	2026-03-03 07:15:15.736982+00	2026-03-03 07:15:15.736982+00	t	kefbkwje	Online		71736824	l2rkrkjn5r	2026-02-24 18:51:00+00	\N	2026-03-03 07:15:15.736982+00	2026-03-03 07:15:15.736982+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	\N	2026-05-29 02:30:00.244155+00
+218058b8-b7a5-459b-9ff7-0f45d5a81577	geenovate	hackathon for students	2026-05-27 10:31:00+00	Seminar Hall 2	2026-05-25 05:02:25.840432+00	2026-05-25 05:02:25.840432+00	t	Workshop	Offline		\N	\N	2026-05-23 10:32:00+00	1	2026-05-25 05:02:25.840432+00	2026-05-25 05:02:25.840432+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254	\N	2026-06-04 02:30:00.165863+00
 \.
 
 
@@ -4617,25 +5123,26 @@ COPY public.events (id, title, description, event_date, location, created_at, up
 --
 
 COPY public.page_content (id, page_name, section_key, content, updated_at, tenant_id) FROM stdin;
-28ddbd9b-b34c-4381-b7d1-b67ad90e4735	about	header	{"title": "What is inCamp", "subtitle": "inCamp is a student-driven innovation challenge designed to identify, analyse, and solve real-world problems within the campus ecosystem. We believe every challenge holds the seed of ", "teamTitle": "The Team", "teamSubtitle": "Behind inCamp"}	2026-05-25 06:07:57.962+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+28ddbd9b-b34c-4381-b7d1-b67ad90e4735	about	header	{"title": "What is inCamp", "subtitle": "", "teamTitle": "The Team", "teamSubtitle": "Behind inCamp"}	2026-05-29 07:20:31.755+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+bdc947ce-ee2e-4c3e-85e6-0c5e0e53abcf	events	page_header	{"title": "Events", "styles": {"title": {"fontSize": "text-4xl", "animation": "none", "fontStyle": "default", "textColor": "#f8f7f7", "fontWeight": "semibold"}, "subtitle": {"fontSize": "text-base", "animation": "none", "fontStyle": "default", "textColor": "#eff2f5", "fontWeight": "normal"}}, "subtitle": "Stay updated with the latest workshops, seminars, and competitions happening on campus. Join us to learn, network, and innovate tthis is events page\\nogether."}	2026-05-27 17:47:05.353+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+5a0071c1-fd3f-4d6e-b2de-64561fe91801	resources	downloads	{"title": "Downloads", "subtitle": "hi im downloads"}	2026-05-28 06:20:30.975+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 382fa9c6-827c-48d8-b644-4d460898ea36	event_structure	phases	[{"id": 0, "icon": "Target", "name": "Phase 0", "title": "Problem Discovery", "points": ["Observe challenges", "Validate problem", "Select statement"]}, {"id": 1, "icon": "Users", "name": "Phase 1", "title": "Team Formation", "points": ["Form team", "Register", "Submit problem"]}]	2026-02-04 15:39:18.785222+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-5a0071c1-fd3f-4d6e-b2de-64561fe91801	resources	downloads	{"title": "Downloads", "subtitle": ""}	2026-04-11 08:16:25.409+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 b4c1c049-2352-4224-ae8d-e0620cd32f2e	contact	general_info	{"email": "inCamp@gcet.edu.in", "phone": "+91 981276345", "address": "Geethanjali Campus, Hyderabad\\n"}	2026-03-25 06:12:54.022+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-bdc947ce-ee2e-4c3e-85e6-0c5e0e53abcf	events	page_header	{"title": "Events", "subtitle": "Stay updated with the latest workshops, seminars, and competitions happening on campus. Join us to learn, network, and innovate tthis is events page\\nogether."}	2026-04-11 07:30:07.563+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-2620fffa-73cb-411c-b511-dcc1dbf8d2da	contact	coordinators	[{"name": "Advika", "role": "Coordinator", "email": "23r11a0515@gmail.com", "phone": "9492362238", "description": "coordinates overall event"}]	2026-04-11 11:36:10.46+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-66b3c02c-32a0-40a9-9cb1-7ec1d941b7c5	contact	general_enquiries	[{"id": "5066ba1e-e5a4-40d3-95a3-564d8a457993", "icon": "Mail", "title": "Email", "description": "inCamp@gcet.edu.in"}, {"id": "42015db8-a47e-4e24-97c3-a1e2f55b289b", "icon": "Phone", "title": "Helpline", "description": "+91 981276345"}, {"id": "98f3bb3f-c8fa-4d54-b2b4-8bd32c822d19", "icon": "MapPin", "title": "Address", "description": "Geethanjali Campus, Hyderabad\\n"}, {"id": "4fe2144b-73ac-4f2a-b79a-7a7d09d10c7a", "icon": "Info", "title": "info", "description": "In Geethanjali College "}]	2026-04-11 11:36:10.46+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-c87a3a43-665e-46d3-a047-f1cf7c1d4929	home	timeline_header	{"label": "journey cards", "title": "Event Journey", "subtitle": "How the phases of the events are ", "photo_url": "https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_timeline_header/1776163288369_IMG_7495.JPG", "photo_urls": []}	2026-05-23 11:19:12.938+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-e05d7711-3554-4aa2-8cee-b4802acd69fc	contact	contact_header	{"title": "Contact Us", "subtitle": "Have questions? Reach out to our organizing team for assistance.", "enquiriesTitle": "General Enquiries", "organizingTitle": "Organizing Team"}	2026-04-11 11:36:10.46+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-89806030-d144-4c88-8489-0adecf323775	home	hero	{"title": "inCamp", "chipText": "inCamp", "subtitle": "", "backImage": "https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_hero_images/1779534780914-Geenovate-logo.jpg", "frontImage": "/front.png", "sliderImages": ["https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_slider_images/1779534895422-blue.webp"]}	2026-05-25 06:04:34.665+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-25684097-d43d-446a-8f8e-5c0f5ecc2e9c	home	timeline_cards	[{"id": "3b7d2c34-1cc3-4518-8da6-e38dc7f01b15", "name": "Phase 1", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "d150442e-d9ba-4ee2-ad38-b1f1080e385c", "name": "Phase 2", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "72cafa00-7b2f-491e-a05e-7ece2c1d1e29", "name": "Phase 3", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "05bd0eb3-aed3-453a-adc6-15827b42f6b2", "name": "Phase 4", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "60170615-d562-4ad4-84b9-19c2e5284352", "name": "Phase 5", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "201064e5-946b-44b9-8c37-ef161467868a", "name": "Phase 6", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}]	2026-05-23 11:19:12.938+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-f3681ea3-79ac-4555-a344-d1a1eef28eb6	about	team_cards	[{"id": "geenovate", "title": "Geenovate Foundation", "image_url": null, "description": "The driving force behind inCamp, fostering innovation and entrepreneurship across GCET."}, {"id": "patrons", "title": "Patrons & Leadership", "image_url": null, "description": "Chairman, Director, and institutional leaders providing vision and guidance."}, {"id": "core", "title": "Core Organisers", "image_url": null, "description": "Head Coordinator and 5 Co-Coordinators managing event operations and participant experience."}, {"id": "support", "title": "Department Support Group", "image_url": null, "description": "Academic supporters from each department ensuring curriculum alignment and mentorship."}, {"id": "partners", "title": "Partner Clubs & Councils", "image_url": null, "description": "Innovation Council, Tech Clubs, and professional bodies collaborating for success."}, {"id": "volunteers", "title": "Volunteers & Sponsors", "image_url": null, "description": "Dedicated student volunteers and external sponsors making this event possible."}]	2026-05-25 06:07:57.962+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+25684097-d43d-446a-8f8e-5c0f5ecc2e9c	home	timeline_cards	[{"id": "72cafa00-7b2f-491e-a05e-7ece2c1d1e29", "name": "Phase 1", "title": "New Phase", "icon_url": null, "icon_name": "Rocket", "image_urls": ["https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_timeline_images/1780039084760_0_SwimLane.png"], "description": "Describe the next step in the journey."}, {"id": "05bd0eb3-aed3-453a-adc6-15827b42f6b2", "name": "Phase 2", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "60170615-d562-4ad4-84b9-19c2e5284352", "name": "Phase 3", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "a752caac-5044-490c-a41a-6edac3c39855", "name": "Phase 4", "title": "New Phase", "icon_url": null, "icon_name": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "efd886e8-204f-4336-99aa-c6ef2af64419", "name": "Phase 5", "title": "New Phase", "icon_url": null, "icon_name": null, "image_urls": [], "description": "Describe the next step in the journey."}]	2026-05-29 07:19:39.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+c87a3a43-665e-46d3-a047-f1cf7c1d4929	home	timeline_header	{"label": "journey cards", "title": "Event Journey", "subtitle": "How the phases of the events are ", "photo_url": "https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_timeline_header/1776163288369_IMG_7495.JPG", "photo_urls": ["https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_timeline_header/1780039175531_0_29thAugAgenda.jpg"]}	2026-05-29 07:19:39.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+2620fffa-73cb-411c-b511-dcc1dbf8d2da	contact	coordinators	[{"name": "Advika", "role": "Coordinator", "email": "23r11a0515@gmail.com", "phone": "9492362238", "description": "coordinates overall event"}]	2026-05-29 07:29:54.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+e05d7711-3554-4aa2-8cee-b4802acd69fc	contact	contact_header	{"title": "Contact Us", "styles": {"title": {"color": "#ffffff", "effect": "none", "fontSize": "text-5xl", "fontType": "font-poppins", "fontWeight": "font-bold"}, "subtitle": {"color": "#dbeafe", "effect": "none", "fontSize": "text-lg", "fontType": "font-sans", "fontWeight": "font-normal"}, "backgroundColor": "#0b3a82"}, "subtitle": "Have questions? Reach out to our organizing team for assistance.", "enquiriesTitle": "General Enquiries", "organizingTitle": "Organizing Team"}	2026-05-29 07:29:54.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+66b3c02c-32a0-40a9-9cb1-7ec1d941b7c5	contact	general_enquiries	[{"id": "5066ba1e-e5a4-40d3-95a3-564d8a457993", "icon": "Mail", "title": "Email", "description": "inCamp@gcet.edu.in"}, {"id": "42015db8-a47e-4e24-97c3-a1e2f55b289b", "icon": "Phone", "title": "Helpline", "description": "+91 981276345"}, {"id": "98f3bb3f-c8fa-4d54-b2b4-8bd32c822d19", "icon": "MapPin", "title": "Address", "description": "Geethanjali Campus, Hyderabad\\n"}, {"id": "4fe2144b-73ac-4f2a-b79a-7a7d09d10c7a", "icon": "Info", "title": "info", "description": "In Geethanjali College "}]	2026-05-29 07:29:54.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+89806030-d144-4c88-8489-0adecf323775	home	hero	{"title": "outCamp", "chipText": "inCamp", "subtitle": "hi im sub-title", "backImage": "https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_hero_images/1779969783058-Geenovate-logo.jpg", "frontImage": "/front.png", "heroStyles": {"title": {"fontSize": "text-7xl", "animation": "bounce", "textColor": "#fafafa"}, "subtitle": {"textColor": "#ffffff"}}, "sliderImages": ["https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_slider_images/1779534895422-blue.webp"]}	2026-05-29 07:31:31.674+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 a6d37947-049f-45cd-b514-14dc61a1896e	about	team_cards	[{"id": "geenovate", "title": "Geenovate Foundation", "image_url": null, "description": "The driving force behind inCamp, fostering innovation and entrepreneurship across GCET."}, {"id": "patrons", "title": "Patrons & Leadership", "image_url": null, "description": "Chairman, Director, and institutional leaders providing vision and guidance."}, {"id": "core", "title": "Core Organisers", "image_url": null, "description": "Head Coordinator and 5 Co-Coordinators managing event operations and participant experience."}, {"id": "support", "title": "Department Support Group", "image_url": null, "description": "Academic supporters from each department ensuring curriculum alignment and mentorship."}, {"id": "partners", "title": "Partner Clubs & Councils", "image_url": null, "description": "Innovation Council, Tech Clubs, and professional bodies collaborating for success."}, {"id": "volunteers", "title": "Volunteers & Sponsors", "image_url": null, "description": "Dedicated student volunteers and external sponsors making this event possible."}]	2026-05-25 06:16:41.041+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-85ec90de-67a9-4de6-8f65-100d765964e7	home	hero	{"title": "outCamp", "chipText": "Chapter 1 — Innovation Begins Here", "subtitle": "Turning Campus Challenges into Countable changes", "backImage": "/back.png", "frontImage": "/front.png", "sliderImages": ["/BackgroundSlider1.jpeg", "/BackgroundSlider2.JPG", "/BackgroundSlider3.JPG", "/BackgroundSlider4.jpeg", "/BackgroundSlider5.jpeg", "/BackgroundSlider6.jpeg", "/BackgroundSlider7.jpeg"]}	2026-05-25 06:00:05.008+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+85ec90de-67a9-4de6-8f65-100d765964e7	home	hero	{"title": "outCamp", "chipText": "Chapter 1 — Innovation Begins Here", "subtitle": "Turning Campus Challenges into Countable changes", "backImage": "/back.png", "frontImage": "/front.png", "heroStyles": {"title": {"textColor": "#f9f5f5"}, "subtitle": {"textColor": "#eff2f5"}}, "sliderImages": ["/BackgroundSlider1.jpeg", "/BackgroundSlider2.JPG", "/BackgroundSlider3.JPG", "/BackgroundSlider4.jpeg", "/BackgroundSlider5.jpeg", "/BackgroundSlider6.jpeg", "/BackgroundSlider7.jpeg"]}	2026-05-27 22:24:31.674+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 9f26bd89-c657-4d32-a624-80cf0c55e851	home	timeline_cards	[{"id": "phase-0", "name": "Phase 0", "title": "Problem Discovery", "image_urls": [], "description": "Identify and document real campus challenges through observation and research."}, {"id": "phase-1", "name": "Phase 1", "title": "Team Formation & Registration", "image_urls": [], "description": "Form cross-functional teams and register with your chosen problem statement."}, {"id": "phase-2", "name": "Phase 2", "title": "Solution Ideation", "image_urls": [], "description": "Brainstorm, validate, and refine your innovative solution approach."}, {"id": "phase-3", "name": "Phase 3", "title": "Prototype Development", "image_urls": [], "description": "Build working prototypes and prepare comprehensive documentation."}, {"id": "phase-4", "name": "Phase 4", "title": "Final Pitch & Evaluation", "image_urls": [], "description": "Present your solution to the jury and compete for recognition and prizes."}]	2026-05-25 06:00:57.818+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 6f1c9eef-ef1e-4182-8f74-68f1e1ac3f95	home	timeline_header	{"label": "Event Journey", "title": "Your Path to Innovation", "subtitle": "the path", "photo_url": null, "photo_urls": []}	2026-05-25 06:00:57.818+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-163b9b51-9598-431d-abfd-572518d28e94	about	description	{"fontStyle": "default", "paragraphs": ["inCamp is a student-driven innovation challenge designed to identify, analyse, and solve real-world problems within the campus ecosystem. We believe every challenge holds the seed of transformation\\n\\n", "Through our structured 5D Framework — Discover, Define, Design, Develop, and Deliver — participants journey from problem identification to prototype creation, gaining invaluable entrepreneurial skills along the way.\\n"]}	2026-05-25 06:07:57.962+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+a82734f5-d985-4244-beb5-a18b9a244d36	about	descriptive_boxes	[{"id": "box-1", "text": "inCamp is a student-driven innovation challenge designed to identify, analyse, and solve real-world problems within the campus ecosystem. We believe every challenge holds the seed of transformation.", "fontSize": "2xl", "animation": "fadeIn", "fontStyle": "default", "textColor": "#ffffff", "fontWeight": "bold", "textEffect": "none"}, {"id": "box-2", "text": "Through our structured 5D Framework — Discover, Define, Design, Develop, and Deliver — participants journey from problem identification to prototype creation, gaining invaluable entrepreneurial skills along the way.", "fontSize": "lg", "animation": "fadeIn", "fontStyle": "default", "textColor": "#e6e9ef", "fontWeight": "normal", "textEffect": "none"}]	2026-05-29 07:20:31.755+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+163b9b51-9598-431d-abfd-572518d28e94	about	description	{"fontStyle": "default", "paragraphs": ["inCamp is a student-driven innovation challenge designed to identify, analyse, and solve real-world problems within the campus ecosystem.\\n\\n", "Through our structured 5D Framework — Discover, Define, Design, Develop, and Deliver — participants journey from problem identification to prototype creation, gaining invaluable entrepreneurial skills along the way.\\n"]}	2026-05-27 15:11:14.921+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 44643046-5e87-477b-b0b1-319c0df76140	about	header	{"title": "What is inCamp?", "subtitle": "inCamp is a student-driven innovation challenge designed to identify, analysis, and solve real-world problems within the campus ecosystem. We believe every challenge holds the seed of transformation.", "teamTitle": "The Team", "teamSubtitle": "Behind inCamp"}	2026-05-25 06:16:41.041+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 cfc8dda5-6885-41f4-ac49-0aa0e5d130e7	about	description	{"fontStyle": "default", "paragraphs": ["inCamp is a student-driven innovation challenge designed to identify, analyse, and solve real-world problems within the campus ecosystem. We believe every challenge holds the seed of transformation", "Through our structured 5D Framework — Discover, Define, Design, Develop, and Deliver — participants journey from problem identification to prototype creation, gaining invaluable entrepreneurial skills along the way."]}	2026-05-25 06:16:41.041+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+f3681ea3-79ac-4555-a344-d1a1eef28eb6	about	team_cards	[{"id": "patrons", "title": "Patrons & Leadership", "image_url": "https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/about_cards/1780039224820_mukesh_kestwal.jpeg", "description": "Chairman, Director, and institutional leaders providing vision and guidance."}, {"id": "core", "title": "Core Organisers", "image_url": null, "description": "Head Coordinator and 5 Co-Coordinators managing event operations and participant experience."}, {"id": "support", "title": "Department Support Group", "image_url": null, "description": "Academic supporters from each department ensuring curriculum alignment and mentorship."}, {"id": "partners", "title": "Partner Clubs & Councils", "image_url": null, "description": "Innovation Council, Tech Clubs, and professional bodies collaborating for success."}, {"id": "volunteers", "title": "Volunteers & Sponsors", "image_url": null, "description": "Dedicated student volunteers and external sponsors making this event possible."}]	2026-05-29 07:20:31.755+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -4685,15 +5192,18 @@ COPY public.problem_statement_reviews (id, problem_statement_id, reviewer_id, re
 
 COPY public.problem_statements (id, problem_statement_id, title, description, category, theme, created_at, detailed_description, department, status, created_by, department_id, faculty_owner, assigned_spoc, submission_batch_id, submitted_at, approved_at, revision_note, expected_outcomes, resource_requirements, timeline_milestones, budget_estimation, last_updated, event_id, admin_remark, max_registrations, curr_registrations, tenant_id) FROM stdin;
 942f2ae6-1d04-4994-9637-4ef50f6cdb31	PS001	testing1 - ECE	testing1 - ECE desc	Hardware/Software	Community Innovation	2026-03-10 06:24:13.685955+00	testing1 - ECE detailed desc	Electronics & Communication Engineering	approved	b84fe995-c654-433b-949a-5d14b471481b	186cc1c0-b797-40bf-b9d8-b8431531ecf3	fac1-ece	spoc1-ece	\N	2026-03-10 06:24:13.943+00	2026-03-10 06:24:45.955+00	\N	\N	\N	\N	\N	2026-03-10 06:24:13.685955+00	\N	\N	6	0	0ee52668-ea70-4740-9f7b-b15ba5535254
-d996c0e5-6a15-41c5-be30-b7743ceda7b9	PS003	testing1-cse	testing1 - cse desc	Software	Non-Academic	2026-03-10 06:15:55.659133+00	testing1 - cse detailed desc	Computer Science & Engineering	approved	8f064c44-6ed2-479d-a547-d1beaf8d4a06	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	fac1-cse	spoc1-cse	\N	2026-03-10 06:15:55.99+00	2026-03-10 06:24:50.202+00	\N	\N	\N	\N	\N	2026-03-10 06:15:55.659133+00	\N	\N	4	0	0ee52668-ea70-4740-9f7b-b15ba5535254
-76eedffd-0a6a-40c5-862a-9389d83d0d2a	12345	arts & science 	hello	Hardware	Non-Academic	2026-03-23 09:19:49.838411+00	hello	\N	approved	ea5561b5-6918-4212-83d9-5e48dec790ce	186cc1c0-b797-40bf-b9d8-b8431531ecf3	\N	\N	\N	2026-03-23 09:19:49.567+00	2026-03-23 09:19:49.567+00	\N	\N	\N	\N	\N	2026-03-23 09:19:49.838411+00	\N	\N	\N	0	0ee52668-ea70-4740-9f7b-b15ba5535254
+b4585cd2-82f5-4990-bb8f-5d1093f25f41	PS-2026-6534	test 123	testing testig	Hardware/Software	Non-Academic	2026-05-28 08:32:41.680612+00	djdjm fivjfkbm fbfkb fgjfkm fmfbm fjfklmwjekbm dfgm	Mechanical Engineering	approved	99abb06b-7974-45ae-887a-9a87e6ec9c36	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	\N	\N	\N	2026-05-28 08:32:41.443+00	2026-05-28 08:33:29.757+00	\N	\N	\N	\N	\N	2026-05-28 08:32:41.680612+00	\N	\N	5	0	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 794da336-faef-4005-bb15-f2b96c503086	29779	testing2 - ece	testing2 - ECE desc	Hardware	Community Innovation	2026-03-10 06:40:23.618568+00	testing2 - ECE detailed desc	Electronics & Communication Engineering	approved	b84fe995-c654-433b-949a-5d14b471481b	186cc1c0-b797-40bf-b9d8-b8431531ecf3	fac2-ece	spoc2-ece	\N	2026-03-10 06:40:23.942+00	2026-03-10 09:28:21.404+00	\N	\N	\N	\N	\N	2026-03-10 06:40:23.618568+00	\N	\N	6	0	0ee52668-ea70-4740-9f7b-b15ba5535254
 1e648b10-0f0f-4545-ac70-795c742890e8	PS002	testing1 - ME	testing1 - ME desc	Hardware	Academic	2026-03-10 06:18:06.889647+00	testing1 - ME detailed desc	Mechanical Engineering	approved	d1645cf0-5274-43f6-94d5-f0db4c6dcabf	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	fac1-me	spoc1-me	\N	2026-03-10 06:18:07.255+00	2026-03-10 06:24:42.196+00	\N	\N	\N	\N	\N	2026-03-10 06:18:06.889647+00	\N	\N	5	0	0ee52668-ea70-4740-9f7b-b15ba5535254
-e64f18cb-6944-480a-96a2-c5363dfdc6a6	PS-2026-4178	smart attendance	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Software	Academic	2026-04-03 18:36:39.297925+00	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Computer Science & Engineering	approved	8f064c44-6ed2-479d-a547-d1beaf8d4a06	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	lalita	\N	\N	2026-04-03 18:36:40.023+00	2026-04-03 18:42:30.789+00	\N	\N	\N	\N	\N	2026-04-03 18:36:39.297925+00	\N	\N	5	0	0ee52668-ea70-4740-9f7b-b15ba5535254
-ea3e53f6-e975-4db7-9c61-8b44ed2c84e3	PS-2026-6019	Economic problem	Economic	Hardware	Non-Academic	2026-04-15 09:52:12.298832+00	Economic	Computer Science & Engineering	pending_review	8f064c44-6ed2-479d-a547-d1beaf8d4a06	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	\N	\N	\N	2026-04-15 09:52:10.697+00	\N	\N	\N	\N	\N	\N	2026-04-15 09:52:12.298832+00	\N	\N	\N	0	0ee52668-ea70-4740-9f7b-b15ba5535254
-a4521cc3-64c7-4143-a72e-f9c8d8947e32	VIT-1002	AR Campus Navigation	Indoor navigation using AR.	Software	Smart Campus	2026-05-09 18:03:29.95091+00	\N	\N	approved	8f064c44-6ed2-479d-a547-d1beaf8d4a06	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	2026-05-09 18:03:29.95091+00	\N	\N	15	4	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-0f98bf1a-d45a-4902-937e-80d9b00402f5	VIT-1001	Smart Waste Management	Build an AI waste segregation platform.	Software	Sustainability	2026-05-09 18:03:29.95091+00	\N	\N	approved	8f064c44-6ed2-479d-a547-d1beaf8d4a06	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	2026-05-09 18:03:29.95091+00	\N	\N	10	3	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-52809188-a629-4709-9005-90ee77240525	PS-2026-9494	smart attendance system	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Software	Academic	2026-04-03 15:17:49.122534+00	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Computer Science & Engineering	approved	8f064c44-6ed2-479d-a547-d1beaf8d4a06	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	Latha	\N	\N	2026-04-03 15:17:49.893+00	2026-04-03 15:20:39.96+00	\N	\N	\N	\N	\N	2026-04-03 15:17:49.122534+00	\N	\N	4	0	0ee52668-ea70-4740-9f7b-b15ba5535254
+76eedffd-0a6a-40c5-862a-9389d83d0d2a	12345	arts & science 	hello	Hardware	Non-Academic	2026-03-23 09:19:49.838411+00	hello	\N	approved	ea5561b5-6918-4212-83d9-5e48dec790ce	186cc1c0-b797-40bf-b9d8-b8431531ecf3	\N	\N	\N	2026-03-23 09:19:49.567+00	2026-03-23 09:19:49.567+00	\N	\N	\N	\N	\N	2026-03-23 09:19:49.838411+00	\N	\N	\N	1	0ee52668-ea70-4740-9f7b-b15ba5535254
+7aeaa458-b523-4bd0-a4ca-cbf309e3431f	25010	smart time table	implement a smart time table	Software	Academic	2026-05-27 15:20:10.366397+00		\N	approved	ea5561b5-6918-4212-83d9-5e48dec790ce	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	\N	\N	\N	2026-05-27 15:20:10.082+00	2026-05-27 15:20:10.082+00	\N	\N	\N	\N	\N	2026-05-27 15:20:10.366397+00	\N	\N	\N	1	0ee52668-ea70-4740-9f7b-b15ba5535254
+e9f33cf4-21e1-4c54-a35c-61c9977767e3	54321	problem hard 	very hard to impliment	Hardware	Community Innovation	2026-05-28 09:19:46.465785+00	u need crazy expertiese to sollve this prob	\N	approved	ea5561b5-6918-4212-83d9-5e48dec790ce	bedf8eac-4458-40af-af3b-6941e44adf8e	\N	\N	\N	2026-05-28 09:19:47.518+00	2026-05-28 09:19:47.518+00	\N	\N	\N	\N	\N	2026-05-28 09:19:46.465785+00	\N	\N	13	0	0ee52668-ea70-4740-9f7b-b15ba5535254
+d996c0e5-6a15-41c5-be30-b7743ceda7b9	PS003	testing1-cse	testing1 - cse desc	Software	Non-Academic	2026-03-10 06:15:55.659133+00	testing1 - cse detailed desc	Computer Science & Engineering	approved	\N	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	fac1-cse	spoc1-cse	\N	2026-03-10 06:15:55.99+00	2026-03-10 06:24:50.202+00	\N	\N	\N	\N	\N	2026-03-10 06:15:55.659133+00	\N	\N	4	0	0ee52668-ea70-4740-9f7b-b15ba5535254
+e64f18cb-6944-480a-96a2-c5363dfdc6a6	PS-2026-4178	smart attendance	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Software	Academic	2026-04-03 18:36:39.297925+00	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Computer Science & Engineering	approved	\N	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	lalita	\N	\N	2026-04-03 18:36:40.023+00	2026-04-03 18:42:30.789+00	\N	\N	\N	\N	\N	2026-04-03 18:36:39.297925+00	\N	\N	5	0	0ee52668-ea70-4740-9f7b-b15ba5535254
+ea3e53f6-e975-4db7-9c61-8b44ed2c84e3	PS-2026-6019	Economic problem	Economic	Hardware	Non-Academic	2026-04-15 09:52:12.298832+00	Economic	Computer Science & Engineering	pending_review	\N	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	\N	\N	\N	2026-04-15 09:52:10.697+00	\N	\N	\N	\N	\N	\N	2026-04-15 09:52:12.298832+00	\N	\N	\N	0	0ee52668-ea70-4740-9f7b-b15ba5535254
+a4521cc3-64c7-4143-a72e-f9c8d8947e32	VIT-1002	AR Campus Navigation	Indoor navigation using AR.	Software	Smart Campus	2026-05-09 18:03:29.95091+00	\N	\N	approved	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	2026-05-09 18:03:29.95091+00	\N	\N	15	4	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+0f98bf1a-d45a-4902-937e-80d9b00402f5	VIT-1001	Smart Waste Management	Build an AI waste segregation platform.	Software		2026-05-09 18:03:29.95091+00		\N	approved	\N	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	2026-05-09 18:03:29.95091+00	\N	\N	10	3	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+52809188-a629-4709-9005-90ee77240525	PS-2026-9494	smart attendance system	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Software	Academic	2026-04-03 15:17:49.122534+00	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Computer Science & Engineering	approved	\N	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	Latha	\N	\N	2026-04-03 15:17:49.893+00	2026-04-03 15:20:39.96+00	\N	\N	\N	\N	\N	2026-04-03 15:17:49.122534+00	\N	\N	4	0	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -4702,17 +5212,17 @@ a4521cc3-64c7-4143-a72e-f9c8d8947e32	VIT-1002	AR Campus Navigation	Indoor naviga
 --
 
 COPY public.profiles (id, name, email, role, created_at, phone, avatar_url, faculty_id, department_id, updated_at, department, year, tenant_id) FROM stdin;
-d1645cf0-5274-43f6-94d5-f0db4c6dcabf	abhiram	23r11a0511@gcet.edu.in	deptadmin	2026-03-03 08:24:42.139035+00	\N	\N	\N	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
-b280f8c8-b05a-4237-b606-802420092eb1	advika	23r11a67c7@gcet.edu.in	student	2026-02-14 05:26:30.861648+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
+bc00594c-8776-4bef-9d32-cf6176f89f81	Vivek Vardhan	23r11a0531@gcet.edu.in	student	2026-05-29 07:15:19.685944+00	\N	\N	\N	\N	2026-05-29 07:15:19.685944+00	CSE	4	0ee52668-ea70-4740-9f7b-b15ba5535254
+b280f8c8-b05a-4237-b606-802420092eb1	Shasidhar reddy	23r11a67c7@gcet.edu.in	student	2026-02-14 05:26:30.861648+00	\N	\N	\N	\N	2026-05-28 07:20:16.196848+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
+99abb06b-7974-45ae-887a-9a87e6ec9c36	siri	23r11a0512@gcet.edu.in	deptadmin	2026-03-06 16:05:35.02836+00	\N	\N	\N	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	2026-05-28 08:19:21.337855+00	Unknown	Unknown	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+2e83ba6a-9778-4e84-80b2-168409debced	Advika	23r11a0515@gcet.edu.in	student	2026-05-29 05:55:01.035892+00	\N	\N	\N	\N	2026-05-29 06:00:44.244934+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 ec79d798-6f6f-4549-8d79-edd15870b43b	lilly	23r11a0566@gcet.edu.in	student	2026-02-15 18:58:18.434703+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
-99abb06b-7974-45ae-887a-9a87e6ec9c36	Rishik	23r11a0512@gcet.edu.in	student	2026-03-06 16:05:35.02836+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 595d5afb-c1f6-47a7-b92a-96519c1fc36f	Vaishnavi	23r11a0513@gcet.edu.in	student	2026-03-06 16:16:51.298508+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 f6601227-10dc-4bb5-9be0-a48df646882c	Shivani	23r11a0505@gcet.edu.in	student	2026-03-10 04:36:59.156753+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
-b84fe995-c654-433b-949a-5d14b471481b	rishik	23r11a0546@gcet.edu.in	deptadmin	2026-03-03 08:25:15.226993+00	\N	\N	\N	186cc1c0-b797-40bf-b9d8-b8431531ecf3	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 ea5561b5-6918-4212-83d9-5e48dec790ce	Jay	23r11a0544@gcet.edu.in	admin	2026-02-10 15:03:19.438526+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 f6e82f04-701a-4e83-84a9-b311eaed6db2	Abhaya	21r11a05c0@gcet.edu.in	student	2026-04-16 16:03:43.238841+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
-d0162e3c-be25-43b0-8e46-9a744f221149	Advika	23r11a0515@gcet.edu.in	student	2026-02-10 15:02:33.971479+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-8f064c44-6ed2-479d-a547-d1beaf8d4a06	Vivek Vardhan	23r11a0531@gcet.edu.in	admin	2026-02-11 04:58:53.831611+00	\N	\N	1234	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	2026-05-25 05:21:25.093339+00	Unknown	Unknown	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+d1645cf0-5274-43f6-94d5-f0db4c6dcabf	abhiram	23r11a0511@gcet.edu.in	deptadmin	2026-03-03 08:24:42.139035+00	\N	\N	\N	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	2026-05-28 05:31:14.775118+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
+b84fe995-c654-433b-949a-5d14b471481b	rishik	23r11a0546@gcet.edu.in	deptadmin	2026-03-03 08:25:15.226993+00	\N	\N	\N	186cc1c0-b797-40bf-b9d8-b8431531ecf3	2026-05-28 05:47:54.675883+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -4724,10 +5234,10 @@ COPY public.resources (id, title, description, file_url, file_type, section_key,
 b41bf788-753c-4e97-a40e-83799f75f41b	Timeline PDF	Important dates and deadlines.	\N	PDF	timeline_pdf	2026-02-04 15:39:18.785222+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 b0117e1d-3787-40f8-9182-d74fc5dc5a51	Rules & Guidelines	Eligibility and submission rules.	\N	\N	rules_guidelines	2026-02-04 15:39:18.785222+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 0a347ec1-af3f-419b-9fbc-73d902aa5faf	PPT Template	Official presentation template	\N	\N	ppt_template	2026-02-11 05:41:49.084+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-6fd8db9d-4400-4034-9074-70d5d2ff8d5d	PDF Template	Official document template	\N	\N	evaluation_rubrics	2026-02-11 05:42:19.833+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 f37bfdb9-4b82-4911-aea2-56e9bd8af9d4	Shortlist Excel	Official Excel Document	https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/shortlist_excel_1775894765880_24-3-26__1_.xlsx	24-3-26 (1).xlsx	shortlist_excel	2026-04-11 08:06:06.929+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 2bbb56bc-955a-4e99-a27b-0d66eebe09d7	VIT Rulebook	Official VIT Hackathon Rules.	\N	\N	vit-rules	2026-05-09 18:03:29.95091+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 96bc3066-6861-401b-b920-cdc2c7a72f93	VIT PPT Template	Pitch deck template for VIT participants.	\N	\N	vit-template	2026-05-09 18:03:29.95091+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+6fd8db9d-4400-4034-9074-70d5d2ff8d5d	PDF Template	Official document template	\N	\N	rules_guidelines__pdf_template	2026-05-28 14:48:08.68+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -4744,7 +5254,7 @@ COPY public.submission_batch_items (id, batch_id, problem_statement_id, created_
 --
 
 COPY public.submission_batches (id, department_id, submitted_by, status, cover_note, created_at, updated_at, submitted_at, tenant_id) FROM stdin;
-2b64ba5f-828d-4605-8aea-ec554b06cbe6	\N	8f064c44-6ed2-479d-a547-d1beaf8d4a06	submitted	\N	2026-02-13 05:55:04.401673+00	2026-05-09 15:53:44.458829+00	2026-02-13 05:55:04.401673+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+2b64ba5f-828d-4605-8aea-ec554b06cbe6	\N	\N	submitted	\N	2026-02-13 05:55:04.401673+00	2026-05-29 05:53:36.617061+00	2026-02-13 05:55:04.401673+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -4753,7 +5263,8 @@ COPY public.submission_batches (id, department_id, submitted_by, status, cover_n
 --
 
 COPY public.team_registrations (id, user_id, team_name, problem_id, member1_name, member1_roll, member2_name, member2_roll, member3_name, member3_roll, member4_name, member4_roll, member1_year, member1_department, member1_phone, member1_email, document_url, created_at, updated_at, document_filename, member3_year, member3_department, member3_phone, member3_email, member4_year, member4_department, member4_phone, member4_email, member2_year, member2_department, member2_phone, member2_email, tenant_id) FROM stdin;
-d92aee44-5318-4249-affe-e8adb0562c5e	8f064c44-6ed2-479d-a547-d1beaf8d4a06	VIT Titans	VIT-1001	Vivek Vardhan	21BCE001	Advika	21BCE002	\N	\N	\N	\N	3	CSE	9876543210	vivek@vit.ac.in	\N	2026-05-09 18:03:29.95091+00	2026-05-09 18:03:29.95091+00	\N	\N	\N	\N	\N	\N	\N	\N	\N	3	CSE	9876543211	advika@vit.ac.in	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+3bd69129-c5dc-42b3-b52d-3513d05d5430	f6601227-10dc-4bb5-9be0-a48df646882c	team1	12345	member1	roll1	member2	roll2	\N	\N	\N	\N	3	EEE	8345242344	vivekvardhan310@gmail.com	\N	2026-05-28 07:17:19.074994+00	2026-05-28 07:17:19.074994+00	\N	\N	\N	\N	\N	\N	\N	\N	\N	4	CSE	8765434565	vivekvardhan310@gmail.com	0ee52668-ea70-4740-9f7b-b15ba5535254
+3d63178d-b03e-4980-a2c2-7fe73fb872d9	f6e82f04-701a-4e83-84a9-b311eaed6db2	Abhaya's Team	25010	Abhaya	21R11A05c0	Advika	23r11a0515@gcet.edu.in	\N	\N	\N	\N	4	CSE	9876543210	21r11a05c0@gcet.edu.in	f6e82f04-701a-4e83-84a9-b311eaed6db2_1779919707189_F_distributiin_table_0.01_level.pdf	2026-05-28 07:25:53.695708+00	2026-05-28 07:25:53.695708+00	F distributiin table 0.01 level.pdf	\N	\N	\N	\N	\N	\N	\N	\N	4	CSE	8765432190	23r11a0515@gcet.edu.in	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -4764,6 +5275,7 @@ d92aee44-5318-4249-affe-e8adb0562c5e	8f064c44-6ed2-479d-a547-d1beaf8d4a06	VIT Ti
 COPY public.tenants (id, name, slug, created_at) FROM stdin;
 0ee52668-ea70-4740-9f7b-b15ba5535254	GCET	gcet	2026-05-09 15:53:44.458829+00
 472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	VIT	vit	2026-05-09 17:54:54.067767+00
+0ea0e008-8c3b-4570-ab6b-d36ab89565f9	Vagdevi	vgd	2026-05-25 16:57:01.945927+00
 \.
 
 
@@ -4773,7 +5285,7 @@ COPY public.tenants (id, name, slug, created_at) FROM stdin;
 
 COPY public.user_queries (id, query_text, user_id, user_email, user_name, status, resolved_at, created_at, tenant_id) FROM stdin;
 348d6f8f-581e-404a-a33e-335ce511a59e	Where can I download the pitch template?	\N	student2@example.com	Isha Kapoor	resolved	\N	2026-02-04 15:39:18.785222+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-e6134ae1-0295-4377-8b3d-96962afb203b	Can we update team members later?	8f064c44-6ed2-479d-a547-d1beaf8d4a06	vivek@vit.ac.in	Vivek Vardhan	pending	\N	2026-05-09 18:03:29.95091+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+e6134ae1-0295-4377-8b3d-96962afb203b	Can we update team members later?	\N	vivek@vit.ac.in	Vivek Vardhan	pending	\N	2026-05-09 18:03:29.95091+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 \.
 
 
@@ -4782,17 +5294,17 @@ e6134ae1-0295-4377-8b3d-96962afb203b	Can we update team members later?	8f064c44-
 --
 
 COPY public.user_roles (id, user_id, role, tenant_id) FROM stdin;
+85431bdf-2b6b-418e-ae0c-5f98519cdae6	bc00594c-8776-4bef-9d32-cf6176f89f81	student	0ee52668-ea70-4740-9f7b-b15ba5535254
 7c01eb6d-827a-419e-88db-296f1caede2e	b280f8c8-b05a-4237-b606-802420092eb1	student	0ee52668-ea70-4740-9f7b-b15ba5535254
 1c1ae2ca-188d-486b-af94-eca15c5f2089	ec79d798-6f6f-4549-8d79-edd15870b43b	student	0ee52668-ea70-4740-9f7b-b15ba5535254
-72e1882c-18be-453f-bf40-5866cf968ab5	99abb06b-7974-45ae-887a-9a87e6ec9c36	student	0ee52668-ea70-4740-9f7b-b15ba5535254
 0f1dca9b-ac4e-43a8-983a-4ac84f0971ec	595d5afb-c1f6-47a7-b92a-96519c1fc36f	student	0ee52668-ea70-4740-9f7b-b15ba5535254
 e73cd2ad-f09a-4674-aab0-3e9fbe0e10ac	f6601227-10dc-4bb5-9be0-a48df646882c	student	0ee52668-ea70-4740-9f7b-b15ba5535254
-09dbea22-1bdc-4c6b-a992-317f37a8a17e	b84fe995-c654-433b-949a-5d14b471481b	deptadmin	0ee52668-ea70-4740-9f7b-b15ba5535254
 842f30c3-6ae8-427b-bc42-5bf42e4334bc	ea5561b5-6918-4212-83d9-5e48dec790ce	admin	0ee52668-ea70-4740-9f7b-b15ba5535254
 2746488b-1053-4505-b296-06d27d350702	f6e82f04-701a-4e83-84a9-b311eaed6db2	student	0ee52668-ea70-4740-9f7b-b15ba5535254
-4bd2c62e-b8eb-4294-abed-c0765f1b0ac9	d0162e3c-be25-43b0-8e46-9a744f221149	student	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-031dbcc8-6653-41b8-bf1d-b7d4db2ee09d	d1645cf0-5274-43f6-94d5-f0db4c6dcabf	student	0ee52668-ea70-4740-9f7b-b15ba5535254
-c4c18781-be2a-4bea-9c8e-01504094574f	8f064c44-6ed2-479d-a547-d1beaf8d4a06	admin	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+72e1882c-18be-453f-bf40-5866cf968ab5	99abb06b-7974-45ae-887a-9a87e6ec9c36	deptadmin	0ee52668-ea70-4740-9f7b-b15ba5535254
+031dbcc8-6653-41b8-bf1d-b7d4db2ee09d	d1645cf0-5274-43f6-94d5-f0db4c6dcabf	deptadmin	0ee52668-ea70-4740-9f7b-b15ba5535254
+09dbea22-1bdc-4c6b-a992-317f37a8a17e	b84fe995-c654-433b-949a-5d14b471481b	deptadmin	0ee52668-ea70-4740-9f7b-b15ba5535254
+3b0973dc-105e-4223-b7d8-95ec46bfa24e	2e83ba6a-9778-4e84-80b2-168409debced	student	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -4800,7 +5312,7 @@ c4c18781-be2a-4bea-9c8e-01504094574f	8f064c44-6ed2-479d-a547-d1beaf8d4a06	admin	
 -- Data for Name: messages_2026_02_12; Type: TABLE DATA; Schema: realtime; Owner: supabase_admin
 --
 
-COPY realtime.messages_2026_02_12 (topic, extension, payload, event, private, updated_at, inserted_at, id) FROM stdin;
+COPY realtime.messages_2026_02_12 (topic, extension, payload, event, private, updated_at, inserted_at, id, binary_payload) FROM stdin;
 \.
 
 
@@ -4808,7 +5320,7 @@ COPY realtime.messages_2026_02_12 (topic, extension, payload, event, private, up
 -- Data for Name: messages_2026_02_13; Type: TABLE DATA; Schema: realtime; Owner: supabase_admin
 --
 
-COPY realtime.messages_2026_02_13 (topic, extension, payload, event, private, updated_at, inserted_at, id) FROM stdin;
+COPY realtime.messages_2026_02_13 (topic, extension, payload, event, private, updated_at, inserted_at, id, binary_payload) FROM stdin;
 \.
 
 
@@ -4816,7 +5328,7 @@ COPY realtime.messages_2026_02_13 (topic, extension, payload, event, private, up
 -- Data for Name: messages_2026_02_14; Type: TABLE DATA; Schema: realtime; Owner: supabase_admin
 --
 
-COPY realtime.messages_2026_02_14 (topic, extension, payload, event, private, updated_at, inserted_at, id) FROM stdin;
+COPY realtime.messages_2026_02_14 (topic, extension, payload, event, private, updated_at, inserted_at, id, binary_payload) FROM stdin;
 \.
 
 
@@ -4824,7 +5336,7 @@ COPY realtime.messages_2026_02_14 (topic, extension, payload, event, private, up
 -- Data for Name: messages_2026_02_15; Type: TABLE DATA; Schema: realtime; Owner: supabase_admin
 --
 
-COPY realtime.messages_2026_02_15 (topic, extension, payload, event, private, updated_at, inserted_at, id) FROM stdin;
+COPY realtime.messages_2026_02_15 (topic, extension, payload, event, private, updated_at, inserted_at, id, binary_payload) FROM stdin;
 \.
 
 
@@ -4832,7 +5344,7 @@ COPY realtime.messages_2026_02_15 (topic, extension, payload, event, private, up
 -- Data for Name: messages_2026_02_16; Type: TABLE DATA; Schema: realtime; Owner: supabase_admin
 --
 
-COPY realtime.messages_2026_02_16 (topic, extension, payload, event, private, updated_at, inserted_at, id) FROM stdin;
+COPY realtime.messages_2026_02_16 (topic, extension, payload, event, private, updated_at, inserted_at, id, binary_payload) FROM stdin;
 \.
 
 
@@ -4910,6 +5422,10 @@ COPY realtime.schema_migrations (version, inserted_at) FROM stdin;
 20251120215549	2026-02-04 09:33:19
 20260218120000	2026-02-28 17:20:33
 20260326120000	2026-04-13 06:48:24
+20260514120000	2026-06-03 14:08:14
+20260527120000	2026-06-03 14:08:14
+20260528120000	2026-06-03 14:08:14
+20260603120000	2026-06-06 06:29:39
 \.
 
 
@@ -4917,7 +5433,7 @@ COPY realtime.schema_migrations (version, inserted_at) FROM stdin;
 -- Data for Name: subscription; Type: TABLE DATA; Schema: realtime; Owner: supabase_admin
 --
 
-COPY realtime.subscription (id, subscription_id, entity, filters, claims, created_at, action_filter) FROM stdin;
+COPY realtime.subscription (id, subscription_id, entity, filters, claims, created_at, action_filter, selected_columns) FROM stdin;
 \.
 
 
@@ -5025,31 +5541,32 @@ COPY storage.migrations (id, name, hash, executed_at) FROM stdin;
 COPY storage.objects (id, bucket_id, name, owner, created_at, updated_at, last_accessed_at, metadata, version, owner_id, user_metadata) FROM stdin;
 1dc11386-7dfc-41ee-8858-0a6f12df6091	ps-documents	8f064c44-6ed2-479d-a547-d1beaf8d4a06/9ca4d9e1-c955-47a5-8872-bd4afe639630/1770962105788-letter (1).docx	8f064c44-6ed2-479d-a547-d1beaf8d4a06	2026-02-13 05:55:06.051967+00	2026-02-13 05:55:06.051967+00	2026-02-13 05:55:06.051967+00	{"eTag": "\\"db04e20137720a3366f0a470bc735ccb\\"", "size": 14468, "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "cacheControl": "max-age=3600", "lastModified": "2026-02-13T05:55:07.000Z", "contentLength": 14468, "httpStatusCode": 200}	4e986af1-f20d-4fd1-a06c-cdf03d51b19b	8f064c44-6ed2-479d-a547-d1beaf8d4a06	{}
 d4a19559-3932-4972-a33c-7e7dbda95d41	ps-documents	8f064c44-6ed2-479d-a547-d1beaf8d4a06/52ec1563-92bb-4642-8993-50a642e04375/1770962105790-letter (1).docx	8f064c44-6ed2-479d-a547-d1beaf8d4a06	2026-02-13 05:55:06.101977+00	2026-02-13 05:55:06.101977+00	2026-02-13 05:55:06.101977+00	{"eTag": "\\"db04e20137720a3366f0a470bc735ccb\\"", "size": 14468, "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "cacheControl": "max-age=3600", "lastModified": "2026-02-13T05:55:07.000Z", "contentLength": 14468, "httpStatusCode": 200}	2e4e5b3c-ba35-4758-ac51-85a1e29ff0d0	8f064c44-6ed2-479d-a547-d1beaf8d4a06	{}
+815e502e-9fdd-4610-b011-e6c7097e08b5	resources	about_cards/1779969857725_blue.webp	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 12:04:17.872951+00	2026-05-28 12:04:17.872951+00	2026-05-28 12:04:17.872951+00	{"eTag": "\\"038ee50ea18420f10fa63952b7dac42c\\"", "size": 6636, "mimetype": "image/webp", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T12:04:18.000Z", "contentLength": 6636, "httpStatusCode": 200}	1a6d5e94-d2bb-44c0-93f5-62ac7ca62296	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 86b4ef81-c5ef-4ab2-b706-db51f925cc62	event_images	event_1772441673812.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-03-02 08:54:32.21534+00	2026-03-02 08:54:32.21534+00	2026-03-02 08:54:32.21534+00	{"eTag": "\\"988445ab6be8b89b3768b770e8e4ab63\\"", "size": 1037364, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-03-02T08:54:33.000Z", "contentLength": 1037364, "httpStatusCode": 200}	ee4431d5-644a-4fe3-956e-58fb05235ead	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-8e1f96d6-cc93-40bc-90d3-dea68c48f7b9	resources	home_timeline_header/1776163024113_ChatGPT_Image_Mar_6__2026__12_01_48_PM.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-14 10:37:05.519657+00	2026-04-14 10:37:05.519657+00	2026-04-14 10:37:05.519657+00	{"eTag": "\\"e8d77c96e78e4c9c9f675b0ccae79189\\"", "size": 1020045, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-14T10:37:06.000Z", "contentLength": 1020045, "httpStatusCode": 200}	b21300d4-c4b4-4ee2-b284-97858321aa6b	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 3db70ba2-aee1-433f-9b6d-11a7f1eeb12b	resources	.emptyFolderPlaceholder	\N	2025-12-26 08:24:36.312642+00	2025-12-26 08:24:36.312642+00	2025-12-26 08:24:36.312642+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2025-12-26T08:24:36.303Z", "contentLength": 0, "httpStatusCode": 200}	0736994d-1b72-4fb7-9fbb-fe68269cd8ab	\N	{}
 d71548c8-e04f-45db-861a-7eb6bef72a08	event_images	.emptyFolderPlaceholder	\N	2025-12-26 08:39:12.892654+00	2025-12-26 08:39:12.892654+00	2025-12-26 08:39:12.892654+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2025-12-26T08:39:12.885Z", "contentLength": 0, "httpStatusCode": 200}	14fac6ab-6a28-41e3-bc61-faf57ef765a0	\N	{}
 a17b9552-1ef9-43df-ac63-941f5915e06f	team-documents	.emptyFolderPlaceholder	\N	2025-12-26 11:17:38.033572+00	2025-12-26 11:17:38.033572+00	2025-12-26 11:17:38.033572+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2025-12-26T11:17:38.036Z", "contentLength": 0, "httpStatusCode": 200}	b5b4b55e-9689-4e44-9cc5-177c38892e62	\N	{}
 2eed9cfb-65f1-4547-8d02-2d533e3bc247	event_images	event_1770222166836.png	de2f5cb1-c1cf-48c9-a2c4-0d7f6dd6373c	2026-02-04 16:22:49.055869+00	2026-02-04 16:22:49.055869+00	2026-02-04 16:22:49.055869+00	{"eTag": "\\"988445ab6be8b89b3768b770e8e4ab63\\"", "size": 1037364, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-02-04T16:22:49.000Z", "contentLength": 1037364, "httpStatusCode": 200}	8b91d685-0128-45cf-80b7-3877d2ddfb8a	de2f5cb1-c1cf-48c9-a2c4-0d7f6dd6373c	{}
 710e0614-6e17-474f-9851-a219b43d3f60	event_images	event_1770222321163.png	de2f5cb1-c1cf-48c9-a2c4-0d7f6dd6373c	2026-02-04 16:25:22.617412+00	2026-02-04 16:25:22.617412+00	2026-02-04 16:25:22.617412+00	{"eTag": "\\"988445ab6be8b89b3768b770e8e4ab63\\"", "size": 1037364, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-02-04T16:25:23.000Z", "contentLength": 1037364, "httpStatusCode": 200}	5cd57df4-103e-43bf-8398-f1a052ac3ad5	de2f5cb1-c1cf-48c9-a2c4-0d7f6dd6373c	{}
 f8d5114e-5160-4592-8d1f-076047dbda91	ps-documents	8f064c44-6ed2-479d-a547-d1beaf8d4a06/5c568dba-9547-4dad-a9c5-2812a42eeb9a/1770962105789-letter (1).docx	8f064c44-6ed2-479d-a547-d1beaf8d4a06	2026-02-13 05:55:06.048355+00	2026-02-13 05:55:06.048355+00	2026-02-13 05:55:06.048355+00	{"eTag": "\\"db04e20137720a3366f0a470bc735ccb\\"", "size": 14468, "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "cacheControl": "max-age=3600", "lastModified": "2026-02-13T05:55:07.000Z", "contentLength": 14468, "httpStatusCode": 200}	869893bc-6a97-4742-8907-b9a7be7c94cd	8f064c44-6ed2-479d-a547-d1beaf8d4a06	{}
-5575ee56-f3ff-44e4-879d-827a607b96c4	resources	home_timeline_images/1776162948429_0_ChatGPT_Image_Mar_9__2026__11_48_30_PM.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-14 10:35:51.467881+00	2026-04-14 10:35:51.467881+00	2026-04-14 10:35:51.467881+00	{"eTag": "\\"8112285518fac30362733ae0190e0b96\\"", "size": 2407682, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-14T10:35:52.000Z", "contentLength": 2407682, "httpStatusCode": 200}	1d8f7b41-96b1-4d37-a041-01c74edcee67	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-400cb480-c98b-4924-bb3b-dbeaab00361d	resources	home_slider_images/1776244181679-ChatGPT_Image_Mar_9__2026__11_47_03_PM.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-15 09:10:04.666321+00	2026-04-15 09:10:04.666321+00	2026-04-15 09:10:04.666321+00	{"eTag": "\\"11d6667f07eb74d0900991f0e8a76be0\\"", "size": 2583856, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-15T09:10:05.000Z", "contentLength": 2583856, "httpStatusCode": 200}	a9093a51-2b44-4f05-a3cb-edd6c533c694	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-3cfa7d1a-963c-40dd-9361-7ad858ed282c	resources	home_hero_images/1779534780914-Geenovate-logo.jpg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-23 11:13:02.244571+00	2026-05-23 11:13:02.244571+00	2026-05-23 11:13:02.244571+00	{"eTag": "\\"6e75be07d57168edbfcc18c7d9ffea16\\"", "size": 31346, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-05-23T11:13:03.000Z", "contentLength": 31346, "httpStatusCode": 200}	202b2661-5ebf-48db-8c23-cd36ffb68ede	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
+9d546054-e146-400b-b4c9-9529ed40fb84	resources	home_timeline_header/.emptyFolderPlaceholder	\N	2026-05-28 12:09:07.851734+00	2026-05-28 12:09:07.851734+00	2026-05-28 12:09:07.851734+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T12:09:07.842Z", "contentLength": 0, "httpStatusCode": 200}	5a0d5b2f-c9f8-4545-bde0-ef9f785c75cd	\N	{}
 b3e01312-38f0-4b66-874d-d4db54d5ea25	resources	about_cards/.emptyFolderPlaceholder	\N	2026-05-25 07:23:19.31332+00	2026-05-25 07:23:19.31332+00	2026-05-25 07:23:19.31332+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2026-05-25T07:23:19.316Z", "contentLength": 0, "httpStatusCode": 200}	bdc5d70e-6f03-454e-ae25-d3c49a55df82	\N	{}
+c4f2cb9c-4f02-417e-80ee-5ee4e833969c	event_images	event_1779904352393.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-27 17:52:34.086789+00	2026-05-27 17:52:34.086789+00	2026-05-27 17:52:34.086789+00	{"eTag": "\\"2ec93adf606b53f2d16676d14d1e2008\\"", "size": 1265679, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-05-27T17:52:35.000Z", "contentLength": 1265679, "httpStatusCode": 200}	f53f7323-6b60-41e0-beb6-f4a508ecb77b	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
+aaa9937c-da65-48f5-b8e5-b934de2bfdb0	resources	home_timeline_images/1779949980574_0_20240302_111524.jpg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 06:33:01.639551+00	2026-05-28 06:33:01.639551+00	2026-05-28 06:33:01.639551+00	{"eTag": "\\"d9d5ee11207489acab077ad462bd9602-2\\"", "size": 7844607, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T06:33:02.000Z", "contentLength": 7844607, "httpStatusCode": 200}	2307aea6-5dd8-4a7d-9efc-e1453396d2c7	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 b963c8cb-61f3-4cca-8531-155cfa5dc8f2	event_images	event_1770789888356.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-02-11 06:04:55.405127+00	2026-02-11 06:04:55.405127+00	2026-02-11 06:04:55.405127+00	{"eTag": "\\"dea778f1645263899bbea196a59a62bd\\"", "size": 583398, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-02-11T06:04:56.000Z", "contentLength": 583398, "httpStatusCode": 200}	34333937-5dbe-47f5-a609-2b2166c711b9	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-5e4531f1-46f6-46d6-9195-ebb4649099e9	resources	home_hero_images/1776244223118-ChatGPT_Image_Mar_9__2026__11_39_04_PM.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-15 09:10:24.150316+00	2026-04-15 09:10:24.150316+00	2026-04-15 09:10:24.150316+00	{"eTag": "\\"11d6667f07eb74d0900991f0e8a76be0\\"", "size": 2583856, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-15T09:10:25.000Z", "contentLength": 2583856, "httpStatusCode": 200}	461816fd-6ad2-421b-a516-5e4883685421	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 dcabba5f-9388-4250-907b-d72a776a633b	resources	home_slider_images/1779534895422-blue.webp	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-23 11:14:56.20166+00	2026-05-23 11:14:56.20166+00	2026-05-23 11:14:56.20166+00	{"eTag": "\\"038ee50ea18420f10fa63952b7dac42c\\"", "size": 6636, "mimetype": "image/webp", "cacheControl": "max-age=3600", "lastModified": "2026-05-23T11:14:57.000Z", "contentLength": 6636, "httpStatusCode": 200}	590ab931-741a-4b94-83ae-791641353b34	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-f3571b0e-eefd-41b5-bbb9-0c78b21d74db	resources	home_timeline_header/1779534958330_0_system_flowchart.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-23 11:15:59.357846+00	2026-05-23 11:15:59.357846+00	2026-05-23 11:15:59.357846+00	{"eTag": "\\"b184b0a9eada9e3fc7991706ac84b24c\\"", "size": 57253, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-05-23T11:16:00.000Z", "contentLength": 57253, "httpStatusCode": 200}	db140e12-9fac-4f34-91d1-dcbebcd98085	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-34cd45ec-0155-47e4-9b83-fdf75bc37d16	resources	home_hero_images/1776246937222-ChatGPT_Image_Mar_10__2026__12_01_35_AM.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-15 09:55:39.82187+00	2026-04-15 09:55:39.82187+00	2026-04-15 09:55:39.82187+00	{"eTag": "\\"f209179accf0ec5e19062c9e660d2351\\"", "size": 2319721, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-15T09:55:40.000Z", "contentLength": 2319721, "httpStatusCode": 200}	5c7f0c45-a315-4799-9b2d-20694203def7	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
+6fab4716-dc97-4445-8024-2322e654a3ae	event_images	event_1779905902167.webp	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-27 18:18:22.374601+00	2026-05-27 18:18:22.374601+00	2026-05-27 18:18:22.374601+00	{"eTag": "\\"038ee50ea18420f10fa63952b7dac42c\\"", "size": 6636, "mimetype": "image/webp", "cacheControl": "max-age=3600", "lastModified": "2026-05-27T18:18:23.000Z", "contentLength": 6636, "httpStatusCode": 200}	66c67bb8-33be-44bf-8e77-6940297d57f0	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
+77072396-4499-4c86-a516-25177513e44f	event_images	event_1779906158133.webp	8f064c44-6ed2-479d-a547-d1beaf8d4a06	2026-05-27 18:22:38.500684+00	2026-05-27 18:22:38.500684+00	2026-05-27 18:22:38.500684+00	{"eTag": "\\"038ee50ea18420f10fa63952b7dac42c\\"", "size": 6636, "mimetype": "image/webp", "cacheControl": "max-age=3600", "lastModified": "2026-05-27T18:22:39.000Z", "contentLength": 6636, "httpStatusCode": 200}	267131e2-55a8-42a5-abac-7f8599eeb0f1	8f064c44-6ed2-479d-a547-d1beaf8d4a06	{}
+76fb0037-e0e7-46da-9556-978f36d88323	team-documents	f6e82f04-701a-4e83-84a9-b311eaed6db2_1779919707189_F_distributiin_table_0.01_level.pdf	f6e82f04-701a-4e83-84a9-b311eaed6db2	2026-05-28 07:25:53.479531+00	2026-05-28 07:25:53.479531+00	2026-05-28 07:25:53.479531+00	{"eTag": "\\"36d5308920096a27ce555f9f1519714f\\"", "size": 1670747, "mimetype": "application/pdf", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T07:25:54.000Z", "contentLength": 1670747, "httpStatusCode": 200}	95b187e3-3640-4589-b51a-b9365ecae39a	f6e82f04-701a-4e83-84a9-b311eaed6db2	{}
+46789e5b-3148-4825-9d29-9ce1af45240f	resources	home_timeline_icons/.emptyFolderPlaceholder	\N	2026-05-28 11:44:01.02444+00	2026-05-28 11:44:01.02444+00	2026-05-28 11:44:01.02444+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T11:44:01.014Z", "contentLength": 0, "httpStatusCode": 200}	984d648e-b234-4e33-9e7d-d9dcd0f8fbd7	\N	{}
+f96f012a-02bc-4ac6-a1b9-bf629145137c	resources	home_timeline_images/1780039084760_0_SwimLane.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-29 07:18:28.272907+00	2026-05-29 07:18:28.272907+00	2026-05-29 07:18:28.272907+00	{"eTag": "\\"222282675691770c021fb8b6f5823f43\\"", "size": 22936, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-05-29T07:18:29.000Z", "contentLength": 22936, "httpStatusCode": 200}	5b4ea0c0-44fa-4606-a0ff-fd99db56e0cb	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 e4a55a96-f5cb-4dd0-a4f5-60092ed29f42	team-documents	d0162e3c-be25-43b0-8e46-9a744f221149_1772884685613_Software_Engineering_Lab_1_.pptx	d0162e3c-be25-43b0-8e46-9a744f221149	2026-03-07 11:58:06.550174+00	2026-03-07 11:58:06.550174+00	2026-03-07 11:58:06.550174+00	{"eTag": "\\"71b154f41b0fcfb388f75614fdb4742b\\"", "size": 2747399, "mimetype": "application/vnd.openxmlformats-officedocument.presentationml.presentation", "cacheControl": "max-age=3600", "lastModified": "2026-03-07T11:58:07.000Z", "contentLength": 2747399, "httpStatusCode": 200}	469fe154-546e-4629-85e9-5421f0b12ede	d0162e3c-be25-43b0-8e46-9a744f221149	{}
+0d37d7e4-6250-449e-b64d-28afe739ce9f	resources	home_timeline_header/1780039175531_0_29thAugAgenda.jpg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-29 07:19:58.570508+00	2026-05-29 07:19:58.570508+00	2026-05-29 07:19:58.570508+00	{"eTag": "\\"211ad5ee608e173d45681e92d7d27b61\\"", "size": 140592, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-05-29T07:19:59.000Z", "contentLength": 140592, "httpStatusCode": 200}	e02bd43e-d3a6-4045-9e0b-1d0b0603a18d	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
+20e625b0-f1b0-4935-8147-a5f00ceeedbd	resources	about_cards/1780039224820_mukesh_kestwal.jpeg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-29 07:20:48.143347+00	2026-05-29 07:20:48.143347+00	2026-05-29 07:20:48.143347+00	{"eTag": "\\"fb3ac0a4240e387ede6e653f7ffe9bdb\\"", "size": 10077, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-05-29T07:20:49.000Z", "contentLength": 10077, "httpStatusCode": 200}	4220b790-f5c9-4230-9fc6-31d6d7e01c96	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 ae876233-7eb7-4cd7-ab7b-ca62197a0d2d	resources	shortlist_excel_1775894765880_24-3-26__1_.xlsx	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-11 08:06:07.073875+00	2026-04-11 08:06:07.073875+00	2026-04-11 08:06:07.073875+00	{"eTag": "\\"f2792c6f356dc8864cbc2888e4ef3053\\"", "size": 103282, "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "cacheControl": "max-age=3600", "lastModified": "2026-04-11T08:06:08.000Z", "contentLength": 103282, "httpStatusCode": 200}	5754c128-082a-452f-8499-a2f107aa3e47	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-98ce8fdf-142e-4480-98af-296e9d01d719	resources	home_timeline_header/1775903187723_SAVY_Emotion_System_Diagram.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-11 10:26:28.809196+00	2026-04-11 10:26:28.809196+00	2026-04-11 10:26:28.809196+00	{"eTag": "\\"c314efcaa7feaaf1d35bfc63e3678ade\\"", "size": 51465, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-11T10:26:29.000Z", "contentLength": 51465, "httpStatusCode": 200}	248d7bc6-8b46-4183-b344-f460f0f40283	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-89a96865-b78e-4798-8e6d-36cbb7e4b61e	resources	home_slider_images/1776062784762-wp5193369-demon-slayer-manga-wallpapers.jpg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-13 06:46:27.165672+00	2026-04-13 06:46:27.165672+00	2026-04-13 06:46:27.165672+00	{"eTag": "\\"f662ce0b144909a4f4e88f9d3b1fe452\\"", "size": 1906848, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-04-13T06:46:28.000Z", "contentLength": 1906848, "httpStatusCode": 200}	8809d911-254a-477b-9d9a-f748b28f9c6c	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-66744b42-114a-4d73-9829-32d284c4e2f0	resources	home_timeline_header/1776063653053_Idea__Vikas_-_All_Creatives__5_.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-13 07:00:54.48625+00	2026-04-13 07:00:54.48625+00	2026-04-13 07:00:54.48625+00	{"eTag": "\\"11fc8b7c890afc8b30ab5daff8c305c4\\"", "size": 393280, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-13T07:00:55.000Z", "contentLength": 393280, "httpStatusCode": 200}	ab85d7e5-431a-44bb-bb67-04de26ec582d	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-ec94f59c-75b4-46f9-8d14-459d5e61ddaf	resources	home_timeline_header/1776063795871_Startup_Utsav_Allotment_List__1_.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-13 07:03:17.122814+00	2026-04-13 07:03:17.122814+00	2026-04-13 07:03:17.122814+00	{"eTag": "\\"cc36807186672dc3d127fb19292fd9cc\\"", "size": 604634, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-13T07:03:18.000Z", "contentLength": 604634, "httpStatusCode": 200}	65a9f2c2-d362-46a8-8581-2201f332d549	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-ae94bdc1-c734-4626-a3b6-fc20b3f8446b	resources	home_timeline_icons/1776063946264_Burger.jpg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-13 07:05:47.24062+00	2026-04-13 07:05:47.24062+00	2026-04-13 07:05:47.24062+00	{"eTag": "\\"55bd5b3a7f51583338a5601329bad150\\"", "size": 231114, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-04-13T07:05:48.000Z", "contentLength": 231114, "httpStatusCode": 200}	be6d15e8-e2dd-4e49-84f7-e5ec1b354d7c	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-db7c4603-5486-4426-9e75-c14f38585ca2	resources	home_hero_images/1776246958552-ChatGPT_Image_Mar_10__2026__12_13_35_AM.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-15 09:55:59.699009+00	2026-04-15 09:55:59.699009+00	2026-04-15 09:55:59.699009+00	{"eTag": "\\"ac03ed2a7b78bc6b16df6a33b3b17065\\"", "size": 2229336, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-04-15T09:56:00.000Z", "contentLength": 2229336, "httpStatusCode": 200}	4c98ec2d-b452-4a2d-a85a-0969a338e66f	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
+23348825-0767-482e-81f3-650d4768df4b	event_images	event_1779894563476.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-27 15:09:25.150531+00	2026-05-27 15:09:25.150531+00	2026-05-27 15:09:25.150531+00	{"eTag": "\\"2ec93adf606b53f2d16676d14d1e2008\\"", "size": 1265679, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-05-27T15:09:26.000Z", "contentLength": 1265679, "httpStatusCode": 200}	634ae6e3-797c-469e-9a95-ee801f0c49b4	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
+9e1e0a97-764c-4fcb-88b6-191e3d0288f5	event_images	event_1779894767938.webp	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-27 15:12:49.51457+00	2026-05-27 15:12:49.51457+00	2026-05-27 15:12:49.51457+00	{"eTag": "\\"038ee50ea18420f10fa63952b7dac42c\\"", "size": 6636, "mimetype": "image/webp", "cacheControl": "max-age=3600", "lastModified": "2026-05-27T15:12:50.000Z", "contentLength": 6636, "httpStatusCode": 200}	c5ea3236-a487-49e4-8049-11bd43587e41	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
+169b898f-3056-49e3-a5ab-449aabe06fe9	resources	home_hero_images/1779969783058-Geenovate-logo.jpg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 12:03:02.898327+00	2026-05-28 12:03:02.898327+00	2026-05-28 12:03:02.898327+00	{"eTag": "\\"6e75be07d57168edbfcc18c7d9ffea16\\"", "size": 31346, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T12:03:03.000Z", "contentLength": 31346, "httpStatusCode": 200}	88ee1948-bfce-48e8-a08d-4724628d1f12	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 \.
 
 
@@ -5097,7 +5614,21 @@ COPY vault.secrets (id, name, description, secret, key_id, nonce, created_at, up
 -- Name: refresh_tokens_id_seq; Type: SEQUENCE SET; Schema: auth; Owner: supabase_auth_admin
 --
 
-SELECT pg_catalog.setval('auth.refresh_tokens_id_seq', 768, true);
+SELECT pg_catalog.setval('auth.refresh_tokens_id_seq', 1068, true);
+
+
+--
+-- Name: jobid_seq; Type: SEQUENCE SET; Schema: cron; Owner: supabase_admin
+--
+
+SELECT pg_catalog.setval('cron.jobid_seq', 1, true);
+
+
+--
+-- Name: runid_seq; Type: SEQUENCE SET; Schema: cron; Owner: supabase_admin
+--
+
+SELECT pg_catalog.setval('cron.runid_seq', 9, true);
 
 
 --
@@ -5403,6 +5934,14 @@ ALTER TABLE ONLY public.event_registrations
 
 
 --
+-- Name: events_archive events_archive_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.events_archive
+    ADD CONSTRAINT events_archive_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: events events_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -5680,6 +6219,14 @@ ALTER TABLE ONLY realtime.messages_2026_02_15
 
 ALTER TABLE ONLY realtime.messages_2026_02_16
     ADD CONSTRAINT messages_2026_02_16_pkey PRIMARY KEY (id, inserted_at);
+
+
+--
+-- Name: messages messages_payload_exclusive; Type: CHECK CONSTRAINT; Schema: realtime; Owner: supabase_realtime_admin
+--
+
+ALTER TABLE realtime.messages
+    ADD CONSTRAINT messages_payload_exclusive CHECK (((payload IS NULL) OR (binary_payload IS NULL))) NOT VALID;
 
 
 --
@@ -6416,10 +6963,10 @@ CREATE INDEX messages_2026_02_16_inserted_at_topic_idx ON realtime.messages_2026
 
 
 --
--- Name: subscription_subscription_id_entity_filters_action_filter_key; Type: INDEX; Schema: realtime; Owner: supabase_admin
+-- Name: subscription_subscription_id_entity_filters_action_filter_selec; Type: INDEX; Schema: realtime; Owner: supabase_admin
 --
 
-CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_key ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter);
+CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_selec ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter, COALESCE(selected_columns, '{}'::text[]));
 
 
 --
@@ -7240,147 +7787,10 @@ ALTER TABLE auth.sso_providers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auth.users ENABLE ROW LEVEL SECURITY;
 
 --
--- Name: problem_statement_remarks Admin can insert remarks; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admin can insert remarks" ON public.problem_statement_remarks FOR INSERT TO authenticated WITH CHECK (((auth.uid() = author_id) AND (EXISTS ( SELECT 1
-   FROM public.user_roles
-  WHERE ((user_roles.user_id = auth.uid()) AND (user_roles.role = 'admin'::public.app_role))))));
-
-
---
--- Name: problem_statement_remarks Admin can view remarks; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admin can view remarks" ON public.problem_statement_remarks FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
-   FROM public.user_roles
-  WHERE ((user_roles.user_id = auth.uid()) AND (user_roles.role = 'admin'::public.app_role)))));
-
-
---
--- Name: user_queries Admins can delete queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can delete queries" ON public.user_queries FOR DELETE USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: problem_statement_alerts Admins can insert alerts; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can insert alerts" ON public.problem_statement_alerts FOR INSERT TO authenticated WITH CHECK ((public.is_admin_user() OR (recipient_user_id = auth.uid())));
-
-
---
--- Name: event_registrations Admins can manage all event registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage all event registrations" ON public.event_registrations USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: user_roles Admins can manage all roles; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage all roles" ON public.user_roles TO authenticated USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: team_registrations Admins can manage all team registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage all team registrations" ON public.team_registrations USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
 -- Name: departments Admins can manage departments; Type: POLICY; Schema: public; Owner: postgres
 --
 
 CREATE POLICY "Admins can manage departments" ON public.departments TO authenticated USING (public.is_admin_user()) WITH CHECK (public.is_admin_user());
-
-
---
--- Name: events Admins can manage events; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage events" ON public.events USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: page_content Admins can manage page content; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage page content" ON public.page_content USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: problem_statements Admins can manage problem statements; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage problem statements" ON public.problem_statements TO authenticated USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: resources Admins can manage resources; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage resources" ON public.resources USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: problem_statement_reviews Admins can manage reviews; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage reviews" ON public.problem_statement_reviews TO authenticated USING (public.is_admin_user()) WITH CHECK (public.is_admin_user());
-
-
---
--- Name: user_queries Admins can update queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can update queries" ON public.user_queries FOR UPDATE USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: event_registrations Admins can view all event registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can view all event registrations" ON public.event_registrations FOR SELECT USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: profiles Admins can view all profiles; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can view all profiles" ON public.profiles FOR SELECT TO authenticated USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: user_queries Admins can view all queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can view all queries" ON public.user_queries FOR SELECT USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: user_roles Admins can view all roles; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can view all roles" ON public.user_roles FOR SELECT TO authenticated USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: tenants Allow public tenant reads; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Allow public tenant reads" ON public.tenants FOR SELECT TO authenticated, anon USING (true);
-
-
---
--- Name: user_queries Anyone can submit queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Anyone can submit queries" ON public.user_queries FOR INSERT WITH CHECK (((auth.uid() IS NOT NULL) OR ((user_email IS NOT NULL) AND (length(TRIM(BOTH FROM user_email)) > 0))));
 
 
 --
@@ -7391,244 +7801,87 @@ CREATE POLICY "Anyone can view departments" ON public.departments FOR SELECT USI
 
 
 --
--- Name: page_content Anyone can view page content; Type: POLICY; Schema: public; Owner: postgres
+-- Name: tenants Public can read tenants; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Anyone can view page content" ON public.page_content FOR SELECT USING (true);
+CREATE POLICY "Public can read tenants" ON public.tenants FOR SELECT TO anon USING (true);
 
 
 --
--- Name: problem_statements Anyone can view problem statements; Type: POLICY; Schema: public; Owner: postgres
+-- Name: problem_statements anon can read approved tenant problem statements; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Anyone can view problem statements" ON public.problem_statements FOR SELECT TO authenticated, anon USING (true);
+CREATE POLICY "anon can read approved tenant problem statements" ON public.problem_statements FOR SELECT TO anon USING (((tenant_id IS NOT NULL) AND (status = 'approved'::text)));
 
 
 --
--- Name: resources Anyone can view resources; Type: POLICY; Schema: public; Owner: postgres
+-- Name: contest_settings anon can read tenant contest settings; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Anyone can view resources" ON public.resources FOR SELECT USING (true);
+CREATE POLICY "anon can read tenant contest settings" ON public.contest_settings FOR SELECT TO anon USING ((tenant_id IS NOT NULL));
 
 
 --
--- Name: problem_statements Authenticated users can create own problem statements; Type: POLICY; Schema: public; Owner: postgres
+-- Name: events anon can read tenant events; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Authenticated users can create own problem statements" ON public.problem_statements FOR INSERT TO authenticated WITH CHECK ((public.is_admin_user() OR (created_by = auth.uid())));
+CREATE POLICY "anon can read tenant events" ON public.events FOR SELECT TO anon USING ((tenant_id IS NOT NULL));
 
 
 --
--- Name: problem_statement_remarks DeptAdmin can view remarks for own department; Type: POLICY; Schema: public; Owner: postgres
+-- Name: page_content anon can read tenant page content; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "DeptAdmin can view remarks for own department" ON public.problem_statement_remarks FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
-   FROM ((public.user_roles ur
-     JOIN public.profiles p ON ((p.id = ur.user_id)))
-     JOIN public.problem_statements ps ON ((ps.id = problem_statement_remarks.problem_statement_id)))
-  WHERE ((ur.user_id = auth.uid()) AND (ur.role = 'deptadmin'::public.app_role) AND (p.department_id = ps.department_id)))));
+CREATE POLICY "anon can read tenant page content" ON public.page_content FOR SELECT TO anon USING ((tenant_id IS NOT NULL));
 
 
 --
--- Name: events Everyone can view events; Type: POLICY; Schema: public; Owner: postgres
+-- Name: resources anon can read tenant resources; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Everyone can view events" ON public.events FOR SELECT USING (true);
+CREATE POLICY "anon can read tenant resources" ON public.resources FOR SELECT TO anon USING ((tenant_id IS NOT NULL));
 
 
 --
--- Name: problem_statements Owners can delete draft problem statements; Type: POLICY; Schema: public; Owner: postgres
+-- Name: user_queries anon can submit tenant queries; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Owners can delete draft problem statements" ON public.problem_statements FOR DELETE TO authenticated USING ((public.is_admin_user() OR ((created_by = auth.uid()) AND (COALESCE(status, 'draft'::text) = ANY (ARRAY['draft'::text, 'revision_needed'::text])))));
+CREATE POLICY "anon can submit tenant queries" ON public.user_queries FOR INSERT TO anon WITH CHECK (((tenant_id IS NOT NULL) AND (user_id IS NULL) AND (user_email IS NOT NULL) AND (length(TRIM(BOTH FROM user_email)) > 0)));
 
 
 --
--- Name: problem_statements Owners or admins can update problem statements; Type: POLICY; Schema: public; Owner: postgres
+-- Name: contest_settings authenticated can read own tenant contest settings; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Owners or admins can update problem statements" ON public.problem_statements FOR UPDATE TO authenticated USING ((public.is_admin_user() OR (created_by = auth.uid()))) WITH CHECK ((public.is_admin_user() OR (created_by = auth.uid())));
+CREATE POLICY "authenticated can read own tenant contest settings" ON public.contest_settings FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
 
 
 --
--- Name: submission_batch_items Users can access batch items they can access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: events authenticated can read own tenant events; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Users can access batch items they can access" ON public.submission_batch_items TO authenticated USING ((EXISTS ( SELECT 1
-   FROM public.submission_batches b
-  WHERE ((b.id = submission_batch_items.batch_id) AND (public.is_admin_user() OR (b.submitted_by = auth.uid()) OR ((b.department_id IS NOT NULL) AND (b.department_id = public.current_department_id()))))))) WITH CHECK ((EXISTS ( SELECT 1
-   FROM public.submission_batches b
-  WHERE ((b.id = submission_batch_items.batch_id) AND (public.is_admin_user() OR (b.submitted_by = auth.uid()) OR ((b.department_id IS NOT NULL) AND (b.department_id = public.current_department_id())))))));
+CREATE POLICY "authenticated can read own tenant events" ON public.events FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
 
 
 --
--- Name: problem_statement_attachments Users can delete own attachments or admins; Type: POLICY; Schema: public; Owner: postgres
+-- Name: page_content authenticated can read own tenant page content; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Users can delete own attachments or admins" ON public.problem_statement_attachments FOR DELETE TO authenticated USING ((public.is_admin_user() OR (uploaded_by = auth.uid())));
+CREATE POLICY "authenticated can read own tenant page content" ON public.page_content FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
 
 
 --
--- Name: problem_statement_messages Users can insert accessible messages; Type: POLICY; Schema: public; Owner: postgres
+-- Name: problem_statements authenticated can read own tenant problem statements; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Users can insert accessible messages" ON public.problem_statement_messages FOR INSERT TO authenticated WITH CHECK ((public.can_access_problem_statement(problem_statement_id) AND ((sender_id IS NULL) OR (sender_id = auth.uid()))));
+CREATE POLICY "authenticated can read own tenant problem statements" ON public.problem_statements FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND ((status = 'approved'::text) OR (created_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
 
 
 --
--- Name: problem_statement_attachments Users can insert own attachments; Type: POLICY; Schema: public; Owner: postgres
+-- Name: resources authenticated can read own tenant resources; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Users can insert own attachments" ON public.problem_statement_attachments FOR INSERT TO authenticated WITH CHECK ((public.can_access_problem_statement(problem_statement_id) AND ((uploaded_by IS NULL) OR (uploaded_by = auth.uid()))));
-
-
---
--- Name: event_registrations Users can insert own event registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can insert own event registrations" ON public.event_registrations FOR INSERT WITH CHECK ((auth.uid() = user_id));
-
-
---
--- Name: submission_batches Users can insert own submission batches; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can insert own submission batches" ON public.submission_batches FOR INSERT TO authenticated WITH CHECK ((public.is_admin_user() OR (submitted_by = auth.uid())));
-
-
---
--- Name: team_registrations Users can insert own team registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can insert own team registrations" ON public.team_registrations FOR INSERT WITH CHECK ((auth.uid() = user_id));
-
-
---
--- Name: profiles Users can insert their own profile; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can insert their own profile" ON public.profiles FOR INSERT TO authenticated WITH CHECK ((auth.uid() = id));
-
-
---
--- Name: problem_statement_alerts Users can update own alerts; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update own alerts" ON public.problem_statement_alerts FOR UPDATE TO authenticated USING (((recipient_user_id = auth.uid()) OR public.is_admin_user())) WITH CHECK (((recipient_user_id = auth.uid()) OR public.is_admin_user()));
-
-
---
--- Name: submission_batches Users can update own submission batches; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update own submission batches" ON public.submission_batches FOR UPDATE TO authenticated USING ((public.is_admin_user() OR (submitted_by = auth.uid()))) WITH CHECK ((public.is_admin_user() OR (submitted_by = auth.uid())));
-
-
---
--- Name: team_registrations Users can update own team registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update own team registrations" ON public.team_registrations FOR UPDATE USING ((auth.uid() = user_id));
-
-
---
--- Name: problem_statement_messages Users can update read status of accessible messages; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update read status of accessible messages" ON public.problem_statement_messages FOR UPDATE TO authenticated USING (public.can_access_problem_statement(problem_statement_id)) WITH CHECK (public.can_access_problem_statement(problem_statement_id));
-
-
---
--- Name: profiles Users can update their own profile; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update their own profile" ON public.profiles FOR UPDATE TO authenticated USING ((auth.uid() = id));
-
-
---
--- Name: problem_statement_attachments Users can view accessible attachments; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view accessible attachments" ON public.problem_statement_attachments FOR SELECT TO authenticated USING (public.can_access_problem_statement(problem_statement_id));
-
-
---
--- Name: problem_statement_messages Users can view accessible messages; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view accessible messages" ON public.problem_statement_messages FOR SELECT TO authenticated USING (public.can_access_problem_statement(problem_statement_id));
-
-
---
--- Name: problem_statement_alerts Users can view own alerts; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view own alerts" ON public.problem_statement_alerts FOR SELECT TO authenticated USING (((recipient_user_id = auth.uid()) OR public.is_admin_user()));
-
-
---
--- Name: event_registrations Users can view own event registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view own event registrations" ON public.event_registrations FOR SELECT USING ((auth.uid() = user_id));
-
-
---
--- Name: team_registrations Users can view own team registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view own team registrations" ON public.team_registrations FOR SELECT USING ((auth.uid() = user_id));
-
-
---
--- Name: submission_batches Users can view relevant submission batches; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view relevant submission batches" ON public.submission_batches FOR SELECT TO authenticated USING ((public.is_admin_user() OR (submitted_by = auth.uid()) OR ((department_id IS NOT NULL) AND (department_id = public.current_department_id()))));
-
-
---
--- Name: problem_statement_reviews Users can view reviews for accessible problem statements; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view reviews for accessible problem statements" ON public.problem_statement_reviews FOR SELECT TO authenticated USING (public.can_access_problem_statement(problem_statement_id));
-
-
---
--- Name: profiles Users can view their own profile; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view their own profile" ON public.profiles FOR SELECT TO authenticated USING ((auth.uid() = id));
-
-
---
--- Name: user_queries Users can view their own queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view their own queries" ON public.user_queries FOR SELECT USING (((auth.uid() = user_id) OR (user_id IS NULL)));
-
-
---
--- Name: user_roles Users can view their own roles; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view their own roles" ON public.user_roles FOR SELECT TO authenticated USING ((auth.uid() = user_id));
-
-
---
--- Name: problem_statement_remarks admin update remarks; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "admin update remarks" ON public.problem_statement_remarks FOR UPDATE USING ((EXISTS ( SELECT 1
-   FROM public.user_roles
-  WHERE ((user_roles.user_id = auth.uid()) AND (user_roles.role = 'admin'::public.app_role)))));
-
-
---
--- Name: contest_settings allow reading contest settings; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "allow reading contest settings" ON public.contest_settings FOR SELECT TO authenticated, anon USING (true);
+CREATE POLICY "authenticated can read own tenant resources" ON public.resources FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
 
 
 --
@@ -7656,21 +7909,16 @@ ALTER TABLE public.event_registrations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: events_archive; Type: ROW SECURITY; Schema: public; Owner: postgres
+--
+
+ALTER TABLE public.events_archive ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: page_content; Type: ROW SECURITY; Schema: public; Owner: postgres
 --
 
 ALTER TABLE public.page_content ENABLE ROW LEVEL SECURITY;
-
---
--- Name: problem_statements problem statements visibility control; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "problem statements visibility control" ON public.problem_statements FOR SELECT TO authenticated USING (((EXISTS ( SELECT 1
-   FROM public.user_roles
-  WHERE ((user_roles.user_id = auth.uid()) AND (user_roles.role = 'admin'::public.app_role)))) OR (now() >= ( SELECT contest_settings.problems_unlock_at
-   FROM public.contest_settings
- LIMIT 1))));
-
 
 --
 -- Name: problem_statement_alerts; Type: ROW SECURITY; Schema: public; Owner: postgres
@@ -7715,10 +7963,107 @@ ALTER TABLE public.problem_statements ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: tenants public can read tenant slugs; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "public can read tenant slugs" ON public.tenants FOR SELECT TO authenticated, anon USING (true);
+
+
+--
 -- Name: resources; Type: ROW SECURITY; Schema: public; Owner: postgres
 --
 
 ALTER TABLE public.resources ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: problem_statements same tenant admins can delete problem statements; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant admins can delete problem statements" ON public.problem_statements FOR DELETE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
+-- Name: problem_statement_alerts same tenant can access alerts; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access alerts" ON public.problem_statement_alerts TO authenticated USING ((public.same_tenant(tenant_id) AND ((recipient_user_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((recipient_user_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statement_attachments same tenant can access attachments; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access attachments" ON public.problem_statement_attachments TO authenticated USING ((public.same_tenant(tenant_id) AND ((uploaded_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((uploaded_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statement_messages same tenant can access messages; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access messages" ON public.problem_statement_messages TO authenticated USING ((public.same_tenant(tenant_id) AND ((sender_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((sender_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statement_remarks same tenant can access remarks; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access remarks" ON public.problem_statement_remarks TO authenticated USING ((public.same_tenant(tenant_id) AND ((author_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((author_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: submission_batch_items same tenant can access submission batch items; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access submission batch items" ON public.submission_batch_items TO authenticated USING ((EXISTS ( SELECT 1
+   FROM public.submission_batches b
+  WHERE ((b.id = submission_batch_items.batch_id) AND public.same_tenant(b.tenant_id) AND ((b.submitted_by = auth.uid()) OR public.is_tenant_admin(b.tenant_id) OR public.is_tenant_deptadmin(b.tenant_id)))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM public.submission_batches b
+  WHERE ((b.id = submission_batch_items.batch_id) AND public.same_tenant(b.tenant_id) AND ((b.submitted_by = auth.uid()) OR public.is_tenant_admin(b.tenant_id) OR public.is_tenant_deptadmin(b.tenant_id))))));
+
+
+--
+-- Name: problem_statements same tenant can create problem statements; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can create problem statements" ON public.problem_statements FOR INSERT TO authenticated WITH CHECK ((public.same_tenant(tenant_id) AND ((created_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: submission_batches same tenant can insert submission batches; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can insert submission batches" ON public.submission_batches FOR INSERT TO authenticated WITH CHECK ((public.same_tenant(tenant_id) AND ((submitted_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statements same tenant can update problem statements; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can update problem statements" ON public.problem_statements FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND ((created_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((created_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: submission_batches same tenant can update submission batches; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can update submission batches" ON public.submission_batches FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND ((submitted_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((submitted_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statement_reviews same tenant can view reviews; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can view reviews" ON public.problem_statement_reviews FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
+   FROM public.problem_statements ps
+  WHERE ((ps.id = problem_statement_reviews.problem_statement_id) AND public.same_tenant(ps.tenant_id) AND (public.is_tenant_admin(ps.tenant_id) OR public.is_tenant_deptadmin(ps.tenant_id) OR (ps.created_by = auth.uid()))))));
+
+
+--
+-- Name: submission_batches same tenant can view submission batches; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can view submission batches" ON public.submission_batches FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND ((submitted_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
 
 --
 -- Name: submission_batch_items; Type: ROW SECURITY; Schema: public; Owner: postgres
@@ -7739,113 +8084,95 @@ ALTER TABLE public.submission_batches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.team_registrations ENABLE ROW LEVEL SECURITY;
 
 --
--- Name: problem_statement_alerts tenant alerts access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: user_queries tenant admins can delete tenant queries; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant alerts access" ON public.problem_statement_alerts TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can delete tenant queries" ON public.user_queries FOR DELETE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: problem_statement_attachments tenant attachments access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: team_registrations tenant admins can delete tenant registrations; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant attachments access" ON public.problem_statement_attachments TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can delete tenant registrations" ON public.team_registrations FOR DELETE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: problem_statement_messages tenant messages access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: contest_settings tenant admins can manage contest settings; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant messages access" ON public.problem_statement_messages TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can manage contest settings" ON public.contest_settings TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: problem_statements tenant problem statements insert; Type: POLICY; Schema: public; Owner: postgres
+-- Name: events tenant admins can manage events; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant problem statements insert" ON public.problem_statements FOR INSERT TO authenticated WITH CHECK ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can manage events" ON public.events TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: problem_statements tenant problem statements select; Type: POLICY; Schema: public; Owner: postgres
+-- Name: page_content tenant admins can manage page content; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant problem statements select" ON public.problem_statements FOR SELECT TO authenticated, anon USING (true);
-
-
---
--- Name: problem_statements tenant problem statements update; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "tenant problem statements update" ON public.problem_statements FOR UPDATE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
-   FROM public.user_roles ur
-  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+CREATE POLICY "tenant admins can manage page content" ON public.page_content TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: team_registrations tenant registrations delete; Type: POLICY; Schema: public; Owner: postgres
+-- Name: resources tenant admins can manage resources; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant registrations delete" ON public.team_registrations FOR DELETE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
-   FROM public.user_roles ur
-  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+CREATE POLICY "tenant admins can manage resources" ON public.resources TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: team_registrations tenant registrations select; Type: POLICY; Schema: public; Owner: postgres
+-- Name: problem_statement_reviews tenant admins can manage reviews; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant registrations select" ON public.team_registrations FOR SELECT TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
-
-
---
--- Name: team_registrations tenant registrations update; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "tenant registrations update" ON public.team_registrations FOR UPDATE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
-   FROM public.user_roles ur
-  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+CREATE POLICY "tenant admins can manage reviews" ON public.problem_statement_reviews TO authenticated USING ((EXISTS ( SELECT 1
+   FROM public.problem_statements ps
+  WHERE ((ps.id = problem_statement_reviews.problem_statement_id) AND public.same_tenant(ps.tenant_id) AND (public.is_tenant_admin(ps.tenant_id) OR public.is_tenant_deptadmin(ps.tenant_id)))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM public.problem_statements ps
+  WHERE ((ps.id = problem_statement_reviews.problem_statement_id) AND public.same_tenant(ps.tenant_id) AND (public.is_tenant_admin(ps.tenant_id) OR public.is_tenant_deptadmin(ps.tenant_id))))));
 
 
 --
--- Name: problem_statement_remarks tenant remarks access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: event_registrations tenant admins can manage tenant event registrations; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant remarks access" ON public.problem_statement_remarks TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
-
-
---
--- Name: resources tenant resources select; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "tenant resources select" ON public.resources FOR SELECT TO authenticated, anon USING (true);
+CREATE POLICY "tenant admins can manage tenant event registrations" ON public.event_registrations FOR UPDATE TO authenticated USING ((EXISTS ( SELECT 1
+   FROM public.events e
+  WHERE ((e.id = event_registrations.event_id) AND public.same_tenant(e.tenant_id) AND public.is_tenant_admin(e.tenant_id))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM public.events e
+  WHERE ((e.id = event_registrations.event_id) AND public.same_tenant(e.tenant_id) AND public.is_tenant_admin(e.tenant_id)))));
 
 
 --
--- Name: resources tenant resources update; Type: POLICY; Schema: public; Owner: postgres
+-- Name: user_roles tenant admins can manage tenant roles; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant resources update" ON public.resources FOR UPDATE TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can manage tenant roles" ON public.user_roles TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
+-- Name: profiles tenant admins can update tenant profiles; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant admins can update tenant profiles" ON public.profiles FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
+-- Name: user_queries tenant admins can update tenant queries; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant admins can update tenant queries" ON public.user_queries FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
+-- Name: profiles tenant admins can view tenant profiles; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant admins can view tenant profiles" ON public.profiles FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
@@ -7865,6 +8192,87 @@ ALTER TABLE public.user_queries ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: event_registrations users can insert own tenant event registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can insert own tenant event registrations" ON public.event_registrations FOR INSERT TO authenticated WITH CHECK (((user_id = auth.uid()) AND (EXISTS ( SELECT 1
+   FROM public.events e
+  WHERE ((e.id = event_registrations.event_id) AND public.same_tenant(e.tenant_id))))));
+
+
+--
+-- Name: profiles users can insert own tenant profile; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can insert own tenant profile" ON public.profiles FOR INSERT TO authenticated WITH CHECK (((id = auth.uid()) AND (tenant_id IS NOT NULL)));
+
+
+--
+-- Name: team_registrations users can insert own tenant registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can insert own tenant registrations" ON public.team_registrations FOR INSERT TO authenticated WITH CHECK ((public.same_tenant(tenant_id) AND (user_id = auth.uid())));
+
+
+--
+-- Name: user_queries users can submit own tenant queries; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can submit own tenant queries" ON public.user_queries FOR INSERT TO authenticated WITH CHECK ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR (user_id IS NULL))));
+
+
+--
+-- Name: profiles users can update own tenant profile; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can update own tenant profile" ON public.profiles FOR UPDATE TO authenticated USING (((id = auth.uid()) AND public.same_tenant(tenant_id))) WITH CHECK (((id = auth.uid()) AND public.same_tenant(tenant_id)));
+
+
+--
+-- Name: team_registrations users can update own tenant registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can update own tenant registrations" ON public.team_registrations FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR public.is_tenant_admin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR public.is_tenant_admin(tenant_id))));
+
+
+--
+-- Name: event_registrations users can view own tenant event registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant event registrations" ON public.event_registrations FOR SELECT TO authenticated USING (((user_id = auth.uid()) OR (EXISTS ( SELECT 1
+   FROM public.events e
+  WHERE ((e.id = event_registrations.event_id) AND public.same_tenant(e.tenant_id) AND public.is_tenant_admin(e.tenant_id))))));
+
+
+--
+-- Name: profiles users can view own tenant profile; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant profile" ON public.profiles FOR SELECT TO authenticated USING (((id = auth.uid()) AND public.same_tenant(tenant_id)));
+
+
+--
+-- Name: user_queries users can view own tenant queries; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant queries" ON public.user_queries FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR public.is_tenant_admin(tenant_id))));
+
+
+--
+-- Name: team_registrations users can view own tenant registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant registrations" ON public.team_registrations FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: user_roles users can view own tenant roles; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant roles" ON public.user_roles FOR SELECT TO authenticated USING (((user_id = auth.uid()) AND public.same_tenant(tenant_id)));
+
 
 --
 -- Name: messages; Type: ROW SECURITY; Schema: realtime; Owner: supabase_realtime_admin
@@ -8140,6 +8548,16 @@ GRANT USAGE ON SCHEMA auth TO postgres;
 
 
 --
+-- Name: SCHEMA cron; Type: ACL; Schema: -; Owner: supabase_admin
+--
+
+GRANT USAGE ON SCHEMA cron TO postgres WITH GRANT OPTION;
+SET SESSION AUTHORIZATION postgres;
+GRANT USAGE ON SCHEMA cron TO postgres;
+RESET SESSION AUTHORIZATION;
+
+
+--
 -- Name: SCHEMA extensions; Type: ACL; Schema: -; Owner: postgres
 --
 
@@ -8217,6 +8635,55 @@ GRANT ALL ON FUNCTION auth.role() TO dashboard_user;
 --
 
 GRANT ALL ON FUNCTION auth.uid() TO dashboard_user;
+
+
+--
+-- Name: FUNCTION alter_job(job_id bigint, schedule text, command text, database text, username text, active boolean); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.alter_job(job_id bigint, schedule text, command text, database text, username text, active boolean) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION job_cache_invalidate(); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.job_cache_invalidate() TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION schedule(schedule text, command text); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.schedule(schedule text, command text) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION schedule(job_name text, schedule text, command text); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.schedule(job_name text, schedule text, command text) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION schedule_in_database(job_name text, schedule text, command text, database text, username text, active boolean); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.schedule_in_database(job_name text, schedule text, command text, database text, username text, active boolean) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION unschedule(job_id bigint); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.unschedule(job_id bigint) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION unschedule(job_name text); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.unschedule(job_name text) TO postgres WITH GRANT OPTION;
 
 
 --
@@ -8732,6 +9199,24 @@ GRANT ALL ON FUNCTION pgbouncer.get_auth(p_usename text) TO pgbouncer;
 
 
 --
+-- Name: FUNCTION archive_completed_events(p_older_than interval); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.archive_completed_events(p_older_than interval) TO anon;
+GRANT ALL ON FUNCTION public.archive_completed_events(p_older_than interval) TO authenticated;
+GRANT ALL ON FUNCTION public.archive_completed_events(p_older_than interval) TO service_role;
+
+
+--
+-- Name: FUNCTION archive_past_events(p_older_than interval); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.archive_past_events(p_older_than interval) TO anon;
+GRANT ALL ON FUNCTION public.archive_past_events(p_older_than interval) TO authenticated;
+GRANT ALL ON FUNCTION public.archive_past_events(p_older_than interval) TO service_role;
+
+
+--
 -- Name: FUNCTION can_access_problem_statement(ps_id uuid); Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -8765,6 +9250,15 @@ GRANT ALL ON FUNCTION public.check_team_name_exists(team_name_input text) TO ser
 GRANT ALL ON FUNCTION public.current_department_id() TO anon;
 GRANT ALL ON FUNCTION public.current_department_id() TO authenticated;
 GRANT ALL ON FUNCTION public.current_department_id() TO service_role;
+
+
+--
+-- Name: FUNCTION current_tenant_id(); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.current_tenant_id() TO anon;
+GRANT ALL ON FUNCTION public.current_tenant_id() TO authenticated;
+GRANT ALL ON FUNCTION public.current_tenant_id() TO service_role;
 
 
 --
@@ -8804,6 +9298,15 @@ GRANT ALL ON FUNCTION public.has_role(_user_id uuid, _role public.app_role) TO s
 
 
 --
+-- Name: FUNCTION has_tenant_role(_role public.app_role, _tenant_id uuid); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) TO anon;
+GRANT ALL ON FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) TO service_role;
+
+
+--
 -- Name: FUNCTION increment_curr_registrations(problem_uuid uuid); Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -8822,12 +9325,39 @@ GRANT ALL ON FUNCTION public.is_admin_user() TO service_role;
 
 
 --
+-- Name: FUNCTION is_tenant_admin(_tenant_id uuid); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.is_tenant_admin(_tenant_id uuid) TO anon;
+GRANT ALL ON FUNCTION public.is_tenant_admin(_tenant_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION public.is_tenant_admin(_tenant_id uuid) TO service_role;
+
+
+--
+-- Name: FUNCTION is_tenant_deptadmin(_tenant_id uuid); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) TO anon;
+GRANT ALL ON FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) TO service_role;
+
+
+--
 -- Name: FUNCTION problem_statements_set_defaults(); Type: ACL; Schema: public; Owner: postgres
 --
 
 GRANT ALL ON FUNCTION public.problem_statements_set_defaults() TO anon;
 GRANT ALL ON FUNCTION public.problem_statements_set_defaults() TO authenticated;
 GRANT ALL ON FUNCTION public.problem_statements_set_defaults() TO service_role;
+
+
+--
+-- Name: FUNCTION same_tenant(_tenant_id uuid); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.same_tenant(_tenant_id uuid) TO anon;
+GRANT ALL ON FUNCTION public.same_tenant(_tenant_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION public.same_tenant(_tenant_id uuid) TO service_role;
 
 
 --
@@ -8846,6 +9376,24 @@ GRANT ALL ON FUNCTION public.set_updated_at() TO service_role;
 GRANT ALL ON FUNCTION public.sync_profile_role() TO anon;
 GRANT ALL ON FUNCTION public.sync_profile_role() TO authenticated;
 GRANT ALL ON FUNCTION public.sync_profile_role() TO service_role;
+
+
+--
+-- Name: FUNCTION sync_profiles_from_user_roles(); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.sync_profiles_from_user_roles() TO anon;
+GRANT ALL ON FUNCTION public.sync_profiles_from_user_roles() TO authenticated;
+GRANT ALL ON FUNCTION public.sync_profiles_from_user_roles() TO service_role;
+
+
+--
+-- Name: FUNCTION sync_user_roles_from_profiles(); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.sync_user_roles_from_profiles() TO anon;
+GRANT ALL ON FUNCTION public.sync_user_roles_from_profiles() TO authenticated;
+GRANT ALL ON FUNCTION public.sync_user_roles_from_profiles() TO service_role;
 
 
 --
@@ -8945,6 +9493,14 @@ GRANT ALL ON FUNCTION realtime.send(payload jsonb, event text, topic text, priva
 
 
 --
+-- Name: FUNCTION send_binary(payload bytea, event text, topic text, private boolean); Type: ACL; Schema: realtime; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean) TO postgres;
+GRANT ALL ON FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean) TO dashboard_user;
+
+
+--
 -- Name: FUNCTION subscription_check_filters(); Type: ACL; Schema: realtime; Owner: supabase_admin
 --
 
@@ -8974,6 +9530,14 @@ GRANT ALL ON FUNCTION realtime.to_regrole(role_name text) TO supabase_realtime_a
 
 GRANT ALL ON FUNCTION realtime.topic() TO postgres;
 GRANT ALL ON FUNCTION realtime.topic() TO dashboard_user;
+
+
+--
+-- Name: FUNCTION wal2json_escape_identifier(name text); Type: ACL; Schema: realtime; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION realtime.wal2json_escape_identifier(name text) TO postgres;
+GRANT ALL ON FUNCTION realtime.wal2json_escape_identifier(name text) TO dashboard_user;
 
 
 --
@@ -9207,6 +9771,26 @@ GRANT ALL ON TABLE auth.webauthn_credentials TO dashboard_user;
 
 
 --
+-- Name: TABLE job; Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT SELECT ON TABLE cron.job TO postgres WITH GRANT OPTION;
+SET SESSION AUTHORIZATION postgres;
+GRANT SELECT ON TABLE cron.job TO postgres;
+RESET SESSION AUTHORIZATION;
+
+
+--
+-- Name: TABLE job_run_details; Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON TABLE cron.job_run_details TO postgres WITH GRANT OPTION;
+SET SESSION AUTHORIZATION postgres;
+GRANT ALL ON TABLE cron.job_run_details TO postgres;
+RESET SESSION AUTHORIZATION;
+
+
+--
 -- Name: TABLE pg_stat_statements; Type: ACL; Schema: extensions; Owner: postgres
 --
 
@@ -9258,6 +9842,15 @@ GRANT ALL ON TABLE public.event_registrations TO service_role;
 GRANT ALL ON TABLE public.events TO anon;
 GRANT ALL ON TABLE public.events TO authenticated;
 GRANT ALL ON TABLE public.events TO service_role;
+
+
+--
+-- Name: TABLE events_archive; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON TABLE public.events_archive TO anon;
+GRANT ALL ON TABLE public.events_archive TO authenticated;
+GRANT ALL ON TABLE public.events_archive TO service_role;
 
 
 --
@@ -9601,6 +10194,27 @@ ALTER DEFAULT PRIVILEGES FOR ROLE supabase_auth_admin IN SCHEMA auth GRANT ALL O
 
 
 --
+-- Name: DEFAULT PRIVILEGES FOR SEQUENCES; Type: DEFAULT ACL; Schema: cron; Owner: supabase_admin
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA cron GRANT ALL ON SEQUENCES TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR FUNCTIONS; Type: DEFAULT ACL; Schema: cron; Owner: supabase_admin
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA cron GRANT ALL ON FUNCTIONS TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: cron; Owner: supabase_admin
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA cron GRANT ALL ON TABLES TO postgres WITH GRANT OPTION;
+
+
+--
 -- Name: DEFAULT PRIVILEGES FOR SEQUENCES; Type: DEFAULT ACL; Schema: extensions; Owner: supabase_admin
 --
 
@@ -9863,5 +10477,5 @@ ALTER EVENT TRIGGER pgrst_drop_watch OWNER TO supabase_admin;
 -- PostgreSQL database dump complete
 --
 
-\unrestrict R1robehfQ2TnWua9EkG1fU44ixlQhTFeZeT5U8R1eS6plBFa9rQk1LAuiw1DOLC
+\unrestrict zNBmaSPEVW02Irboi5BooricXbleH5JVGtGOfWFqFABTmxtwIcQjVvX2v6Z9oCY
 

@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict NBUkwZgW6O4SPQ3Jc1DqfFSUwdhZRU8jWdddO6l8FcvvxNg8lsOaQ4oOYQEoKef
+\restrict 4T7IjG2dq41gFbEnmw1bYT30CbDAcvZpOhf3Ixgb05KUc7a4S7rqxkeue4ghT6e
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 18.3
@@ -27,6 +27,20 @@ CREATE SCHEMA auth;
 
 
 ALTER SCHEMA auth OWNER TO supabase_admin;
+
+--
+-- Name: pg_cron; Type: EXTENSION; Schema: -; Owner: -
+--
+
+CREATE EXTENSION IF NOT EXISTS pg_cron WITH SCHEMA pg_catalog;
+
+
+--
+-- Name: EXTENSION pg_cron; Type: COMMENT; Schema: -; Owner: 
+--
+
+COMMENT ON EXTENSION pg_cron IS 'Job scheduler for PostgreSQL';
+
 
 --
 -- Name: extensions; Type: SCHEMA; Schema: -; Owner: postgres
@@ -824,6 +838,56 @@ CREATE FUNCTION pgbouncer.get_auth(p_usename text) RETURNS TABLE(username text, 
 ALTER FUNCTION pgbouncer.get_auth(p_usename text) OWNER TO supabase_admin;
 
 --
+-- Name: archive_completed_events(interval); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.archive_completed_events(p_older_than interval DEFAULT '00:00:00'::interval) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+BEGIN
+  -- Move rows into archive
+  WITH moved AS (
+    INSERT INTO public.events_archive
+    SELECT *
+    FROM public.events
+    WHERE (status = 'completed' OR end_at < now())
+      AND (p_older_than IS NULL OR end_at < now() - p_older_than)
+    RETURNING id
+  )
+  DELETE FROM public.events e
+  USING moved m
+  WHERE e.id = m.id;
+END;
+$$;
+
+
+ALTER FUNCTION public.archive_completed_events(p_older_than interval) OWNER TO postgres;
+
+--
+-- Name: archive_past_events(interval); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.archive_past_events(p_older_than interval DEFAULT '00:00:00'::interval) RETURNS void
+    LANGUAGE plpgsql SECURITY DEFINER
+    AS $$
+BEGIN
+  WITH moved AS (
+    INSERT INTO public.events_archive
+    SELECT *
+    FROM public.events
+    WHERE event_date < now() - p_older_than
+    RETURNING id
+  )
+  DELETE FROM public.events e
+  USING moved m
+  WHERE e.id = m.id;
+END;
+$$;
+
+
+ALTER FUNCTION public.archive_past_events(p_older_than interval) OWNER TO postgres;
+
+--
 -- Name: can_access_problem_statement(uuid); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -894,6 +958,23 @@ $$;
 ALTER FUNCTION public.current_department_id() OWNER TO postgres;
 
 --
+-- Name: current_tenant_id(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.current_tenant_id() RETURNS uuid
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select p.tenant_id
+  from public.profiles p
+  where p.id = auth.uid()
+  limit 1
+$$;
+
+
+ALTER FUNCTION public.current_tenant_id() OWNER TO postgres;
+
+--
 -- Name: deactivate_past_events(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -937,17 +1018,74 @@ CREATE FUNCTION public.handle_new_user() RETURNS trigger
     LANGUAGE plpgsql SECURITY DEFINER
     SET search_path TO 'public'
     AS $$
+DECLARE
+  v_tenant_id uuid;
 BEGIN
-  INSERT INTO public.profiles (id, name, email, role)
-  VALUES (
-    NEW.id,
-    COALESCE(NEW.raw_user_meta_data ->> 'name', ''),
-    NEW.email,
-    'student'
-  );
+  -- Safely parse tenant_id to avoid casting exceptions
+  BEGIN
+    IF NEW.raw_user_meta_data ->> 'tenant_id' IS NOT NULL AND NEW.raw_user_meta_data ->> 'tenant_id' <> '' THEN
+      v_tenant_id := (NEW.raw_user_meta_data ->> 'tenant_id')::uuid;
+    END IF;
+  EXCEPTION WHEN OTHERS THEN
+    v_tenant_id := NULL;
+  END;
 
-  INSERT INTO public.user_roles (user_id, role)
-  VALUES (NEW.id, 'student');
+  -- Verify if the tenant actually exists in the tenants table to avoid foreign key violations
+  IF v_tenant_id IS NOT NULL THEN
+    IF NOT EXISTS (SELECT 1 FROM public.tenants WHERE id = v_tenant_id) THEN
+      v_tenant_id := NULL;
+    END IF;
+  END IF;
+
+  -- Insert or update profile (uses EXCEPTION block to be completely immune to constraint definition differences)
+  BEGIN
+    INSERT INTO public.profiles (id, name, email, role, department, year, tenant_id)
+    VALUES (
+      NEW.id,
+      COALESCE(NEW.raw_user_meta_data ->> 'name', ''),
+      NEW.email,
+      'student',
+      COALESCE(NULLIF(NEW.raw_user_meta_data ->> 'department', ''), 'Unknown'),
+      COALESCE(NULLIF(NEW.raw_user_meta_data ->> 'year', ''), 'Unknown'),
+      v_tenant_id
+    );
+  EXCEPTION WHEN UNIQUE_VIOLATION THEN
+    UPDATE public.profiles
+    SET
+      name = COALESCE(NEW.raw_user_meta_data ->> 'name', ''),
+      email = NEW.email,
+      department = COALESCE(NULLIF(NEW.raw_user_meta_data ->> 'department', ''), 'Unknown'),
+      year = COALESCE(NULLIF(NEW.raw_user_meta_data ->> 'year', ''), 'Unknown'),
+      tenant_id = v_tenant_id
+    WHERE id = NEW.id;
+  END;
+
+  -- Insert or update user role dynamically checking for tenant_id column existence and using EXCEPTION for unique constraints
+  IF EXISTS (
+    SELECT 1 
+    FROM information_schema.columns 
+    WHERE table_schema = 'public' 
+      AND table_name = 'user_roles' 
+      AND column_name = 'tenant_id'
+  ) THEN
+    BEGIN
+      INSERT INTO public.user_roles (user_id, role, tenant_id)
+      VALUES (NEW.id, 'student', v_tenant_id);
+    EXCEPTION WHEN UNIQUE_VIOLATION THEN
+      UPDATE public.user_roles 
+      SET role = 'student', tenant_id = v_tenant_id 
+      WHERE user_id = NEW.id;
+    END;
+  ELSE
+    BEGIN
+      INSERT INTO public.user_roles (user_id, role)
+      VALUES (NEW.id, 'student');
+    EXCEPTION WHEN UNIQUE_VIOLATION THEN
+      UPDATE public.user_roles 
+      SET role = 'student' 
+      WHERE user_id = NEW.id;
+    END;
+  END IF;
 
   RETURN NEW;
 END;
@@ -974,6 +1112,26 @@ $$;
 
 
 ALTER FUNCTION public.has_role(_user_id uuid, _role public.app_role) OWNER TO postgres;
+
+--
+-- Name: has_tenant_role(public.app_role, uuid); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select exists (
+    select 1
+    from public.user_roles ur
+    where ur.user_id = auth.uid()
+      and ur.role = _role
+      and ur.tenant_id = _tenant_id
+  )
+$$;
+
+
+ALTER FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) OWNER TO postgres;
 
 --
 -- Name: increment_curr_registrations(uuid); Type: FUNCTION; Schema: public; Owner: postgres
@@ -1013,6 +1171,36 @@ $$;
 ALTER FUNCTION public.is_admin_user() OWNER TO postgres;
 
 --
+-- Name: is_tenant_admin(uuid); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.is_tenant_admin(_tenant_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select public.has_tenant_role('admin', _tenant_id)
+      or public.has_tenant_role('institution_admin', _tenant_id)
+$$;
+
+
+ALTER FUNCTION public.is_tenant_admin(_tenant_id uuid) OWNER TO postgres;
+
+--
+-- Name: is_tenant_deptadmin(uuid); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select public.has_tenant_role('deptadmin', _tenant_id)
+      or public.has_tenant_role('department_admin', _tenant_id)
+$$;
+
+
+ALTER FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) OWNER TO postgres;
+
+--
 -- Name: problem_statements_set_defaults(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -1030,6 +1218,22 @@ $$;
 
 
 ALTER FUNCTION public.problem_statements_set_defaults() OWNER TO postgres;
+
+--
+-- Name: same_tenant(uuid); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.same_tenant(_tenant_id uuid) RETURNS boolean
+    LANGUAGE sql STABLE SECURITY DEFINER
+    SET search_path TO 'public'
+    AS $$
+  select auth.uid() is not null
+     and _tenant_id is not null
+     and _tenant_id = public.current_tenant_id()
+$$;
+
+
+ALTER FUNCTION public.same_tenant(_tenant_id uuid) OWNER TO postgres;
 
 --
 -- Name: set_updated_at(); Type: FUNCTION; Schema: public; Owner: postgres
@@ -1067,6 +1271,75 @@ $$;
 ALTER FUNCTION public.sync_profile_role() OWNER TO postgres;
 
 --
+-- Name: sync_profiles_from_user_roles(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.sync_profiles_from_user_roles() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  _user_id uuid;
+BEGIN
+  -- Recursion guard
+  IF current_setting('app.sync_in_progress', true) = 'user_roles_to_profiles' THEN
+    RETURN NEW;
+  END IF;
+
+  _user_id := NEW.user_id;
+
+  PERFORM
+    set_config('app.sync_in_progress', 'user_roles_to_profiles', true);
+
+  INSERT INTO public.profiles (id, tenant_id, role)
+  VALUES (_user_id, NEW.tenant_id, NEW.role)
+  ON CONFLICT (id)
+  DO UPDATE
+    SET tenant_id = EXCLUDED.tenant_id,
+        role = EXCLUDED.role;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.sync_profiles_from_user_roles() OWNER TO postgres;
+
+--
+-- Name: sync_user_roles_from_profiles(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.sync_user_roles_from_profiles() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  _user_id uuid;
+BEGIN
+  -- Recursion guard: if we're already inside the other trigger, do nothing.
+  IF current_setting('app.sync_in_progress', true) = 'profiles_to_user_roles' THEN
+    RETURN NEW;
+  END IF;
+
+  _user_id := NEW.id;
+
+  PERFORM
+    set_config('app.sync_in_progress', 'profiles_to_user_roles', true);
+
+  INSERT INTO public.user_roles (user_id, tenant_id, role)
+  VALUES (_user_id, NEW.tenant_id, NEW.role)
+  ON CONFLICT (user_id)
+  DO UPDATE
+    SET tenant_id = EXCLUDED.tenant_id,
+        role = EXCLUDED.role;
+
+  -- Keep the GUC value for this transaction (doesn't matter much after this).
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION public.sync_user_roles_from_profiles() OWNER TO postgres;
+
+--
 -- Name: apply_rls(jsonb, integer); Type: FUNCTION; Schema: realtime; Owner: supabase_admin
 --
 
@@ -1074,119 +1347,114 @@ CREATE FUNCTION realtime.apply_rls(wal jsonb, max_record_bytes integer DEFAULT (
     LANGUAGE plpgsql
     AS $$
 declare
--- Regclass of the table e.g. public.notes
-entity_ regclass = (quote_ident(wal ->> 'schema') || '.' || quote_ident(wal ->> 'table'))::regclass;
+    -- Regclass of the table e.g. public.notes
+    entity_ regclass = (quote_ident(wal ->> 'schema') || '.' || quote_ident(wal ->> 'table'))::regclass;
 
--- I, U, D, T: insert, update ...
-action realtime.action = (
-    case wal ->> 'action'
-        when 'I' then 'INSERT'
-        when 'U' then 'UPDATE'
-        when 'D' then 'DELETE'
-        else 'ERROR'
-    end
-);
+    -- I, U, D, T: insert, update ...
+    action realtime.action = (
+        case wal ->> 'action'
+            when 'I' then 'INSERT'
+            when 'U' then 'UPDATE'
+            when 'D' then 'DELETE'
+            else 'ERROR'
+        end
+    );
 
--- Is row level security enabled for the table
-is_rls_enabled bool = relrowsecurity from pg_class where oid = entity_;
+    -- Is row level security enabled for the table
+    is_rls_enabled bool = relrowsecurity from pg_class where oid = entity_;
 
-subscriptions realtime.subscription[] = array_agg(subs)
-    from
-        realtime.subscription subs
-    where
-        subs.entity = entity_
-        -- Filter by action early - only get subscriptions interested in this action
-        -- action_filter column can be: '*' (all), 'INSERT', 'UPDATE', or 'DELETE'
-        and (subs.action_filter = '*' or subs.action_filter = action::text);
+    subscriptions realtime.subscription[] = array_agg(subs)
+        from
+            realtime.subscription subs
+        where
+            subs.entity = entity_
+            -- Filter by action early - only get subscriptions interested in this action
+            -- action_filter column can be: '*' (all), 'INSERT', 'UPDATE', or 'DELETE'
+            and (subs.action_filter = '*' or subs.action_filter = action::text);
 
--- Subscription vars
-roles regrole[] = array_agg(distinct us.claims_role::text)
-    from
-        unnest(subscriptions) us;
+    -- Subscription vars
+    working_role regrole;
+    working_selected_columns text[];
+    claimed_role regrole;
+    claims jsonb;
 
-working_role regrole;
-claimed_role regrole;
-claims jsonb;
+    subscription_id uuid;
+    subscription_has_access bool;
+    visible_to_subscription_ids uuid[] = '{}';
 
-subscription_id uuid;
-subscription_has_access bool;
-visible_to_subscription_ids uuid[] = '{}';
+    -- structured info for wal's columns
+    columns realtime.wal_column[];
+    -- previous identity values for update/delete
+    old_columns realtime.wal_column[];
 
--- structured info for wal's columns
-columns realtime.wal_column[];
--- previous identity values for update/delete
-old_columns realtime.wal_column[];
+    error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
 
-error_record_exceeds_max_size boolean = octet_length(wal::text) > max_record_bytes;
+    -- Primary jsonb output for record
+    output jsonb;
 
--- Primary jsonb output for record
-output jsonb;
+    -- Loop record for iterating unique roles (outer loop)
+    role_record record;
+    -- Loop record for iterating unique selected_columns within a role (inner loop)
+    cols_record record;
+    -- Subscription ids visible at the role level (before fanning out by selected_columns)
+    visible_role_sub_ids uuid[] = '{}';
 
 begin
-perform set_config('role', null, true);
+    perform set_config('role', null, true);
 
-columns =
-    array_agg(
-        (
-            x->>'name',
-            x->>'type',
-            x->>'typeoid',
-            realtime.cast(
-                (x->'value') #>> '{}',
-                coalesce(
-                    (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
-                    (x->>'type')::regtype
-                )
-            ),
-            (pks ->> 'name') is not null,
-            true
-        )::realtime.wal_column
-    )
-    from
-        jsonb_array_elements(wal -> 'columns') x
-        left join jsonb_array_elements(wal -> 'pk') pks
-            on (x ->> 'name') = (pks ->> 'name');
-
-old_columns =
-    array_agg(
-        (
-            x->>'name',
-            x->>'type',
-            x->>'typeoid',
-            realtime.cast(
-                (x->'value') #>> '{}',
-                coalesce(
-                    (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
-                    (x->>'type')::regtype
-                )
-            ),
-            (pks ->> 'name') is not null,
-            true
-        )::realtime.wal_column
-    )
-    from
-        jsonb_array_elements(wal -> 'identity') x
-        left join jsonb_array_elements(wal -> 'pk') pks
-            on (x ->> 'name') = (pks ->> 'name');
-
-for working_role in select * from unnest(roles) loop
-
-    -- Update `is_selectable` for columns and old_columns
     columns =
         array_agg(
             (
-                c.name,
-                c.type_name,
-                c.type_oid,
-                c.value,
-                c.is_pkey,
-                pg_catalog.has_column_privilege(working_role, entity_, c.name, 'SELECT')
+                x->>'name',
+                x->>'type',
+                x->>'typeoid',
+                realtime.cast(
+                    (x->'value') #>> '{}',
+                    coalesce(
+                        (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
+                        (x->>'type')::regtype
+                    )
+                ),
+                (pks ->> 'name') is not null,
+                true
             )::realtime.wal_column
         )
         from
-            unnest(columns) c;
+            jsonb_array_elements(wal -> 'columns') x
+            left join jsonb_array_elements(wal -> 'pk') pks
+                on (x ->> 'name') = (pks ->> 'name');
 
     old_columns =
+        array_agg(
+            (
+                x->>'name',
+                x->>'type',
+                x->>'typeoid',
+                realtime.cast(
+                    (x->'value') #>> '{}',
+                    coalesce(
+                        (x->>'typeoid')::regtype, -- null when wal2json version <= 2.4
+                        (x->>'type')::regtype
+                    )
+                ),
+                (pks ->> 'name') is not null,
+                true
+            )::realtime.wal_column
+        )
+        from
+            jsonb_array_elements(wal -> 'identity') x
+            left join jsonb_array_elements(wal -> 'pk') pks
+                on (x ->> 'name') = (pks ->> 'name');
+
+    for role_record in
+        select claims_role
+        from (select distinct claims_role from unnest(subscriptions)) t
+        order by claims_role::text
+    loop
+        working_role := role_record.claims_role;
+
+        -- Update `is_selectable` for columns and old_columns (once per role)
+        columns =
             array_agg(
                 (
                     c.name,
@@ -1198,178 +1466,238 @@ for working_role in select * from unnest(roles) loop
                 )::realtime.wal_column
             )
             from
-                unnest(old_columns) c;
+                unnest(columns) c;
 
-    if action <> 'DELETE' and count(1) = 0 from unnest(columns) c where c.is_pkey then
-        return next (
-            jsonb_build_object(
-                'schema', wal ->> 'schema',
-                'table', wal ->> 'table',
-                'type', action
-            ),
-            is_rls_enabled,
-            -- subscriptions is already filtered by entity
-            (select array_agg(s.subscription_id) from unnest(subscriptions) as s where claims_role = working_role),
-            array['Error 400: Bad Request, no primary key']
-        )::realtime.wal_rls;
-
-    -- The claims role does not have SELECT permission to the primary key of entity
-    elsif action <> 'DELETE' and sum(c.is_selectable::int) <> count(1) from unnest(columns) c where c.is_pkey then
-        return next (
-            jsonb_build_object(
-                'schema', wal ->> 'schema',
-                'table', wal ->> 'table',
-                'type', action
-            ),
-            is_rls_enabled,
-            (select array_agg(s.subscription_id) from unnest(subscriptions) as s where claims_role = working_role),
-            array['Error 401: Unauthorized']
-        )::realtime.wal_rls;
-
-    else
-        output = jsonb_build_object(
-            'schema', wal ->> 'schema',
-            'table', wal ->> 'table',
-            'type', action,
-            'commit_timestamp', to_char(
-                ((wal ->> 'timestamp')::timestamptz at time zone 'utc'),
-                'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
-            ),
-            'columns', (
-                select
-                    jsonb_agg(
-                        jsonb_build_object(
-                            'name', pa.attname,
-                            'type', pt.typname
-                        )
-                        order by pa.attnum asc
-                    )
-                from
-                    pg_attribute pa
-                    join pg_type pt
-                        on pa.atttypid = pt.oid
-                where
-                    attrelid = entity_
-                    and attnum > 0
-                    and pg_catalog.has_column_privilege(working_role, entity_, pa.attname, 'SELECT')
-            )
-        )
-        -- Add "record" key for insert and update
-        || case
-            when action in ('INSERT', 'UPDATE') then
-                jsonb_build_object(
-                    'record',
+        old_columns =
+                array_agg(
                     (
+                        c.name,
+                        c.type_name,
+                        c.type_oid,
+                        c.value,
+                        c.is_pkey,
+                        pg_catalog.has_column_privilege(working_role, entity_, c.name, 'SELECT')
+                    )::realtime.wal_column
+                )
+                from
+                    unnest(old_columns) c;
+
+        if action <> 'DELETE' and count(1) = 0 from unnest(columns) c where c.is_pkey then
+            -- Fan out 400 error per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+                return next (
+                    jsonb_build_object(
+                        'schema', wal ->> 'schema',
+                        'table', wal ->> 'table',
+                        'type', action
+                    ),
+                    is_rls_enabled,
+                    (select array_agg(s.subscription_id) from unnest(subscriptions) as s where s.claims_role = working_role and (s.selected_columns is not distinct from working_selected_columns)),
+                    array['Error 400: Bad Request, no primary key']
+                )::realtime.wal_rls;
+            end loop;
+
+        -- The claims role does not have SELECT permission to the primary key of entity
+        elsif action <> 'DELETE' and sum(c.is_selectable::int) <> count(1) from unnest(columns) c where c.is_pkey then
+            -- Fan out 401 error per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+                return next (
+                    jsonb_build_object(
+                        'schema', wal ->> 'schema',
+                        'table', wal ->> 'table',
+                        'type', action
+                    ),
+                    is_rls_enabled,
+                    (select array_agg(s.subscription_id) from unnest(subscriptions) as s where s.claims_role = working_role and (s.selected_columns is not distinct from working_selected_columns)),
+                    array['Error 401: Unauthorized']
+                )::realtime.wal_rls;
+            end loop;
+
+        else
+            -- Create the prepared statement (once per role)
+            if is_rls_enabled and action <> 'DELETE' then
+                if (select 1 from pg_prepared_statements where name = 'walrus_rls_stmt' limit 1) > 0 then
+                    deallocate walrus_rls_stmt;
+                end if;
+                execute realtime.build_prepared_statement_sql('walrus_rls_stmt', entity_, columns);
+            end if;
+
+            -- Collect all visible subscription IDs for this role (filter check + RLS check)
+            visible_role_sub_ids = '{}';
+
+            for subscription_id, claims in (
+                    select
+                        subs.subscription_id,
+                        subs.claims
+                    from
+                        unnest(subscriptions) subs
+                    where
+                        subs.entity = entity_
+                        and subs.claims_role = working_role
+                        and (
+                            realtime.is_visible_through_filters(columns, subs.filters)
+                            or (
+                              action = 'DELETE'
+                              and realtime.is_visible_through_filters(old_columns, subs.filters)
+                            )
+                        )
+            ) loop
+
+                if not is_rls_enabled or action = 'DELETE' then
+                    visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+                else
+                    -- Check if RLS allows the role to see the record
+                    perform
+                        -- Trim leading and trailing quotes from working_role because set_config
+                        -- doesn't recognize the role as valid if they are included
+                        set_config('role', trim(both '"' from working_role::text), true),
+                        set_config('request.jwt.claims', claims::text, true);
+
+                    execute 'execute walrus_rls_stmt' into subscription_has_access;
+
+                    if subscription_has_access then
+                        visible_role_sub_ids = visible_role_sub_ids || subscription_id;
+                    end if;
+                end if;
+            end loop;
+
+            perform set_config('role', null, true);
+
+            -- Inner loop: per distinct selected_columns for this role
+            for cols_record in
+                select selected_columns
+                from (select distinct selected_columns from unnest(subscriptions) s where s.claims_role = working_role) t
+                order by coalesce(array_to_string(selected_columns, ','), '')
+            loop
+                working_selected_columns := cols_record.selected_columns;
+
+                output = jsonb_build_object(
+                    'schema', wal ->> 'schema',
+                    'table', wal ->> 'table',
+                    'type', action,
+                    'commit_timestamp', to_char(
+                        ((wal ->> 'timestamp')::timestamptz at time zone 'utc'),
+                        'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'
+                    ),
+                    'columns', (
                         select
-                            jsonb_object_agg(
-                                -- if unchanged toast, get column name and value from old record
-                                coalesce((c).name, (oc).name),
-                                case
-                                    when (c).name is null then (oc).value
-                                    else (c).value
-                                end
+                            jsonb_agg(
+                                jsonb_build_object(
+                                    'name', pa.attname,
+                                    'type', pt.typname
+                                )
+                                order by pa.attnum asc
                             )
                         from
-                            unnest(columns) c
-                            full outer join unnest(old_columns) oc
-                                on (c).name = (oc).name
+                            pg_attribute pa
+                            join pg_type pt
+                                on pa.atttypid = pt.oid
+                            left join (
+                                select unnest(conkey) as pkey_attnum
+                                from pg_constraint
+                                where conrelid = entity_ and contype = 'p'
+                            ) pk on pk.pkey_attnum = pa.attnum
                         where
-                            coalesce((c).is_selectable, (oc).is_selectable)
-                            and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                            attrelid = entity_
+                            and attnum > 0
+                            and pg_catalog.has_column_privilege(working_role, entity_, pa.attname, 'SELECT')
+                            and (working_selected_columns is null or pa.attname = any(working_selected_columns) or pk.pkey_attnum is not null)
                     )
                 )
-            else '{}'::jsonb
-        end
-        -- Add "old_record" key for update and delete
-        || case
-            when action = 'UPDATE' then
-                jsonb_build_object(
-                        'old_record',
-                        (
-                            select jsonb_object_agg((c).name, (c).value)
-                            from unnest(old_columns) c
-                            where
-                                (c).is_selectable
-                                and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                -- Add "record" key for insert and update
+                || case
+                    when action in ('INSERT', 'UPDATE') then
+                        jsonb_build_object(
+                            'record',
+                            (
+                                select
+                                    jsonb_object_agg(
+                                        -- if unchanged toast, get column name and value from old record
+                                        coalesce((c).name, (oc).name),
+                                        case
+                                            when (c).name is null then (oc).value
+                                            else (c).value
+                                        end
+                                    )
+                                from
+                                    unnest(columns) c
+                                    full outer join unnest(old_columns) oc
+                                        on (c).name = (oc).name
+                                where
+                                    coalesce((c).is_selectable, (oc).is_selectable)
+                                    and (working_selected_columns is null or coalesce((c).name, (oc).name) = any(working_selected_columns) or coalesce((c).is_pkey, (oc).is_pkey))
+                                    and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                            )
                         )
-                    )
-            when action = 'DELETE' then
-                jsonb_build_object(
-                    'old_record',
+                    else '{}'::jsonb
+                end
+                -- Add "old_record" key for update and delete
+                || case
+                    when action = 'UPDATE' then
+                        jsonb_build_object(
+                                'old_record',
+                                (
+                                    select jsonb_object_agg((c).name, (c).value)
+                                    from unnest(old_columns) c
+                                    where
+                                        (c).is_selectable
+                                        and (working_selected_columns is null or (c).name = any(working_selected_columns) or (c).is_pkey)
+                                        and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                                )
+                            )
+                    when action = 'DELETE' then
+                        jsonb_build_object(
+                            'old_record',
+                            (
+                                select jsonb_object_agg((c).name, (c).value)
+                                from unnest(old_columns) c
+                                where
+                                    (c).is_selectable
+                                    and (working_selected_columns is null or (c).name = any(working_selected_columns) or (c).is_pkey)
+                                    and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
+                                    and ( not is_rls_enabled or (c).is_pkey ) -- if RLS enabled, we can't secure deletes so filter to pkey
+                            )
+                        )
+                    else '{}'::jsonb
+                end;
+
+                -- Filter visible_role_sub_ids to those matching the current selected_columns group
+                visible_to_subscription_ids = coalesce(
                     (
-                        select jsonb_object_agg((c).name, (c).value)
-                        from unnest(old_columns) c
-                        where
-                            (c).is_selectable
-                            and ( not error_record_exceeds_max_size or (octet_length((c).value::text) <= 64))
-                            and ( not is_rls_enabled or (c).is_pkey ) -- if RLS enabled, we can't secure deletes so filter to pkey
-                    )
-                )
-            else '{}'::jsonb
-        end;
+                        select array_agg(s.subscription_id)
+                        from unnest(subscriptions) s
+                        where s.claims_role = working_role
+                          and (s.selected_columns is not distinct from working_selected_columns)
+                          and s.subscription_id = any(visible_role_sub_ids)
+                    ),
+                    '{}'::uuid[]
+                );
 
-        -- Create the prepared statement
-        if is_rls_enabled and action <> 'DELETE' then
-            if (select 1 from pg_prepared_statements where name = 'walrus_rls_stmt' limit 1) > 0 then
-                deallocate walrus_rls_stmt;
-            end if;
-            execute realtime.build_prepared_statement_sql('walrus_rls_stmt', entity_, columns);
+                return next (
+                    output,
+                    is_rls_enabled,
+                    visible_to_subscription_ids,
+                    case
+                        when error_record_exceeds_max_size then array['Error 413: Payload Too Large']
+                        else '{}'
+                    end
+                )::realtime.wal_rls;
+            end loop;
+
         end if;
+    end loop;
 
-        visible_to_subscription_ids = '{}';
-
-        for subscription_id, claims in (
-                select
-                    subs.subscription_id,
-                    subs.claims
-                from
-                    unnest(subscriptions) subs
-                where
-                    subs.entity = entity_
-                    and subs.claims_role = working_role
-                    and (
-                        realtime.is_visible_through_filters(columns, subs.filters)
-                        or (
-                          action = 'DELETE'
-                          and realtime.is_visible_through_filters(old_columns, subs.filters)
-                        )
-                    )
-        ) loop
-
-            if not is_rls_enabled or action = 'DELETE' then
-                visible_to_subscription_ids = visible_to_subscription_ids || subscription_id;
-            else
-                -- Check if RLS allows the role to see the record
-                perform
-                    -- Trim leading and trailing quotes from working_role because set_config
-                    -- doesn't recognize the role as valid if they are included
-                    set_config('role', trim(both '"' from working_role::text), true),
-                    set_config('request.jwt.claims', claims::text, true);
-
-                execute 'execute walrus_rls_stmt' into subscription_has_access;
-
-                if subscription_has_access then
-                    visible_to_subscription_ids = visible_to_subscription_ids || subscription_id;
-                end if;
-            end if;
-        end loop;
-
-        perform set_config('role', null, true);
-
-        return next (
-            output,
-            is_rls_enabled,
-            visible_to_subscription_ids,
-            case
-                when error_record_exceeds_max_size then array['Error 413: Payload Too Large']
-                else '{}'
-            end
-        )::realtime.wal_rls;
-
-    end if;
-end loop;
-
-perform set_config('role', null, true);
+    perform set_config('role', null, true);
 end;
 $$;
 
@@ -1562,7 +1890,7 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
         string_agg(
           realtime.quote_wal2json(format('%I.%I', schemaname, tablename)::regclass),
           ','
-        ) filter (WHERE ppt.tablename IS NOT NULL AND ppt.tablename NOT LIKE '% %'),
+        ) filter (WHERE ppt.tablename IS NOT NULL),
         ''
       ) AS w2j_add_tables
     FROM pg_publication pp
@@ -1586,13 +1914,11 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
            'add-tables', pub.w2j_add_tables
          ) x
   ),
-  -- Count raw slot entries before apply_rls/subscription filter
   slot_count AS (
     SELECT count(*)::bigint AS cnt
     FROM w2j
     WHERE w2j.w2j_add_tables <> ''
   ),
-  -- Apply RLS and filter as before
   rls_filtered AS (
     SELECT xyz.wal, xyz.is_rls_enabled, xyz.subscription_ids, xyz.errors
     FROM w2j,
@@ -1603,14 +1929,11 @@ CREATE FUNCTION realtime.list_changes(publication name, slot_name name, max_chan
     WHERE w2j.w2j_add_tables <> ''
       AND xyz.subscription_ids[1] IS NOT NULL
   )
-  -- Real rows with slot count attached
   SELECT rf.wal, rf.is_rls_enabled, rf.subscription_ids, rf.errors, sc.cnt
   FROM rls_filtered rf, slot_count sc
 
   UNION ALL
 
-  -- Sentinel row: always returned when no real rows exist so Elixir can
-  -- always read slot_changes_count. Identified by wal IS NULL.
   SELECT null, null, null, null, sc.cnt
   FROM slot_count sc
   WHERE NOT EXISTS (SELECT 1 FROM rls_filtered)
@@ -1626,35 +1949,14 @@ ALTER FUNCTION realtime.list_changes(publication name, slot_name name, max_chang
 CREATE FUNCTION realtime.quote_wal2json(entity regclass) RETURNS text
     LANGUAGE sql IMMUTABLE STRICT
     AS $$
-      select
-        (
-          select string_agg('' || ch,'')
-          from unnest(string_to_array(nsp.nspname::text, null)) with ordinality x(ch, idx)
-          where
-            not (x.idx = 1 and x.ch = '"')
-            and not (
-              x.idx = array_length(string_to_array(nsp.nspname::text, null), 1)
-              and x.ch = '"'
-            )
-        )
-        || '.'
-        || (
-          select string_agg('' || ch,'')
-          from unnest(string_to_array(pc.relname::text, null)) with ordinality x(ch, idx)
-          where
-            not (x.idx = 1 and x.ch = '"')
-            and not (
-              x.idx = array_length(string_to_array(nsp.nspname::text, null), 1)
-              and x.ch = '"'
-            )
-          )
-      from
-        pg_class pc
-        join pg_namespace nsp
-          on pc.relnamespace = nsp.oid
-      where
-        pc.oid = entity
-    $$;
+  SELECT
+    realtime.wal2json_escape_identifier(nsp.nspname::text)
+    || '.'
+    || realtime.wal2json_escape_identifier(pc.relname::text)
+  FROM pg_class pc
+  JOIN pg_namespace nsp ON pc.relnamespace = nsp.oid
+  WHERE pc.oid = entity
+$$;
 
 
 ALTER FUNCTION realtime.quote_wal2json(entity regclass) OWNER TO supabase_admin;
@@ -1699,77 +2001,121 @@ $$;
 ALTER FUNCTION realtime.send(payload jsonb, event text, topic text, private boolean) OWNER TO supabase_admin;
 
 --
+-- Name: send_binary(bytea, text, text, boolean); Type: FUNCTION; Schema: realtime; Owner: supabase_admin
+--
+
+CREATE FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean DEFAULT true) RETURNS void
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+  generated_id uuid;
+BEGIN
+  BEGIN
+    generated_id := gen_random_uuid();
+
+    EXECUTE format('SET LOCAL realtime.topic TO %L', topic);
+
+    INSERT INTO realtime.messages (id, binary_payload, event, topic, private, extension)
+    VALUES (generated_id, payload, event, topic, private, 'broadcast');
+  EXCEPTION
+    WHEN OTHERS THEN
+      RAISE WARNING 'ErrorSendingBroadcastMessage: %', SQLERRM;
+  END;
+END;
+$$;
+
+
+ALTER FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean) OWNER TO supabase_admin;
+
+--
 -- Name: subscription_check_filters(); Type: FUNCTION; Schema: realtime; Owner: supabase_admin
 --
 
 CREATE FUNCTION realtime.subscription_check_filters() RETURNS trigger
     LANGUAGE plpgsql
     AS $$
-    /*
-    Validates that the user defined filters for a subscription:
-    - refer to valid columns that the claimed role may access
-    - values are coercable to the correct column type
-    */
-    declare
-        col_names text[] = coalesce(
-                array_agg(c.column_name order by c.ordinal_position),
-                '{}'::text[]
-            )
-            from
-                information_schema.columns c
-            where
-                format('%I.%I', c.table_schema, c.table_name)::regclass = new.entity
-                and pg_catalog.has_column_privilege(
-                    (new.claims ->> 'role'),
-                    format('%I.%I', c.table_schema, c.table_name)::regclass,
-                    c.column_name,
-                    'SELECT'
-                );
-        filter realtime.user_defined_filter;
-        col_type regtype;
-
-        in_val jsonb;
-    begin
-        for filter in select * from unnest(new.filters) loop
-            -- Filtered column is valid
-            if not filter.column_name = any(col_names) then
-                raise exception 'invalid column for filter %', filter.column_name;
-            end if;
-
-            -- Type is sanitized and safe for string interpolation
-            col_type = (
-                select atttypid::regtype
-                from pg_catalog.pg_attribute
-                where attrelid = new.entity
-                      and attname = filter.column_name
+declare
+    col_names text[] = coalesce(
+            array_agg(c.column_name order by c.ordinal_position),
+            '{}'::text[]
+        )
+        from
+            information_schema.columns c
+        where
+            format('%I.%I', c.table_schema, c.table_name)::regclass = new.entity
+            and pg_catalog.has_column_privilege(
+                (new.claims ->> 'role'),
+                format('%I.%I', c.table_schema, c.table_name)::regclass,
+                c.column_name,
+                'SELECT'
             );
-            if col_type is null then
-                raise exception 'failed to lookup type for column %', filter.column_name;
-            end if;
+    table_col_names text[] = coalesce(
+            array_agg(pa.attname),
+            '{}'::text[]
+        )
+        from
+            pg_attribute pa
+        where
+            pa.attrelid = new.entity
+            and pa.attnum > 0;
+    filter realtime.user_defined_filter;
+    col_type regtype;
+    in_val jsonb;
+    selected_col text;
+begin
+    for filter in select * from unnest(new.filters) loop
+        -- Filtered column is valid
+        if not filter.column_name = any(col_names) then
+            raise exception 'invalid column for filter %', filter.column_name;
+        end if;
 
-            -- Set maximum number of entries for in filter
-            if filter.op = 'in'::realtime.equality_op then
-                in_val = realtime.cast(filter.value, (col_type::text || '[]')::regtype);
-                if coalesce(jsonb_array_length(in_val), 0) > 100 then
-                    raise exception 'too many values for `in` filter. Maximum 100';
-                end if;
-            else
-                -- raises an exception if value is not coercable to type
-                perform realtime.cast(filter.value, col_type);
+        -- Type is sanitized and safe for string interpolation
+        col_type = (
+            select atttypid::regtype
+            from pg_catalog.pg_attribute
+            where attrelid = new.entity
+                  and attname = filter.column_name
+        );
+        if col_type is null then
+            raise exception 'failed to lookup type for column %', filter.column_name;
+        end if;
+        if filter.op = 'in'::realtime.equality_op then
+            in_val = realtime.cast(filter.value, (col_type::text || '[]')::regtype);
+            if coalesce(jsonb_array_length(in_val), 0) > 100 then
+                raise exception 'too many values for `in` filter. Maximum 100';
             end if;
+        else
+            -- raises an exception if value is not coercable to type
+            perform realtime.cast(filter.value, col_type);
+        end if;
+    end loop;
 
+    -- Validate that selected_columns reference columns the role can SELECT
+    if new.selected_columns is not null then
+        for selected_col in select * from unnest(new.selected_columns) loop
+            if not selected_col = any(col_names) then
+                raise exception 'invalid column for select %', selected_col;
+            end if;
         end loop;
+    end if;
 
-        -- Apply consistent order to filters so the unique constraint on
-        -- (subscription_id, entity, filters) can't be tricked by a different filter order
-        new.filters = coalesce(
-            array_agg(f order by f.column_name, f.op, f.value),
-            '{}'
-        ) from unnest(new.filters) f;
+    -- Apply consistent order to filters so the unique constraint on
+    -- (subscription_id, entity, filters) can't be tricked by a different filter order
+    new.filters = coalesce(
+        array_agg(f order by f.column_name, f.op, f.value),
+        '{}'
+    ) from unnest(new.filters) f;
 
-        return new;
-    end;
-    $$;
+    -- Normalize selected_columns order so ARRAY['a','b'] and ARRAY['b','a'] are
+    -- treated as the same subscription group in apply_rls
+    new.selected_columns = (
+        select array_agg(c order by c)
+        from unnest(new.selected_columns) c
+    );
+
+    return new;
+end;
+$$;
 
 
 ALTER FUNCTION realtime.subscription_check_filters() OWNER TO supabase_admin;
@@ -1797,6 +2143,20 @@ $$;
 
 
 ALTER FUNCTION realtime.topic() OWNER TO supabase_realtime_admin;
+
+--
+-- Name: wal2json_escape_identifier(text); Type: FUNCTION; Schema: realtime; Owner: supabase_admin
+--
+
+CREATE FUNCTION realtime.wal2json_escape_identifier(name text) RETURNS text
+    LANGUAGE sql IMMUTABLE STRICT
+    AS $$
+  -- Prefix `\`, `,`, `.`, and any whitespace with `\`
+  SELECT regexp_replace(name, '([\\,.[:space:]])', '\\\1', 'g')
+$$;
+
+
+ALTER FUNCTION realtime.wal2json_escape_identifier(name text) OWNER TO supabase_admin;
 
 --
 -- Name: allow_any_operation(text[]); Type: FUNCTION; Schema: storage; Owner: supabase_storage_admin
@@ -3509,11 +3869,44 @@ CREATE TABLE public.events (
     registration_start_date timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text) NOT NULL,
     has_problem_statement boolean DEFAULT false,
     resource_person text,
-    tenant_id uuid NOT NULL
+    tenant_id uuid NOT NULL,
+    registration_link text
 );
 
 
 ALTER TABLE public.events OWNER TO postgres;
+
+--
+-- Name: events_archive; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.events_archive (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    title text NOT NULL,
+    description text NOT NULL,
+    event_date timestamp with time zone NOT NULL,
+    location text NOT NULL,
+    created_at timestamp with time zone DEFAULT now() NOT NULL,
+    updated_at timestamp with time zone DEFAULT now() NOT NULL,
+    is_active boolean DEFAULT true,
+    event_type text,
+    mode text,
+    image_url text,
+    organizer_name text,
+    organizer_contact text,
+    registration_deadline timestamp with time zone,
+    max_participants integer,
+    problem_statement_deadline timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text),
+    registration_start_date timestamp with time zone DEFAULT (now() AT TIME ZONE 'utc'::text) NOT NULL,
+    has_problem_statement boolean DEFAULT false,
+    resource_person text,
+    tenant_id uuid NOT NULL,
+    registration_link text,
+    archived_at timestamp with time zone DEFAULT now()
+);
+
+
+ALTER TABLE public.events_archive OWNER TO postgres;
 
 --
 -- Name: page_content; Type: TABLE; Schema: public; Owner: postgres
@@ -3850,7 +4243,8 @@ CREATE TABLE realtime.messages (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 )
 PARTITION BY RANGE (inserted_at);
 
@@ -3869,7 +4263,8 @@ CREATE TABLE realtime.messages_2026_02_12 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3887,7 +4282,8 @@ CREATE TABLE realtime.messages_2026_02_13 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3905,7 +4301,8 @@ CREATE TABLE realtime.messages_2026_02_14 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3923,7 +4320,8 @@ CREATE TABLE realtime.messages_2026_02_15 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3941,7 +4339,8 @@ CREATE TABLE realtime.messages_2026_02_16 (
     private boolean DEFAULT false,
     updated_at timestamp without time zone DEFAULT now() NOT NULL,
     inserted_at timestamp without time zone DEFAULT now() NOT NULL,
-    id uuid DEFAULT gen_random_uuid() NOT NULL
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    binary_payload bytea
 );
 
 
@@ -3972,6 +4371,7 @@ CREATE TABLE realtime.subscription (
     claims_role regrole GENERATED ALWAYS AS (realtime.to_regrole((claims ->> 'role'::text))) STORED NOT NULL,
     created_at timestamp without time zone DEFAULT timezone('utc'::text, now()) NOT NULL,
     action_filter text DEFAULT '*'::text,
+    selected_columns text[],
     CONSTRAINT subscription_action_filter_check CHECK ((action_filter = ANY (ARRAY['*'::text, 'INSERT'::text, 'UPDATE'::text, 'DELETE'::text])))
 );
 
@@ -4497,6 +4897,14 @@ ALTER TABLE ONLY public.event_registrations
 
 
 --
+-- Name: events_archive events_archive_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.events_archive
+    ADD CONSTRAINT events_archive_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: events events_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -4774,6 +5182,14 @@ ALTER TABLE ONLY realtime.messages_2026_02_15
 
 ALTER TABLE ONLY realtime.messages_2026_02_16
     ADD CONSTRAINT messages_2026_02_16_pkey PRIMARY KEY (id, inserted_at);
+
+
+--
+-- Name: messages messages_payload_exclusive; Type: CHECK CONSTRAINT; Schema: realtime; Owner: supabase_realtime_admin
+--
+
+ALTER TABLE realtime.messages
+    ADD CONSTRAINT messages_payload_exclusive CHECK (((payload IS NULL) OR (binary_payload IS NULL))) NOT VALID;
 
 
 --
@@ -5510,10 +5926,10 @@ CREATE INDEX messages_2026_02_16_inserted_at_topic_idx ON realtime.messages_2026
 
 
 --
--- Name: subscription_subscription_id_entity_filters_action_filter_key; Type: INDEX; Schema: realtime; Owner: supabase_admin
+-- Name: subscription_subscription_id_entity_filters_action_filter_selec; Type: INDEX; Schema: realtime; Owner: supabase_admin
 --
 
-CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_key ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter);
+CREATE UNIQUE INDEX subscription_subscription_id_entity_filters_action_filter_selec ON realtime.subscription USING btree (subscription_id, entity, filters, action_filter, COALESCE(selected_columns, '{}'::text[]));
 
 
 --
@@ -6334,147 +6750,10 @@ ALTER TABLE auth.sso_providers ENABLE ROW LEVEL SECURITY;
 ALTER TABLE auth.users ENABLE ROW LEVEL SECURITY;
 
 --
--- Name: problem_statement_remarks Admin can insert remarks; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admin can insert remarks" ON public.problem_statement_remarks FOR INSERT TO authenticated WITH CHECK (((auth.uid() = author_id) AND (EXISTS ( SELECT 1
-   FROM public.user_roles
-  WHERE ((user_roles.user_id = auth.uid()) AND (user_roles.role = 'admin'::public.app_role))))));
-
-
---
--- Name: problem_statement_remarks Admin can view remarks; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admin can view remarks" ON public.problem_statement_remarks FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
-   FROM public.user_roles
-  WHERE ((user_roles.user_id = auth.uid()) AND (user_roles.role = 'admin'::public.app_role)))));
-
-
---
--- Name: user_queries Admins can delete queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can delete queries" ON public.user_queries FOR DELETE USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: problem_statement_alerts Admins can insert alerts; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can insert alerts" ON public.problem_statement_alerts FOR INSERT TO authenticated WITH CHECK ((public.is_admin_user() OR (recipient_user_id = auth.uid())));
-
-
---
--- Name: event_registrations Admins can manage all event registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage all event registrations" ON public.event_registrations USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: user_roles Admins can manage all roles; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage all roles" ON public.user_roles TO authenticated USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: team_registrations Admins can manage all team registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage all team registrations" ON public.team_registrations USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
 -- Name: departments Admins can manage departments; Type: POLICY; Schema: public; Owner: postgres
 --
 
 CREATE POLICY "Admins can manage departments" ON public.departments TO authenticated USING (public.is_admin_user()) WITH CHECK (public.is_admin_user());
-
-
---
--- Name: events Admins can manage events; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage events" ON public.events USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: page_content Admins can manage page content; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage page content" ON public.page_content USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: problem_statements Admins can manage problem statements; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage problem statements" ON public.problem_statements TO authenticated USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: resources Admins can manage resources; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage resources" ON public.resources USING (public.has_role(auth.uid(), 'admin'::public.app_role)) WITH CHECK (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: problem_statement_reviews Admins can manage reviews; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can manage reviews" ON public.problem_statement_reviews TO authenticated USING (public.is_admin_user()) WITH CHECK (public.is_admin_user());
-
-
---
--- Name: user_queries Admins can update queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can update queries" ON public.user_queries FOR UPDATE USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: event_registrations Admins can view all event registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can view all event registrations" ON public.event_registrations FOR SELECT USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: profiles Admins can view all profiles; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can view all profiles" ON public.profiles FOR SELECT TO authenticated USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: user_queries Admins can view all queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can view all queries" ON public.user_queries FOR SELECT USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: user_roles Admins can view all roles; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Admins can view all roles" ON public.user_roles FOR SELECT TO authenticated USING (public.has_role(auth.uid(), 'admin'::public.app_role));
-
-
---
--- Name: tenants Allow public tenant reads; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Allow public tenant reads" ON public.tenants FOR SELECT TO authenticated, anon USING (true);
-
-
---
--- Name: user_queries Anyone can submit queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Anyone can submit queries" ON public.user_queries FOR INSERT WITH CHECK (((auth.uid() IS NOT NULL) OR ((user_email IS NOT NULL) AND (length(TRIM(BOTH FROM user_email)) > 0))));
 
 
 --
@@ -6485,244 +6764,87 @@ CREATE POLICY "Anyone can view departments" ON public.departments FOR SELECT USI
 
 
 --
--- Name: page_content Anyone can view page content; Type: POLICY; Schema: public; Owner: postgres
+-- Name: tenants Public can read tenants; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Anyone can view page content" ON public.page_content FOR SELECT USING (true);
+CREATE POLICY "Public can read tenants" ON public.tenants FOR SELECT TO anon USING (true);
 
 
 --
--- Name: problem_statements Anyone can view problem statements; Type: POLICY; Schema: public; Owner: postgres
+-- Name: problem_statements anon can read approved tenant problem statements; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Anyone can view problem statements" ON public.problem_statements FOR SELECT TO authenticated, anon USING (true);
+CREATE POLICY "anon can read approved tenant problem statements" ON public.problem_statements FOR SELECT TO anon USING (((tenant_id IS NOT NULL) AND (status = 'approved'::text)));
 
 
 --
--- Name: resources Anyone can view resources; Type: POLICY; Schema: public; Owner: postgres
+-- Name: contest_settings anon can read tenant contest settings; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Anyone can view resources" ON public.resources FOR SELECT USING (true);
+CREATE POLICY "anon can read tenant contest settings" ON public.contest_settings FOR SELECT TO anon USING ((tenant_id IS NOT NULL));
 
 
 --
--- Name: problem_statements Authenticated users can create own problem statements; Type: POLICY; Schema: public; Owner: postgres
+-- Name: events anon can read tenant events; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Authenticated users can create own problem statements" ON public.problem_statements FOR INSERT TO authenticated WITH CHECK ((public.is_admin_user() OR (created_by = auth.uid())));
+CREATE POLICY "anon can read tenant events" ON public.events FOR SELECT TO anon USING ((tenant_id IS NOT NULL));
 
 
 --
--- Name: problem_statement_remarks DeptAdmin can view remarks for own department; Type: POLICY; Schema: public; Owner: postgres
+-- Name: page_content anon can read tenant page content; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "DeptAdmin can view remarks for own department" ON public.problem_statement_remarks FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
-   FROM ((public.user_roles ur
-     JOIN public.profiles p ON ((p.id = ur.user_id)))
-     JOIN public.problem_statements ps ON ((ps.id = problem_statement_remarks.problem_statement_id)))
-  WHERE ((ur.user_id = auth.uid()) AND (ur.role = 'deptadmin'::public.app_role) AND (p.department_id = ps.department_id)))));
+CREATE POLICY "anon can read tenant page content" ON public.page_content FOR SELECT TO anon USING ((tenant_id IS NOT NULL));
 
 
 --
--- Name: events Everyone can view events; Type: POLICY; Schema: public; Owner: postgres
+-- Name: resources anon can read tenant resources; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Everyone can view events" ON public.events FOR SELECT USING (true);
+CREATE POLICY "anon can read tenant resources" ON public.resources FOR SELECT TO anon USING ((tenant_id IS NOT NULL));
 
 
 --
--- Name: problem_statements Owners can delete draft problem statements; Type: POLICY; Schema: public; Owner: postgres
+-- Name: user_queries anon can submit tenant queries; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Owners can delete draft problem statements" ON public.problem_statements FOR DELETE TO authenticated USING ((public.is_admin_user() OR ((created_by = auth.uid()) AND (COALESCE(status, 'draft'::text) = ANY (ARRAY['draft'::text, 'revision_needed'::text])))));
+CREATE POLICY "anon can submit tenant queries" ON public.user_queries FOR INSERT TO anon WITH CHECK (((tenant_id IS NOT NULL) AND (user_id IS NULL) AND (user_email IS NOT NULL) AND (length(TRIM(BOTH FROM user_email)) > 0)));
 
 
 --
--- Name: problem_statements Owners or admins can update problem statements; Type: POLICY; Schema: public; Owner: postgres
+-- Name: contest_settings authenticated can read own tenant contest settings; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Owners or admins can update problem statements" ON public.problem_statements FOR UPDATE TO authenticated USING ((public.is_admin_user() OR (created_by = auth.uid()))) WITH CHECK ((public.is_admin_user() OR (created_by = auth.uid())));
+CREATE POLICY "authenticated can read own tenant contest settings" ON public.contest_settings FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
 
 
 --
--- Name: submission_batch_items Users can access batch items they can access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: events authenticated can read own tenant events; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Users can access batch items they can access" ON public.submission_batch_items TO authenticated USING ((EXISTS ( SELECT 1
-   FROM public.submission_batches b
-  WHERE ((b.id = submission_batch_items.batch_id) AND (public.is_admin_user() OR (b.submitted_by = auth.uid()) OR ((b.department_id IS NOT NULL) AND (b.department_id = public.current_department_id()))))))) WITH CHECK ((EXISTS ( SELECT 1
-   FROM public.submission_batches b
-  WHERE ((b.id = submission_batch_items.batch_id) AND (public.is_admin_user() OR (b.submitted_by = auth.uid()) OR ((b.department_id IS NOT NULL) AND (b.department_id = public.current_department_id())))))));
+CREATE POLICY "authenticated can read own tenant events" ON public.events FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
 
 
 --
--- Name: problem_statement_attachments Users can delete own attachments or admins; Type: POLICY; Schema: public; Owner: postgres
+-- Name: page_content authenticated can read own tenant page content; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Users can delete own attachments or admins" ON public.problem_statement_attachments FOR DELETE TO authenticated USING ((public.is_admin_user() OR (uploaded_by = auth.uid())));
+CREATE POLICY "authenticated can read own tenant page content" ON public.page_content FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
 
 
 --
--- Name: problem_statement_messages Users can insert accessible messages; Type: POLICY; Schema: public; Owner: postgres
+-- Name: problem_statements authenticated can read own tenant problem statements; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Users can insert accessible messages" ON public.problem_statement_messages FOR INSERT TO authenticated WITH CHECK ((public.can_access_problem_statement(problem_statement_id) AND ((sender_id IS NULL) OR (sender_id = auth.uid()))));
+CREATE POLICY "authenticated can read own tenant problem statements" ON public.problem_statements FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND ((status = 'approved'::text) OR (created_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
 
 
 --
--- Name: problem_statement_attachments Users can insert own attachments; Type: POLICY; Schema: public; Owner: postgres
+-- Name: resources authenticated can read own tenant resources; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "Users can insert own attachments" ON public.problem_statement_attachments FOR INSERT TO authenticated WITH CHECK ((public.can_access_problem_statement(problem_statement_id) AND ((uploaded_by IS NULL) OR (uploaded_by = auth.uid()))));
-
-
---
--- Name: event_registrations Users can insert own event registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can insert own event registrations" ON public.event_registrations FOR INSERT WITH CHECK ((auth.uid() = user_id));
-
-
---
--- Name: submission_batches Users can insert own submission batches; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can insert own submission batches" ON public.submission_batches FOR INSERT TO authenticated WITH CHECK ((public.is_admin_user() OR (submitted_by = auth.uid())));
-
-
---
--- Name: team_registrations Users can insert own team registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can insert own team registrations" ON public.team_registrations FOR INSERT WITH CHECK ((auth.uid() = user_id));
-
-
---
--- Name: profiles Users can insert their own profile; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can insert their own profile" ON public.profiles FOR INSERT TO authenticated WITH CHECK ((auth.uid() = id));
-
-
---
--- Name: problem_statement_alerts Users can update own alerts; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update own alerts" ON public.problem_statement_alerts FOR UPDATE TO authenticated USING (((recipient_user_id = auth.uid()) OR public.is_admin_user())) WITH CHECK (((recipient_user_id = auth.uid()) OR public.is_admin_user()));
-
-
---
--- Name: submission_batches Users can update own submission batches; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update own submission batches" ON public.submission_batches FOR UPDATE TO authenticated USING ((public.is_admin_user() OR (submitted_by = auth.uid()))) WITH CHECK ((public.is_admin_user() OR (submitted_by = auth.uid())));
-
-
---
--- Name: team_registrations Users can update own team registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update own team registrations" ON public.team_registrations FOR UPDATE USING ((auth.uid() = user_id));
-
-
---
--- Name: problem_statement_messages Users can update read status of accessible messages; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update read status of accessible messages" ON public.problem_statement_messages FOR UPDATE TO authenticated USING (public.can_access_problem_statement(problem_statement_id)) WITH CHECK (public.can_access_problem_statement(problem_statement_id));
-
-
---
--- Name: profiles Users can update their own profile; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can update their own profile" ON public.profiles FOR UPDATE TO authenticated USING ((auth.uid() = id));
-
-
---
--- Name: problem_statement_attachments Users can view accessible attachments; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view accessible attachments" ON public.problem_statement_attachments FOR SELECT TO authenticated USING (public.can_access_problem_statement(problem_statement_id));
-
-
---
--- Name: problem_statement_messages Users can view accessible messages; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view accessible messages" ON public.problem_statement_messages FOR SELECT TO authenticated USING (public.can_access_problem_statement(problem_statement_id));
-
-
---
--- Name: problem_statement_alerts Users can view own alerts; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view own alerts" ON public.problem_statement_alerts FOR SELECT TO authenticated USING (((recipient_user_id = auth.uid()) OR public.is_admin_user()));
-
-
---
--- Name: event_registrations Users can view own event registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view own event registrations" ON public.event_registrations FOR SELECT USING ((auth.uid() = user_id));
-
-
---
--- Name: team_registrations Users can view own team registrations; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view own team registrations" ON public.team_registrations FOR SELECT USING ((auth.uid() = user_id));
-
-
---
--- Name: submission_batches Users can view relevant submission batches; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view relevant submission batches" ON public.submission_batches FOR SELECT TO authenticated USING ((public.is_admin_user() OR (submitted_by = auth.uid()) OR ((department_id IS NOT NULL) AND (department_id = public.current_department_id()))));
-
-
---
--- Name: problem_statement_reviews Users can view reviews for accessible problem statements; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view reviews for accessible problem statements" ON public.problem_statement_reviews FOR SELECT TO authenticated USING (public.can_access_problem_statement(problem_statement_id));
-
-
---
--- Name: profiles Users can view their own profile; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view their own profile" ON public.profiles FOR SELECT TO authenticated USING ((auth.uid() = id));
-
-
---
--- Name: user_queries Users can view their own queries; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view their own queries" ON public.user_queries FOR SELECT USING (((auth.uid() = user_id) OR (user_id IS NULL)));
-
-
---
--- Name: user_roles Users can view their own roles; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "Users can view their own roles" ON public.user_roles FOR SELECT TO authenticated USING ((auth.uid() = user_id));
-
-
---
--- Name: problem_statement_remarks admin update remarks; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "admin update remarks" ON public.problem_statement_remarks FOR UPDATE USING ((EXISTS ( SELECT 1
-   FROM public.user_roles
-  WHERE ((user_roles.user_id = auth.uid()) AND (user_roles.role = 'admin'::public.app_role)))));
-
-
---
--- Name: contest_settings allow reading contest settings; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "allow reading contest settings" ON public.contest_settings FOR SELECT TO authenticated, anon USING (true);
+CREATE POLICY "authenticated can read own tenant resources" ON public.resources FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
 
 
 --
@@ -6750,21 +6872,16 @@ ALTER TABLE public.event_registrations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.events ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: events_archive; Type: ROW SECURITY; Schema: public; Owner: postgres
+--
+
+ALTER TABLE public.events_archive ENABLE ROW LEVEL SECURITY;
+
+--
 -- Name: page_content; Type: ROW SECURITY; Schema: public; Owner: postgres
 --
 
 ALTER TABLE public.page_content ENABLE ROW LEVEL SECURITY;
-
---
--- Name: problem_statements problem statements visibility control; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "problem statements visibility control" ON public.problem_statements FOR SELECT TO authenticated USING (((EXISTS ( SELECT 1
-   FROM public.user_roles
-  WHERE ((user_roles.user_id = auth.uid()) AND (user_roles.role = 'admin'::public.app_role)))) OR (now() >= ( SELECT contest_settings.problems_unlock_at
-   FROM public.contest_settings
- LIMIT 1))));
-
 
 --
 -- Name: problem_statement_alerts; Type: ROW SECURITY; Schema: public; Owner: postgres
@@ -6809,10 +6926,107 @@ ALTER TABLE public.problem_statements ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 
 --
+-- Name: tenants public can read tenant slugs; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "public can read tenant slugs" ON public.tenants FOR SELECT TO authenticated, anon USING (true);
+
+
+--
 -- Name: resources; Type: ROW SECURITY; Schema: public; Owner: postgres
 --
 
 ALTER TABLE public.resources ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: problem_statements same tenant admins can delete problem statements; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant admins can delete problem statements" ON public.problem_statements FOR DELETE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
+-- Name: problem_statement_alerts same tenant can access alerts; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access alerts" ON public.problem_statement_alerts TO authenticated USING ((public.same_tenant(tenant_id) AND ((recipient_user_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((recipient_user_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statement_attachments same tenant can access attachments; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access attachments" ON public.problem_statement_attachments TO authenticated USING ((public.same_tenant(tenant_id) AND ((uploaded_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((uploaded_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statement_messages same tenant can access messages; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access messages" ON public.problem_statement_messages TO authenticated USING ((public.same_tenant(tenant_id) AND ((sender_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((sender_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statement_remarks same tenant can access remarks; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access remarks" ON public.problem_statement_remarks TO authenticated USING ((public.same_tenant(tenant_id) AND ((author_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((author_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: submission_batch_items same tenant can access submission batch items; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can access submission batch items" ON public.submission_batch_items TO authenticated USING ((EXISTS ( SELECT 1
+   FROM public.submission_batches b
+  WHERE ((b.id = submission_batch_items.batch_id) AND public.same_tenant(b.tenant_id) AND ((b.submitted_by = auth.uid()) OR public.is_tenant_admin(b.tenant_id) OR public.is_tenant_deptadmin(b.tenant_id)))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM public.submission_batches b
+  WHERE ((b.id = submission_batch_items.batch_id) AND public.same_tenant(b.tenant_id) AND ((b.submitted_by = auth.uid()) OR public.is_tenant_admin(b.tenant_id) OR public.is_tenant_deptadmin(b.tenant_id))))));
+
+
+--
+-- Name: problem_statements same tenant can create problem statements; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can create problem statements" ON public.problem_statements FOR INSERT TO authenticated WITH CHECK ((public.same_tenant(tenant_id) AND ((created_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: submission_batches same tenant can insert submission batches; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can insert submission batches" ON public.submission_batches FOR INSERT TO authenticated WITH CHECK ((public.same_tenant(tenant_id) AND ((submitted_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statements same tenant can update problem statements; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can update problem statements" ON public.problem_statements FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND ((created_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((created_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: submission_batches same tenant can update submission batches; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can update submission batches" ON public.submission_batches FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND ((submitted_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((submitted_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: problem_statement_reviews same tenant can view reviews; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can view reviews" ON public.problem_statement_reviews FOR SELECT TO authenticated USING ((EXISTS ( SELECT 1
+   FROM public.problem_statements ps
+  WHERE ((ps.id = problem_statement_reviews.problem_statement_id) AND public.same_tenant(ps.tenant_id) AND (public.is_tenant_admin(ps.tenant_id) OR public.is_tenant_deptadmin(ps.tenant_id) OR (ps.created_by = auth.uid()))))));
+
+
+--
+-- Name: submission_batches same tenant can view submission batches; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "same tenant can view submission batches" ON public.submission_batches FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND ((submitted_by = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
 
 --
 -- Name: submission_batch_items; Type: ROW SECURITY; Schema: public; Owner: postgres
@@ -6833,113 +7047,95 @@ ALTER TABLE public.submission_batches ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.team_registrations ENABLE ROW LEVEL SECURITY;
 
 --
--- Name: problem_statement_alerts tenant alerts access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: user_queries tenant admins can delete tenant queries; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant alerts access" ON public.problem_statement_alerts TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can delete tenant queries" ON public.user_queries FOR DELETE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: problem_statement_attachments tenant attachments access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: team_registrations tenant admins can delete tenant registrations; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant attachments access" ON public.problem_statement_attachments TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can delete tenant registrations" ON public.team_registrations FOR DELETE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: problem_statement_messages tenant messages access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: contest_settings tenant admins can manage contest settings; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant messages access" ON public.problem_statement_messages TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can manage contest settings" ON public.contest_settings TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: problem_statements tenant problem statements insert; Type: POLICY; Schema: public; Owner: postgres
+-- Name: events tenant admins can manage events; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant problem statements insert" ON public.problem_statements FOR INSERT TO authenticated WITH CHECK ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can manage events" ON public.events TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: problem_statements tenant problem statements select; Type: POLICY; Schema: public; Owner: postgres
+-- Name: page_content tenant admins can manage page content; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant problem statements select" ON public.problem_statements FOR SELECT TO authenticated, anon USING (true);
-
-
---
--- Name: problem_statements tenant problem statements update; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "tenant problem statements update" ON public.problem_statements FOR UPDATE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
-   FROM public.user_roles ur
-  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+CREATE POLICY "tenant admins can manage page content" ON public.page_content TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: team_registrations tenant registrations delete; Type: POLICY; Schema: public; Owner: postgres
+-- Name: resources tenant admins can manage resources; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant registrations delete" ON public.team_registrations FOR DELETE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
-   FROM public.user_roles ur
-  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+CREATE POLICY "tenant admins can manage resources" ON public.resources TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
--- Name: team_registrations tenant registrations select; Type: POLICY; Schema: public; Owner: postgres
+-- Name: problem_statement_reviews tenant admins can manage reviews; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant registrations select" ON public.team_registrations FOR SELECT TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
-
-
---
--- Name: team_registrations tenant registrations update; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "tenant registrations update" ON public.team_registrations FOR UPDATE TO authenticated USING (((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))) AND (EXISTS ( SELECT 1
-   FROM public.user_roles ur
-  WHERE ((ur.user_id = auth.uid()) AND (ur.role = ANY (ARRAY['admin'::public.app_role, 'deptadmin'::public.app_role])))))));
+CREATE POLICY "tenant admins can manage reviews" ON public.problem_statement_reviews TO authenticated USING ((EXISTS ( SELECT 1
+   FROM public.problem_statements ps
+  WHERE ((ps.id = problem_statement_reviews.problem_statement_id) AND public.same_tenant(ps.tenant_id) AND (public.is_tenant_admin(ps.tenant_id) OR public.is_tenant_deptadmin(ps.tenant_id)))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM public.problem_statements ps
+  WHERE ((ps.id = problem_statement_reviews.problem_statement_id) AND public.same_tenant(ps.tenant_id) AND (public.is_tenant_admin(ps.tenant_id) OR public.is_tenant_deptadmin(ps.tenant_id))))));
 
 
 --
--- Name: problem_statement_remarks tenant remarks access; Type: POLICY; Schema: public; Owner: postgres
+-- Name: event_registrations tenant admins can manage tenant event registrations; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant remarks access" ON public.problem_statement_remarks TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
-
-
---
--- Name: resources tenant resources select; Type: POLICY; Schema: public; Owner: postgres
---
-
-CREATE POLICY "tenant resources select" ON public.resources FOR SELECT TO authenticated, anon USING (true);
+CREATE POLICY "tenant admins can manage tenant event registrations" ON public.event_registrations FOR UPDATE TO authenticated USING ((EXISTS ( SELECT 1
+   FROM public.events e
+  WHERE ((e.id = event_registrations.event_id) AND public.same_tenant(e.tenant_id) AND public.is_tenant_admin(e.tenant_id))))) WITH CHECK ((EXISTS ( SELECT 1
+   FROM public.events e
+  WHERE ((e.id = event_registrations.event_id) AND public.same_tenant(e.tenant_id) AND public.is_tenant_admin(e.tenant_id)))));
 
 
 --
--- Name: resources tenant resources update; Type: POLICY; Schema: public; Owner: postgres
+-- Name: user_roles tenant admins can manage tenant roles; Type: POLICY; Schema: public; Owner: postgres
 --
 
-CREATE POLICY "tenant resources update" ON public.resources FOR UPDATE TO authenticated USING ((tenant_id = ( SELECT profiles.tenant_id
-   FROM public.profiles
-  WHERE (profiles.id = auth.uid()))));
+CREATE POLICY "tenant admins can manage tenant roles" ON public.user_roles TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
+-- Name: profiles tenant admins can update tenant profiles; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant admins can update tenant profiles" ON public.profiles FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
+-- Name: user_queries tenant admins can update tenant queries; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant admins can update tenant queries" ON public.user_queries FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
+-- Name: profiles tenant admins can view tenant profiles; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant admins can view tenant profiles" ON public.profiles FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
 
 
 --
@@ -6959,6 +7155,87 @@ ALTER TABLE public.user_queries ENABLE ROW LEVEL SECURITY;
 --
 
 ALTER TABLE public.user_roles ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: event_registrations users can insert own tenant event registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can insert own tenant event registrations" ON public.event_registrations FOR INSERT TO authenticated WITH CHECK (((user_id = auth.uid()) AND (EXISTS ( SELECT 1
+   FROM public.events e
+  WHERE ((e.id = event_registrations.event_id) AND public.same_tenant(e.tenant_id))))));
+
+
+--
+-- Name: profiles users can insert own tenant profile; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can insert own tenant profile" ON public.profiles FOR INSERT TO authenticated WITH CHECK (((id = auth.uid()) AND (tenant_id IS NOT NULL)));
+
+
+--
+-- Name: team_registrations users can insert own tenant registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can insert own tenant registrations" ON public.team_registrations FOR INSERT TO authenticated WITH CHECK ((public.same_tenant(tenant_id) AND (user_id = auth.uid())));
+
+
+--
+-- Name: user_queries users can submit own tenant queries; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can submit own tenant queries" ON public.user_queries FOR INSERT TO authenticated WITH CHECK ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR (user_id IS NULL))));
+
+
+--
+-- Name: profiles users can update own tenant profile; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can update own tenant profile" ON public.profiles FOR UPDATE TO authenticated USING (((id = auth.uid()) AND public.same_tenant(tenant_id))) WITH CHECK (((id = auth.uid()) AND public.same_tenant(tenant_id)));
+
+
+--
+-- Name: team_registrations users can update own tenant registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can update own tenant registrations" ON public.team_registrations FOR UPDATE TO authenticated USING ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR public.is_tenant_admin(tenant_id)))) WITH CHECK ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR public.is_tenant_admin(tenant_id))));
+
+
+--
+-- Name: event_registrations users can view own tenant event registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant event registrations" ON public.event_registrations FOR SELECT TO authenticated USING (((user_id = auth.uid()) OR (EXISTS ( SELECT 1
+   FROM public.events e
+  WHERE ((e.id = event_registrations.event_id) AND public.same_tenant(e.tenant_id) AND public.is_tenant_admin(e.tenant_id))))));
+
+
+--
+-- Name: profiles users can view own tenant profile; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant profile" ON public.profiles FOR SELECT TO authenticated USING (((id = auth.uid()) AND public.same_tenant(tenant_id)));
+
+
+--
+-- Name: user_queries users can view own tenant queries; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant queries" ON public.user_queries FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR public.is_tenant_admin(tenant_id))));
+
+
+--
+-- Name: team_registrations users can view own tenant registrations; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant registrations" ON public.team_registrations FOR SELECT TO authenticated USING ((public.same_tenant(tenant_id) AND ((user_id = auth.uid()) OR public.is_tenant_admin(tenant_id) OR public.is_tenant_deptadmin(tenant_id))));
+
+
+--
+-- Name: user_roles users can view own tenant roles; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "users can view own tenant roles" ON public.user_roles FOR SELECT TO authenticated USING (((user_id = auth.uid()) AND public.same_tenant(tenant_id)));
+
 
 --
 -- Name: messages; Type: ROW SECURITY; Schema: realtime; Owner: supabase_realtime_admin
@@ -7234,6 +7511,16 @@ GRANT USAGE ON SCHEMA auth TO postgres;
 
 
 --
+-- Name: SCHEMA cron; Type: ACL; Schema: -; Owner: supabase_admin
+--
+
+GRANT USAGE ON SCHEMA cron TO postgres WITH GRANT OPTION;
+SET SESSION AUTHORIZATION postgres;
+GRANT USAGE ON SCHEMA cron TO postgres;
+RESET SESSION AUTHORIZATION;
+
+
+--
 -- Name: SCHEMA extensions; Type: ACL; Schema: -; Owner: postgres
 --
 
@@ -7311,6 +7598,55 @@ GRANT ALL ON FUNCTION auth.role() TO dashboard_user;
 --
 
 GRANT ALL ON FUNCTION auth.uid() TO dashboard_user;
+
+
+--
+-- Name: FUNCTION alter_job(job_id bigint, schedule text, command text, database text, username text, active boolean); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.alter_job(job_id bigint, schedule text, command text, database text, username text, active boolean) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION job_cache_invalidate(); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.job_cache_invalidate() TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION schedule(schedule text, command text); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.schedule(schedule text, command text) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION schedule(job_name text, schedule text, command text); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.schedule(job_name text, schedule text, command text) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION schedule_in_database(job_name text, schedule text, command text, database text, username text, active boolean); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.schedule_in_database(job_name text, schedule text, command text, database text, username text, active boolean) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION unschedule(job_id bigint); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.unschedule(job_id bigint) TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: FUNCTION unschedule(job_name text); Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION cron.unschedule(job_name text) TO postgres WITH GRANT OPTION;
 
 
 --
@@ -7826,6 +8162,24 @@ GRANT ALL ON FUNCTION pgbouncer.get_auth(p_usename text) TO pgbouncer;
 
 
 --
+-- Name: FUNCTION archive_completed_events(p_older_than interval); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.archive_completed_events(p_older_than interval) TO anon;
+GRANT ALL ON FUNCTION public.archive_completed_events(p_older_than interval) TO authenticated;
+GRANT ALL ON FUNCTION public.archive_completed_events(p_older_than interval) TO service_role;
+
+
+--
+-- Name: FUNCTION archive_past_events(p_older_than interval); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.archive_past_events(p_older_than interval) TO anon;
+GRANT ALL ON FUNCTION public.archive_past_events(p_older_than interval) TO authenticated;
+GRANT ALL ON FUNCTION public.archive_past_events(p_older_than interval) TO service_role;
+
+
+--
 -- Name: FUNCTION can_access_problem_statement(ps_id uuid); Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -7859,6 +8213,15 @@ GRANT ALL ON FUNCTION public.check_team_name_exists(team_name_input text) TO ser
 GRANT ALL ON FUNCTION public.current_department_id() TO anon;
 GRANT ALL ON FUNCTION public.current_department_id() TO authenticated;
 GRANT ALL ON FUNCTION public.current_department_id() TO service_role;
+
+
+--
+-- Name: FUNCTION current_tenant_id(); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.current_tenant_id() TO anon;
+GRANT ALL ON FUNCTION public.current_tenant_id() TO authenticated;
+GRANT ALL ON FUNCTION public.current_tenant_id() TO service_role;
 
 
 --
@@ -7898,6 +8261,15 @@ GRANT ALL ON FUNCTION public.has_role(_user_id uuid, _role public.app_role) TO s
 
 
 --
+-- Name: FUNCTION has_tenant_role(_role public.app_role, _tenant_id uuid); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) TO anon;
+GRANT ALL ON FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION public.has_tenant_role(_role public.app_role, _tenant_id uuid) TO service_role;
+
+
+--
 -- Name: FUNCTION increment_curr_registrations(problem_uuid uuid); Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -7916,12 +8288,39 @@ GRANT ALL ON FUNCTION public.is_admin_user() TO service_role;
 
 
 --
+-- Name: FUNCTION is_tenant_admin(_tenant_id uuid); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.is_tenant_admin(_tenant_id uuid) TO anon;
+GRANT ALL ON FUNCTION public.is_tenant_admin(_tenant_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION public.is_tenant_admin(_tenant_id uuid) TO service_role;
+
+
+--
+-- Name: FUNCTION is_tenant_deptadmin(_tenant_id uuid); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) TO anon;
+GRANT ALL ON FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) TO service_role;
+
+
+--
 -- Name: FUNCTION problem_statements_set_defaults(); Type: ACL; Schema: public; Owner: postgres
 --
 
 GRANT ALL ON FUNCTION public.problem_statements_set_defaults() TO anon;
 GRANT ALL ON FUNCTION public.problem_statements_set_defaults() TO authenticated;
 GRANT ALL ON FUNCTION public.problem_statements_set_defaults() TO service_role;
+
+
+--
+-- Name: FUNCTION same_tenant(_tenant_id uuid); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.same_tenant(_tenant_id uuid) TO anon;
+GRANT ALL ON FUNCTION public.same_tenant(_tenant_id uuid) TO authenticated;
+GRANT ALL ON FUNCTION public.same_tenant(_tenant_id uuid) TO service_role;
 
 
 --
@@ -7940,6 +8339,24 @@ GRANT ALL ON FUNCTION public.set_updated_at() TO service_role;
 GRANT ALL ON FUNCTION public.sync_profile_role() TO anon;
 GRANT ALL ON FUNCTION public.sync_profile_role() TO authenticated;
 GRANT ALL ON FUNCTION public.sync_profile_role() TO service_role;
+
+
+--
+-- Name: FUNCTION sync_profiles_from_user_roles(); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.sync_profiles_from_user_roles() TO anon;
+GRANT ALL ON FUNCTION public.sync_profiles_from_user_roles() TO authenticated;
+GRANT ALL ON FUNCTION public.sync_profiles_from_user_roles() TO service_role;
+
+
+--
+-- Name: FUNCTION sync_user_roles_from_profiles(); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.sync_user_roles_from_profiles() TO anon;
+GRANT ALL ON FUNCTION public.sync_user_roles_from_profiles() TO authenticated;
+GRANT ALL ON FUNCTION public.sync_user_roles_from_profiles() TO service_role;
 
 
 --
@@ -8039,6 +8456,14 @@ GRANT ALL ON FUNCTION realtime.send(payload jsonb, event text, topic text, priva
 
 
 --
+-- Name: FUNCTION send_binary(payload bytea, event text, topic text, private boolean); Type: ACL; Schema: realtime; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean) TO postgres;
+GRANT ALL ON FUNCTION realtime.send_binary(payload bytea, event text, topic text, private boolean) TO dashboard_user;
+
+
+--
 -- Name: FUNCTION subscription_check_filters(); Type: ACL; Schema: realtime; Owner: supabase_admin
 --
 
@@ -8068,6 +8493,14 @@ GRANT ALL ON FUNCTION realtime.to_regrole(role_name text) TO supabase_realtime_a
 
 GRANT ALL ON FUNCTION realtime.topic() TO postgres;
 GRANT ALL ON FUNCTION realtime.topic() TO dashboard_user;
+
+
+--
+-- Name: FUNCTION wal2json_escape_identifier(name text); Type: ACL; Schema: realtime; Owner: supabase_admin
+--
+
+GRANT ALL ON FUNCTION realtime.wal2json_escape_identifier(name text) TO postgres;
+GRANT ALL ON FUNCTION realtime.wal2json_escape_identifier(name text) TO dashboard_user;
 
 
 --
@@ -8301,6 +8734,26 @@ GRANT ALL ON TABLE auth.webauthn_credentials TO dashboard_user;
 
 
 --
+-- Name: TABLE job; Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT SELECT ON TABLE cron.job TO postgres WITH GRANT OPTION;
+SET SESSION AUTHORIZATION postgres;
+GRANT SELECT ON TABLE cron.job TO postgres;
+RESET SESSION AUTHORIZATION;
+
+
+--
+-- Name: TABLE job_run_details; Type: ACL; Schema: cron; Owner: supabase_admin
+--
+
+GRANT ALL ON TABLE cron.job_run_details TO postgres WITH GRANT OPTION;
+SET SESSION AUTHORIZATION postgres;
+GRANT ALL ON TABLE cron.job_run_details TO postgres;
+RESET SESSION AUTHORIZATION;
+
+
+--
 -- Name: TABLE pg_stat_statements; Type: ACL; Schema: extensions; Owner: postgres
 --
 
@@ -8352,6 +8805,15 @@ GRANT ALL ON TABLE public.event_registrations TO service_role;
 GRANT ALL ON TABLE public.events TO anon;
 GRANT ALL ON TABLE public.events TO authenticated;
 GRANT ALL ON TABLE public.events TO service_role;
+
+
+--
+-- Name: TABLE events_archive; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON TABLE public.events_archive TO anon;
+GRANT ALL ON TABLE public.events_archive TO authenticated;
+GRANT ALL ON TABLE public.events_archive TO service_role;
 
 
 --
@@ -8695,6 +9157,27 @@ ALTER DEFAULT PRIVILEGES FOR ROLE supabase_auth_admin IN SCHEMA auth GRANT ALL O
 
 
 --
+-- Name: DEFAULT PRIVILEGES FOR SEQUENCES; Type: DEFAULT ACL; Schema: cron; Owner: supabase_admin
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA cron GRANT ALL ON SEQUENCES TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR FUNCTIONS; Type: DEFAULT ACL; Schema: cron; Owner: supabase_admin
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA cron GRANT ALL ON FUNCTIONS TO postgres WITH GRANT OPTION;
+
+
+--
+-- Name: DEFAULT PRIVILEGES FOR TABLES; Type: DEFAULT ACL; Schema: cron; Owner: supabase_admin
+--
+
+ALTER DEFAULT PRIVILEGES FOR ROLE supabase_admin IN SCHEMA cron GRANT ALL ON TABLES TO postgres WITH GRANT OPTION;
+
+
+--
 -- Name: DEFAULT PRIVILEGES FOR SEQUENCES; Type: DEFAULT ACL; Schema: extensions; Owner: supabase_admin
 --
 
@@ -8957,5 +9440,5 @@ ALTER EVENT TRIGGER pgrst_drop_watch OWNER TO supabase_admin;
 -- PostgreSQL database dump complete
 --
 
-\unrestrict NBUkwZgW6O4SPQ3Jc1DqfFSUwdhZRU8jWdddO6l8FcvvxNg8lsOaQ4oOYQEoKef
+\unrestrict 4T7IjG2dq41gFbEnmw1bYT30CbDAcvZpOhf3Ixgb05KUc7a4S7rqxkeue4ghT6e
 
