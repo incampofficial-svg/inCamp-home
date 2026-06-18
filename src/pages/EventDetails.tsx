@@ -7,6 +7,8 @@ import { Calendar, Clock, MapPin } from "lucide-react";
 import { Layout } from "@/components/layout/Layout";
 import { useTenant } from "@/context/TenantContext";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
+import { useAuth } from "@/contexts/AuthContext";
+import { LoginGate } from "@/components/LoginGate";
 
 interface Event {
   id: string;
@@ -29,6 +31,7 @@ export default function EventDetails() {
   const { id } = useParams();
   const navigate = useNavigate();
   const { tenant } = useTenant();
+  const { user } = useAuth();
   const [event, setEvent] = useState<Event | null>(null);
   const [loading, setLoading] = useState(true);
   const [imageOpen, setImageOpen] = useState(false);
@@ -48,6 +51,18 @@ export default function EventDetails() {
     if (!error) setEvent(data);
     setLoading(false);
   };
+
+  if (!user) {
+    return (
+      <Layout>
+        <LoginGate
+          title="Login to view event details"
+          description="Please log in to access event details and registration links."
+          actionLabel="Login to view events"
+        />
+      </Layout>
+    );
+  }
 
   if (loading) {
     return (

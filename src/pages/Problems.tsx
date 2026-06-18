@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Link } from "react-router-dom";
 import { Search, ArrowRight, GraduationCap, Users, Lightbulb, AlertCircle, Plus, Edit, Trash2 } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/contexts/AuthContext";
 import { useAdmin } from "@/hooks/useAdmin";
 import { ProblemFormDialog } from "@/components/admin/ProblemFormDialog";
 import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
@@ -12,6 +13,7 @@ import { toast } from "sonner";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
 import { fetchProblemsUnlockAt } from "@/lib/contestSettings";
+import { LoginGate } from "@/components/LoginGate";
 
 // Default theme metadata used when a tenant has no custom themes
 const DEFAULT_THEME_META: { [key: string]: { icon: any; description: string; color: string } } = {
@@ -58,6 +60,7 @@ export default function Problems() {
   const [unlockTime, setUnlockTime] = useState<Date | null>(null);
   const [timeRemaining, setTimeRemaining] = useState<string>("");
   const [isUnlocked, setIsUnlocked] = useState<boolean>(false);
+  const { user } = useAuth();
   const { isAdmin } = useAdmin();
   const { tenant } = useTenant();
 
@@ -108,16 +111,16 @@ export default function Problems() {
   const fetchThemes = async () => {
     try {
       if (!tenant?.id) return;
-      const { data, error } = await supabase.from("themes").select("id, name").eq("tenant_id", tenant.id).order("name", { ascending: true });
+      const { data, error } = await supabase.from("themes").select("id, name, description").eq("tenant_id", tenant.id).order("name", { ascending: true });
       if (error) {
         console.error("Error fetching themes:", error);
         // fallback to defaults
-        setThemes(Object.keys(DEFAULT_THEME_META).map((name) => ({ name })));
+        setThemes(Object.keys(DEFAULT_THEME_META).map((name) => ({ name, description: DEFAULT_THEME_META[name]?.description })));
       } else if (data && (data as any).length > 0) {
-        setThemes((data as any).map((t: any) => ({ id: t.id, name: t.name })));
+        setThemes((data as any).map((t: any) => ({ id: t.id, name: t.name, description: t.description })));
       } else {
         // No themes in DB: use defaults
-        setThemes(Object.keys(DEFAULT_THEME_META).map((name) => ({ name })));
+        setThemes(Object.keys(DEFAULT_THEME_META).map((name) => ({ name, description: DEFAULT_THEME_META[name]?.description })));
       }
     } catch (err) {
       console.error("Error loading themes:", err);
@@ -156,11 +159,11 @@ export default function Problems() {
   }, [isAdmin, tenant?.id]);
 
   useEffect(() => {
-    if (isUnlocked) {
+    if (isUnlocked && user) {
       fetchProblems();
     }
     fetchThemes();
-  }, [isUnlocked, tenant?.id]);
+  }, [isUnlocked, tenant?.id, user]);
 
   useEffect(() => {
     if (!unlockTime || isUnlocked) return;
@@ -186,6 +189,18 @@ export default function Problems() {
 
     return () => clearInterval(interval);
   }, [unlockTime, isUnlocked]);
+
+  if (!user) {
+    return (
+      <Layout>
+        <LoginGate
+          title="Login to view problem statements"
+          description="Please log in to see problem statements and related details."
+          actionLabel="Login to view problems"
+        />
+      </Layout>
+    );
+  }
 
   const handleSave = async (data: Omit<ProblemStatement, "id" | "created_at">) => {
     setSaving(true);
@@ -397,19 +412,19 @@ export default function Problems() {
                     <button
                       key={theme.id}
                       onClick={() => setActiveTheme(isActive ? "All" : theme.name)}
-                      className={`p-6 rounded-3xl border-2 transition-all text-left ${isActive
+                      className={`pt-0 px-6 pb-4 rounded-3xl border-2 transition-all text-left ${isActive
                         ? "border-secondary bg-secondary/5 shadow-lg"
                         : "border-border bg-card hover:border-secondary/50 hover:shadow-md"
                         }`}
                     >
-                      <div className={`w-12 h-12 rounded-lg ${theme.color} flex items-center justify-center mb-4`}>
-                        <Icon className="w-6 h-6 text-white" />
+                      <div className={`w-8 h-8 rounded-lg ${theme.color} flex items-center justify-center mb-1`}>
+                        <Icon className="w-4 h-4 text-white" />
                       </div>
                       <h3 className="font-poppins font-semibold text-lg text-foreground mb-2">
                         {theme.name}
                       </h3>
                       <p className="text-muted-foreground text-sm mb-3">
-                        {DEFAULT_THEME_META[theme.name]?.description || "Problems under this theme."}
+                        {theme.description || DEFAULT_THEME_META[theme.name]?.description || "Problems under this theme."}
                       </p>
                       <span className="text-secondary font-medium text-sm">
                         {problemCounts[theme.name]} Problems

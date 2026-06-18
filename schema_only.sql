@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict 4T7IjG2dq41gFbEnmw1bYT30CbDAcvZpOhf3Ixgb05KUc7a4S7rqxkeue4ghT6e
+\restrict xCUwyf4Hb1eS1CN6XJqJg4HWEar1zrsHdcdJ9NUUGdAIMtk5uCpM3dS97Gv7i20
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 18.3
@@ -1201,6 +1201,30 @@ $$;
 ALTER FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) OWNER TO postgres;
 
 --
+-- Name: prevent_theme_delete(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.prevent_theme_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.problem_statements ps
+    WHERE ps.theme = OLD.name
+      AND ps.tenant_id = OLD.tenant_id
+    LIMIT 1
+  ) THEN
+    RAISE EXCEPTION 'Cannot delete theme "%", it is used by existing problem statements.', OLD.name;
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+
+ALTER FUNCTION public.prevent_theme_delete() OWNER TO postgres;
+
+--
 -- Name: problem_statements_set_defaults(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -1973,7 +1997,6 @@ DECLARE
   final_payload jsonb;
 BEGIN
   BEGIN
-    -- Generate a new UUID for the id
     generated_id := gen_random_uuid();
 
     -- Check if payload has an 'id' key, if not, add the generated UUID
@@ -1986,13 +2009,11 @@ BEGIN
     -- Set the topic configuration
     EXECUTE format('SET LOCAL realtime.topic TO %L', topic);
 
-    -- Attempt to insert the message
     INSERT INTO realtime.messages (id, payload, event, topic, private, extension)
     VALUES (generated_id, final_payload, event, topic, private, 'broadcast');
   EXCEPTION
     WHEN OTHERS THEN
-      -- Capture and notify the error
-      RAISE WARNING 'ErrorSendingBroadcastMessage: %', SQLERRM;
+      RAISE WARNING 'WarnSendingBroadcastMessage: %', SQLERRM;
   END;
 END;
 $$;
@@ -2019,7 +2040,7 @@ BEGIN
     VALUES (generated_id, payload, event, topic, private, 'broadcast');
   EXCEPTION
     WHEN OTHERS THEN
-      RAISE WARNING 'ErrorSendingBroadcastMessage: %', SQLERRM;
+      RAISE WARNING 'WarnSendingBroadcastMessage: %', SQLERRM;
   END;
 END;
 $$;
@@ -2036,40 +2057,31 @@ CREATE FUNCTION realtime.subscription_check_filters() RETURNS trigger
     AS $$
 declare
     col_names text[] = coalesce(
-            array_agg(c.column_name order by c.ordinal_position),
+            array_agg(a.attname order by a.attnum),
             '{}'::text[]
         )
         from
-            information_schema.columns c
+            pg_catalog.pg_attribute a
         where
-            format('%I.%I', c.table_schema, c.table_name)::regclass = new.entity
+            a.attrelid = new.entity
+            and a.attnum > 0
+            and not a.attisdropped
             and pg_catalog.has_column_privilege(
                 (new.claims ->> 'role'),
-                format('%I.%I', c.table_schema, c.table_name)::regclass,
-                c.column_name,
+                a.attrelid,
+                a.attnum,
                 'SELECT'
             );
-    table_col_names text[] = coalesce(
-            array_agg(pa.attname),
-            '{}'::text[]
-        )
-        from
-            pg_attribute pa
-        where
-            pa.attrelid = new.entity
-            and pa.attnum > 0;
     filter realtime.user_defined_filter;
     col_type regtype;
     in_val jsonb;
     selected_col text;
 begin
     for filter in select * from unnest(new.filters) loop
-        -- Filtered column is valid
         if not filter.column_name = any(col_names) then
             raise exception 'invalid column for filter %', filter.column_name;
         end if;
 
-        -- Type is sanitized and safe for string interpolation
         col_type = (
             select atttypid::regtype
             from pg_catalog.pg_attribute
@@ -2079,18 +2091,17 @@ begin
         if col_type is null then
             raise exception 'failed to lookup type for column %', filter.column_name;
         end if;
+
         if filter.op = 'in'::realtime.equality_op then
             in_val = realtime.cast(filter.value, (col_type::text || '[]')::regtype);
             if coalesce(jsonb_array_length(in_val), 0) > 100 then
                 raise exception 'too many values for `in` filter. Maximum 100';
             end if;
         else
-            -- raises an exception if value is not coercable to type
             perform realtime.cast(filter.value, col_type);
         end if;
     end loop;
 
-    -- Validate that selected_columns reference columns the role can SELECT
     if new.selected_columns is not null then
         for selected_col in select * from unnest(new.selected_columns) loop
             if not selected_col = any(col_names) then
@@ -2099,15 +2110,11 @@ begin
         end loop;
     end if;
 
-    -- Apply consistent order to filters so the unique constraint on
-    -- (subscription_id, entity, filters) can't be tricked by a different filter order
     new.filters = coalesce(
         array_agg(f order by f.column_name, f.op, f.value),
         '{}'
     ) from unnest(new.filters) f;
 
-    -- Normalize selected_columns order so ARRAY['a','b'] and ARRAY['b','a'] are
-    -- treated as the same subscription group in apply_rls
     new.selected_columns = (
         select array_agg(c order by c)
         from unnest(new.selected_columns) c
@@ -4199,6 +4206,20 @@ CREATE TABLE public.tenants (
 ALTER TABLE public.tenants OWNER TO postgres;
 
 --
+-- Name: themes; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.themes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    tenant_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+ALTER TABLE public.themes OWNER TO postgres;
+
+--
 -- Name: user_queries; Type: TABLE; Schema: public; Owner: postgres
 --
 
@@ -5105,6 +5126,14 @@ ALTER TABLE ONLY public.tenants
 
 
 --
+-- Name: themes themes_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.themes
+    ADD CONSTRAINT themes_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: problem_statement_remarks unique_problem_remark; Type: CONSTRAINT; Schema: public; Owner: postgres
 --
 
@@ -5877,6 +5906,13 @@ CREATE UNIQUE INDEX team_registrations_team_name_lower_unique ON public.team_reg
 
 
 --
+-- Name: themes_tenant_name_lower_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE UNIQUE INDEX themes_tenant_name_lower_idx ON public.themes USING btree (tenant_id, lower(name));
+
+
+--
 -- Name: ix_realtime_subscription_entity; Type: INDEX; Schema: realtime; Owner: supabase_admin
 --
 
@@ -6070,6 +6106,13 @@ CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users FOR EACH ROW EXEC
 --
 
 CREATE TRIGGER on_team_registration_insert AFTER INSERT ON public.team_registrations FOR EACH ROW EXECUTE FUNCTION public.handle_new_team_registration();
+
+
+--
+-- Name: themes themes_prevent_delete; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER themes_prevent_delete BEFORE DELETE ON public.themes FOR EACH ROW EXECUTE FUNCTION public.prevent_theme_delete();
 
 
 --
@@ -7118,6 +7161,13 @@ CREATE POLICY "tenant admins can manage tenant roles" ON public.user_roles TO au
 
 
 --
+-- Name: themes tenant admins can manage themes; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant admins can manage themes" ON public.themes TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
 -- Name: profiles tenant admins can update tenant profiles; Type: POLICY; Schema: public; Owner: postgres
 --
 
@@ -7139,10 +7189,30 @@ CREATE POLICY "tenant admins can view tenant profiles" ON public.profiles FOR SE
 
 
 --
+-- Name: themes tenant deptadmins can manage themes; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant deptadmins can manage themes" ON public.themes TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_deptadmin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_deptadmin(tenant_id)));
+
+
+--
+-- Name: themes tenant users can read themes; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant users can read themes" ON public.themes FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
+
+
+--
 -- Name: tenants; Type: ROW SECURITY; Schema: public; Owner: postgres
 --
 
 ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: themes; Type: ROW SECURITY; Schema: public; Owner: postgres
+--
+
+ALTER TABLE public.themes ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: user_queries; Type: ROW SECURITY; Schema: public; Owner: postgres
@@ -8306,6 +8376,15 @@ GRANT ALL ON FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) TO service_rol
 
 
 --
+-- Name: FUNCTION prevent_theme_delete(); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.prevent_theme_delete() TO anon;
+GRANT ALL ON FUNCTION public.prevent_theme_delete() TO authenticated;
+GRANT ALL ON FUNCTION public.prevent_theme_delete() TO service_role;
+
+
+--
 -- Name: FUNCTION problem_statements_set_defaults(); Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -8943,6 +9022,15 @@ GRANT ALL ON TABLE public.tenants TO service_role;
 
 
 --
+-- Name: TABLE themes; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON TABLE public.themes TO anon;
+GRANT ALL ON TABLE public.themes TO authenticated;
+GRANT ALL ON TABLE public.themes TO service_role;
+
+
+--
 -- Name: TABLE user_queries; Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -9440,5 +9528,5 @@ ALTER EVENT TRIGGER pgrst_drop_watch OWNER TO supabase_admin;
 -- PostgreSQL database dump complete
 --
 
-\unrestrict 4T7IjG2dq41gFbEnmw1bYT30CbDAcvZpOhf3Ixgb05KUc7a4S7rqxkeue4ghT6e
+\unrestrict xCUwyf4Hb1eS1CN6XJqJg4HWEar1zrsHdcdJ9NUUGdAIMtk5uCpM3dS97Gv7i20
 

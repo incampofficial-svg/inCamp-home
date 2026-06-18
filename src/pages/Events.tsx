@@ -7,12 +7,14 @@ import { Textarea } from "@/components/ui/textarea";
 import { Calendar, Clock, MapPin, Plus, Edit, Trash2, Save, X } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { Layout } from "@/components/layout/Layout";
+import { useAuth } from "@/contexts/AuthContext";
 import { useAdmin } from "@/hooks/useAdmin";
 import { EventFormDialog } from "@/components/admin/EventFormDialog";
 import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
 import { toast } from "sonner";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
+import { LoginGate } from "@/components/LoginGate";
 
 interface Event {
   id: string;
@@ -115,6 +117,7 @@ export default function EventsPage() {
   const [editingHeader, setEditingHeader] = useState(false);
   const [headerSaving, setHeaderSaving] = useState(false);
   const navigate = useNavigate();
+  const { user } = useAuth();
   const { isAdmin } = useAdmin();
   const { tenant } = useTenant();
 
@@ -125,9 +128,14 @@ export default function EventsPage() {
   const [saving, setSaving] = useState(false);
 
   useEffect(() => {
+    if (!tenant?.id || !user) {
+      setLoading(false);
+      return;
+    }
+
     fetchEvents();
     fetchPageText();
-    }, [tenant?.id]);   
+  }, [tenant?.id, user]);
 
   const fetchEvents = async () => {
     const { data, error } = await (supabase as any)
@@ -263,6 +271,18 @@ export default function EventsPage() {
       hour: "2-digit",
       minute: "2-digit",
     });
+
+  if (!user) {
+    return (
+      <Layout>
+        <LoginGate
+          title="Login to view events"
+          description="Please log in to browse upcoming events and access event registration."
+          actionLabel="Login to view events"
+        />
+      </Layout>
+    );
+  }
 
   if (loading) {
     return (
