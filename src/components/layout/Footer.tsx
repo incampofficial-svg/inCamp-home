@@ -87,9 +87,7 @@ export function Footer() {
           {/* Logo & Description */}
           <div className="space-y-4">
             <div className="flex items-center gap-2">
-              <div className="w-10 h-10 rounded-lg bg-secondary flex items-center justify-center">
-                <span className="text-secondary-foreground font-poppins font-bold text-lg">C</span>
-              </div>
+              <img src="/favicon.png" alt="inCamp" className="w-10 h-10 rounded-lg" />
               <span className="font-poppins font-semibold text-xl">inCamp</span>
             </div>
             <p className="text-primary-foreground/80 text-sm leading-relaxed">
@@ -143,7 +141,7 @@ export function Footer() {
         {/* Bottom Bar */}
         <div className="mt-12 pt-8 border-t border-primary-foreground/20">
           <p className="text-center text-primary-foreground/60 text-sm">
-            © {new Date().getFullYear()} inCamp – Chapter 1. Organized by Geenovate Foundation. All rights reserved.
+            © {new Date().getFullYear()} inCamp. Organized by Geenovate Foundation. All rights reserved.
           </p>
         </div>
       </div>
