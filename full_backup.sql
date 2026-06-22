@@ -2,7 +2,7 @@
 -- PostgreSQL database dump
 --
 
-\restrict zNBmaSPEVW02Irboi5BooricXbleH5JVGtGOfWFqFABTmxtwIcQjVvX2v6Z9oCY
+\restrict C0sGbBiBpEHfwbNsn2gx8RqxaGtY5dyIAubPO8BZtitELSuihOl8S6ceicDPVtU
 
 -- Dumped from database version 17.6
 -- Dumped by pg_dump version 18.3
@@ -1201,6 +1201,30 @@ $$;
 ALTER FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) OWNER TO postgres;
 
 --
+-- Name: prevent_theme_delete(); Type: FUNCTION; Schema: public; Owner: postgres
+--
+
+CREATE FUNCTION public.prevent_theme_delete() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM public.problem_statements ps
+    WHERE ps.theme = OLD.name
+      AND ps.tenant_id = OLD.tenant_id
+    LIMIT 1
+  ) THEN
+    RAISE EXCEPTION 'Cannot delete theme "%", it is used by existing problem statements.', OLD.name;
+  END IF;
+  RETURN OLD;
+END;
+$$;
+
+
+ALTER FUNCTION public.prevent_theme_delete() OWNER TO postgres;
+
+--
 -- Name: problem_statements_set_defaults(); Type: FUNCTION; Schema: public; Owner: postgres
 --
 
@@ -1973,7 +1997,6 @@ DECLARE
   final_payload jsonb;
 BEGIN
   BEGIN
-    -- Generate a new UUID for the id
     generated_id := gen_random_uuid();
 
     -- Check if payload has an 'id' key, if not, add the generated UUID
@@ -1986,13 +2009,11 @@ BEGIN
     -- Set the topic configuration
     EXECUTE format('SET LOCAL realtime.topic TO %L', topic);
 
-    -- Attempt to insert the message
     INSERT INTO realtime.messages (id, payload, event, topic, private, extension)
     VALUES (generated_id, final_payload, event, topic, private, 'broadcast');
   EXCEPTION
     WHEN OTHERS THEN
-      -- Capture and notify the error
-      RAISE WARNING 'ErrorSendingBroadcastMessage: %', SQLERRM;
+      RAISE WARNING 'WarnSendingBroadcastMessage: %', SQLERRM;
   END;
 END;
 $$;
@@ -2019,7 +2040,7 @@ BEGIN
     VALUES (generated_id, payload, event, topic, private, 'broadcast');
   EXCEPTION
     WHEN OTHERS THEN
-      RAISE WARNING 'ErrorSendingBroadcastMessage: %', SQLERRM;
+      RAISE WARNING 'WarnSendingBroadcastMessage: %', SQLERRM;
   END;
 END;
 $$;
@@ -2036,40 +2057,31 @@ CREATE FUNCTION realtime.subscription_check_filters() RETURNS trigger
     AS $$
 declare
     col_names text[] = coalesce(
-            array_agg(c.column_name order by c.ordinal_position),
+            array_agg(a.attname order by a.attnum),
             '{}'::text[]
         )
         from
-            information_schema.columns c
+            pg_catalog.pg_attribute a
         where
-            format('%I.%I', c.table_schema, c.table_name)::regclass = new.entity
+            a.attrelid = new.entity
+            and a.attnum > 0
+            and not a.attisdropped
             and pg_catalog.has_column_privilege(
                 (new.claims ->> 'role'),
-                format('%I.%I', c.table_schema, c.table_name)::regclass,
-                c.column_name,
+                a.attrelid,
+                a.attnum,
                 'SELECT'
             );
-    table_col_names text[] = coalesce(
-            array_agg(pa.attname),
-            '{}'::text[]
-        )
-        from
-            pg_attribute pa
-        where
-            pa.attrelid = new.entity
-            and pa.attnum > 0;
     filter realtime.user_defined_filter;
     col_type regtype;
     in_val jsonb;
     selected_col text;
 begin
     for filter in select * from unnest(new.filters) loop
-        -- Filtered column is valid
         if not filter.column_name = any(col_names) then
             raise exception 'invalid column for filter %', filter.column_name;
         end if;
 
-        -- Type is sanitized and safe for string interpolation
         col_type = (
             select atttypid::regtype
             from pg_catalog.pg_attribute
@@ -2079,18 +2091,17 @@ begin
         if col_type is null then
             raise exception 'failed to lookup type for column %', filter.column_name;
         end if;
+
         if filter.op = 'in'::realtime.equality_op then
             in_val = realtime.cast(filter.value, (col_type::text || '[]')::regtype);
             if coalesce(jsonb_array_length(in_val), 0) > 100 then
                 raise exception 'too many values for `in` filter. Maximum 100';
             end if;
         else
-            -- raises an exception if value is not coercable to type
             perform realtime.cast(filter.value, col_type);
         end if;
     end loop;
 
-    -- Validate that selected_columns reference columns the role can SELECT
     if new.selected_columns is not null then
         for selected_col in select * from unnest(new.selected_columns) loop
             if not selected_col = any(col_names) then
@@ -2099,15 +2110,11 @@ begin
         end loop;
     end if;
 
-    -- Apply consistent order to filters so the unique constraint on
-    -- (subscription_id, entity, filters) can't be tricked by a different filter order
     new.filters = coalesce(
         array_agg(f order by f.column_name, f.op, f.value),
         '{}'
     ) from unnest(new.filters) f;
 
-    -- Normalize selected_columns order so ARRAY['a','b'] and ARRAY['b','a'] are
-    -- treated as the same subscription group in apply_rls
     new.selected_columns = (
         select array_agg(c order by c)
         from unnest(new.selected_columns) c
@@ -4199,6 +4206,20 @@ CREATE TABLE public.tenants (
 ALTER TABLE public.tenants OWNER TO postgres;
 
 --
+-- Name: themes; Type: TABLE; Schema: public; Owner: postgres
+--
+
+CREATE TABLE public.themes (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    name text NOT NULL,
+    tenant_id uuid NOT NULL,
+    created_at timestamp with time zone DEFAULT now()
+);
+
+
+ALTER TABLE public.themes OWNER TO postgres;
+
+--
 -- Name: user_queries; Type: TABLE; Schema: public; Owner: postgres
 --
 
@@ -4666,9 +4687,8 @@ COPY auth.instances (id, uuid, raw_base_config, created_at, updated_at) FROM std
 COPY auth.mfa_amr_claims (session_id, created_at, updated_at, authentication_method, id) FROM stdin;
 661ab255-7150-4bb1-af9c-3c55d35128a7	2026-05-28 08:59:22.487088+00	2026-05-28 08:59:22.487088+00	password	8f6d8fbc-9f64-4976-8f7a-0abae9d56e2a
 4efc29ef-893a-41d5-8bc4-5639ef427ee9	2026-05-28 09:25:20.044047+00	2026-05-28 09:25:20.044047+00	password	46bd205a-33b4-49ba-b5d6-33ff9595d963
-49eaad77-5f9f-470d-babe-9c3f22046eef	2026-05-28 09:37:10.747315+00	2026-05-28 09:37:10.747315+00	password	1639cbea-92d9-4123-8345-e410a494241b
 d967d768-9611-4b9d-adcc-0af86ad909bb	2026-05-28 09:37:26.604093+00	2026-05-28 09:37:26.604093+00	password	8b3af0a1-c912-47d9-9c85-7326f9a07c22
-417df4f3-34ce-4af9-a0ac-ef483e3f6cb5	2026-05-28 10:14:30.349515+00	2026-05-28 10:14:30.349515+00	password	c74d3952-88aa-444e-aab6-bc92b6298478
+e5bf4bab-8481-4261-891a-11e20b5b233b	2026-06-18 06:36:49.951043+00	2026-06-18 06:36:49.951043+00	password	5b484c6c-9e3e-4d6b-8fe2-120a9c515457
 b8591ffa-b91f-4eb3-b644-075e68adeb47	2026-05-28 07:06:25.316105+00	2026-05-28 07:06:25.316105+00	password	62620a42-b167-4def-8b1b-7ebea5dd9178
 b5e61792-8088-40c1-bdd9-860c9c62cc8b	2026-05-29 06:37:50.369552+00	2026-05-29 06:37:50.369552+00	password	e013f39a-aa51-4edb-9272-d3e361ecaf19
 8603c917-e253-4e42-bd8d-a8be14d40f94	2026-05-28 07:12:18.123713+00	2026-05-28 07:12:18.123713+00	password	15be8e87-1ad5-47fc-8ff2-fb2cbb893c26
@@ -4677,13 +4697,16 @@ b61a4643-ec2e-40b8-9e12-2ffebe17b920	2026-05-29 06:42:34.800329+00	2026-05-29 06
 3ce6c222-95d3-46c9-8dc5-974ba870abfb	2026-05-29 06:44:50.263804+00	2026-05-29 06:44:50.263804+00	password	442f7ab9-1488-4f3f-9a1f-3c0ced36d7ad
 8d0c8278-d6b4-4290-b0ed-080c07d65a13	2026-04-16 16:04:23.942872+00	2026-04-16 16:04:23.942872+00	otp	ca5d6c54-1dc0-4eeb-97d6-2bbccd9c53fb
 a76f5fed-6a03-40d9-b2d7-2acf895ce7d8	2026-05-29 06:45:36.330691+00	2026-05-29 06:45:36.330691+00	password	17185761-6fa9-4396-94a8-a8e523dd897a
-afdb3340-8b61-48c7-bbd5-747d425ce99f	2026-05-29 06:46:26.262208+00	2026-05-29 06:46:26.262208+00	password	57f962de-2b6d-4c83-9e77-fdcc86a94136
 b4a49cb0-0b5a-4295-a106-acaf14602e9b	2026-05-29 06:47:35.675982+00	2026-05-29 06:47:35.675982+00	password	0d28d493-7e91-4654-8143-9d7876f26691
 4b4a996f-9979-44e4-8b0c-fe1e62464b30	2026-03-10 04:37:16.070448+00	2026-03-10 04:37:16.070448+00	otp	5473cf53-8e25-4ffe-be15-d59b5ba66494
-35f9bd15-a054-4315-b4fd-092eb8d4cb57	2026-05-29 07:20:38.432071+00	2026-05-29 07:20:38.432071+00	otp	1b9a2b95-c4a7-41ec-8853-6fd7974f01f9
 b71c0817-a47b-4c03-8ed3-4d0c8cfd8bad	2026-05-29 07:32:40.951836+00	2026-05-29 07:32:40.951836+00	password	95abc842-6d80-4bb8-a770-775bdd595467
-f8160813-6e1a-443f-bc69-03353095811d	2026-05-30 06:26:54.208984+00	2026-05-30 06:26:54.208984+00	password	5b3bafa6-ea9f-4776-9dde-eadfdaf82786
-7b03a3e4-bfe1-4fe2-924d-3c4b8ccf1dca	2026-06-04 10:22:44.975048+00	2026-06-04 10:22:44.975048+00	password	f8340e79-faf1-422e-9bde-e1654aa4b08e
+5678ad3d-a932-4b82-80e2-0b04316326a8	2026-06-06 07:41:27.294942+00	2026-06-06 07:41:27.294942+00	password	7c3209e6-7130-408f-889f-e267e873b383
+7e579c1b-3573-4b6e-9034-2c4ac1a526d6	2026-06-06 07:47:55.944893+00	2026-06-06 07:47:55.944893+00	password	21510e35-2b9a-4b81-9d2e-bd10e0a56d58
+6f5852aa-158f-481d-a703-ce92c4617207	2026-06-06 08:10:41.306841+00	2026-06-06 08:10:41.306841+00	password	6f858135-dc5d-4cfb-ab11-aff81bf38233
+2a46e00f-083f-4fc9-aa1d-9550404b6ca4	2026-06-14 12:38:51.205377+00	2026-06-14 12:38:51.205377+00	password	af348922-c767-4d18-a116-8b8400443774
+9869946c-8777-4c38-9bf8-6060915720dd	2026-06-14 13:59:50.350829+00	2026-06-14 13:59:50.350829+00	password	53fa9f69-4e7b-46fb-8ebe-b52bd337222f
+e62301df-9038-444d-95a9-a66e1c30bfbd	2026-06-16 05:47:37.790026+00	2026-06-16 05:47:37.790026+00	password	ec8b889c-168e-4270-a36c-36cd69190f35
+466e150b-5557-4534-bb42-71ea04aba575	2026-06-16 06:53:09.42132+00	2026-06-16 06:53:09.42132+00	password	c5f6aeb6-76e6-457c-a0e6-6a6c11b98506
 \.
 
 
@@ -4752,17 +4775,15 @@ COPY auth.one_time_tokens (id, user_id, token_type, token_hash, relates_to, crea
 COPY auth.refresh_tokens (instance_id, id, token, user_id, revoked, created_at, updated_at, parent, session_id) FROM stdin;
 00000000-0000-0000-0000-000000000000	866	e3umr2njgmmd	b84fe995-c654-433b-949a-5d14b471481b	t	2026-05-28 07:06:25.314884+00	2026-05-28 08:52:15.939426+00	\N	b8591ffa-b91f-4eb3-b644-075e68adeb47
 00000000-0000-0000-0000-000000000000	890	ug6dt2jxqcsr	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-28 08:52:15.950196+00	2026-05-28 08:52:15.950196+00	e3umr2njgmmd	b8591ffa-b91f-4eb3-b644-075e68adeb47
-00000000-0000-0000-0000-000000000000	1044	mea7vznsuoal	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:46:26.2512+00	2026-05-29 08:06:41.133358+00	\N	afdb3340-8b61-48c7-bbd5-747d425ce99f
-00000000-0000-0000-0000-000000000000	896	qs7hb3cus7x2	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-28 09:37:10.744061+00	2026-05-28 09:37:10.744061+00	\N	49eaad77-5f9f-470d-babe-9c3f22046eef
+00000000-0000-0000-0000-000000000000	1077	xqcx3usltau2	bc00594c-8776-4bef-9d32-cf6176f89f81	f	2026-06-06 07:47:55.930255+00	2026-06-06 07:47:55.930255+00	\N	7e579c1b-3573-4b6e-9034-2c4ac1a526d6
+00000000-0000-0000-0000-000000000000	1081	2lthhoikbb5g	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-06-14 12:38:51.197844+00	2026-06-14 12:38:51.197844+00	\N	2a46e00f-083f-4fc9-aa1d-9550404b6ca4
 00000000-0000-0000-0000-000000000000	897	rlbpknkdzbbb	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-28 09:37:26.602955+00	2026-05-28 09:37:26.602955+00	\N	d967d768-9611-4b9d-adcc-0af86ad909bb
 00000000-0000-0000-0000-000000000000	577	ofoelurvgmba	f6601227-10dc-4bb5-9be0-a48df646882c	f	2026-03-10 04:37:16.05829+00	2026-03-10 04:37:16.05829+00	\N	4b4a996f-9979-44e4-8b0c-fe1e62464b30
-00000000-0000-0000-0000-000000000000	899	3ttux73pw7l3	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-28 10:14:30.325117+00	2026-05-28 10:14:30.325117+00	\N	417df4f3-34ce-4af9-a0ac-ef483e3f6cb5
 00000000-0000-0000-0000-000000000000	891	nha22hfv57de	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 08:59:22.471861+00	2026-05-28 11:05:50.062019+00	\N	661ab255-7150-4bb1-af9c-3c55d35128a7
+00000000-0000-0000-0000-000000000000	1089	qehn76gkgm3s	bc00594c-8776-4bef-9d32-cf6176f89f81	f	2026-06-16 05:47:37.787076+00	2026-06-16 05:47:37.787076+00	\N	e62301df-9038-444d-95a9-a66e1c30bfbd
 00000000-0000-0000-0000-000000000000	900	6qj5on5foxem	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 11:05:50.099272+00	2026-05-28 12:04:21.101245+00	nha22hfv57de	661ab255-7150-4bb1-af9c-3c55d35128a7
-00000000-0000-0000-0000-000000000000	1064	2m7lxronks4l	f6601227-10dc-4bb5-9be0-a48df646882c	f	2026-05-30 06:26:54.207627+00	2026-05-30 06:26:54.207627+00	\N	f8160813-6e1a-443f-bc69-03353095811d
 00000000-0000-0000-0000-000000000000	901	7qgb2mjy5zrq	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 12:04:21.117998+00	2026-05-28 13:05:09.440816+00	6qj5on5foxem	661ab255-7150-4bb1-af9c-3c55d35128a7
 00000000-0000-0000-0000-000000000000	871	bujalc6ms5eu	f6601227-10dc-4bb5-9be0-a48df646882c	f	2026-05-28 07:12:18.121639+00	2026-05-28 07:12:18.121639+00	\N	8603c917-e253-4e42-bd8d-a8be14d40f94
-00000000-0000-0000-0000-000000000000	1068	q7unc4z27mr6	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-06-04 15:18:15.048163+00	2026-06-04 15:18:15.048163+00	zhk2tteu7ijb	7b03a3e4-bfe1-4fe2-924d-3c4b8ccf1dca
 00000000-0000-0000-0000-000000000000	704	ei66b5rirvtx	f6e82f04-701a-4e83-84a9-b311eaed6db2	f	2026-04-16 16:04:23.922313+00	2026-04-16 16:04:23.922313+00	\N	8d0c8278-d6b4-4290-b0ed-080c07d65a13
 00000000-0000-0000-0000-000000000000	902	ujksn5mit24e	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-05-28 13:05:09.4662+00	2026-05-28 14:47:16.834484+00	7qgb2mjy5zrq	661ab255-7150-4bb1-af9c-3c55d35128a7
 00000000-0000-0000-0000-000000000000	903	n2xtac6puhtu	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-05-28 14:47:16.859634+00	2026-05-28 14:47:16.859634+00	ujksn5mit24e	661ab255-7150-4bb1-af9c-3c55d35128a7
@@ -4772,9 +4793,12 @@ COPY auth.refresh_tokens (instance_id, id, token, user_id, revoked, created_at, 
 00000000-0000-0000-0000-000000000000	972	nqm3ub334pmu	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:01.735083+00	2026-05-29 06:43:02.044359+00	\N	0ece92fa-53df-42db-a509-8b2b01ce3321
 00000000-0000-0000-0000-000000000000	1045	dmw43uipkj33	2e83ba6a-9778-4e84-80b2-168409debced	f	2026-05-29 06:47:35.674096+00	2026-05-29 06:47:35.674096+00	\N	b4a49cb0-0b5a-4295-a106-acaf14602e9b
 00000000-0000-0000-0000-000000000000	973	ics3i6js4ls4	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:02.046417+00	2026-05-29 06:43:02.642345+00	nqm3ub334pmu	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	1079	pgvuuekqxfal	f6601227-10dc-4bb5-9be0-a48df646882c	f	2026-06-06 08:10:41.305486+00	2026-06-06 08:10:41.305486+00	\N	6f5852aa-158f-481d-a703-ce92c4617207
+00000000-0000-0000-0000-000000000000	1086	w55qpdgx3kye	bc00594c-8776-4bef-9d32-cf6176f89f81	f	2026-06-15 13:21:03.938049+00	2026-06-15 13:21:03.938049+00	cdmgh5foznf7	9869946c-8777-4c38-9bf8-6060915720dd
+00000000-0000-0000-0000-000000000000	1090	7q6a6lrf2dn3	bc00594c-8776-4bef-9d32-cf6176f89f81	f	2026-06-16 06:53:09.384852+00	2026-06-16 06:53:09.384852+00	\N	466e150b-5557-4534-bb42-71ea04aba575
 00000000-0000-0000-0000-000000000000	974	lsash653uoyn	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:02.64293+00	2026-05-29 06:43:02.929343+00	ics3i6js4ls4	0ece92fa-53df-42db-a509-8b2b01ce3321
+00000000-0000-0000-0000-000000000000	1096	mhcvzydnmdm2	bc00594c-8776-4bef-9d32-cf6176f89f81	f	2026-06-18 06:36:49.936907+00	2026-06-18 06:36:49.936907+00	\N	e5bf4bab-8481-4261-891a-11e20b5b233b
 00000000-0000-0000-0000-000000000000	975	bfb3zxup3s5m	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:02.929799+00	2026-05-29 06:43:03.214898+00	lsash653uoyn	0ece92fa-53df-42db-a509-8b2b01ce3321
-00000000-0000-0000-0000-000000000000	1052	4rynw2dxrraz	bc00594c-8776-4bef-9d32-cf6176f89f81	t	2026-05-29 07:20:38.415153+00	2026-05-29 12:06:58.974365+00	\N	35f9bd15-a054-4315-b4fd-092eb8d4cb57
 00000000-0000-0000-0000-000000000000	976	ixk74vd3qrk7	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:43:03.215823+00	2026-05-29 06:43:03.504066+00	bfb3zxup3s5m	0ece92fa-53df-42db-a509-8b2b01ce3321
 00000000-0000-0000-0000-000000000000	964	m3twdtdgiokz	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:34.799118+00	2026-05-29 06:42:35.090563+00	\N	b61a4643-ec2e-40b8-9e12-2ffebe17b920
 00000000-0000-0000-0000-000000000000	965	3ycmpvuur3cy	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:42:35.091783+00	2026-05-29 06:42:35.658734+00	m3twdtdgiokz	b61a4643-ec2e-40b8-9e12-2ffebe17b920
@@ -4810,24 +4834,22 @@ COPY auth.refresh_tokens (instance_id, id, token, user_id, revoked, created_at, 
 00000000-0000-0000-0000-000000000000	1001	wihc7zqt6uqf	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:54.633392+00	2026-05-29 06:44:54.923419+00	qatzxi3nyx54	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1002	ngh6vkjyah7t	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:54.923751+00	2026-05-29 06:44:55.212989+00	wihc7zqt6uqf	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1003	d655sh7bvvwv	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:55.213816+00	2026-05-29 06:44:55.503847+00	ngh6vkjyah7t	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1075	6zcz2lf6v5e2	ea5561b5-6918-4212-83d9-5e48dec790ce	f	2026-06-06 07:41:27.286989+00	2026-06-06 07:41:27.286989+00	\N	5678ad3d-a932-4b82-80e2-0b04316326a8
 00000000-0000-0000-0000-000000000000	1004	qf6b42o6p2gn	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:55.504469+00	2026-05-29 06:44:55.802394+00	d655sh7bvvwv	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1005	5bkcxjn7byff	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:55.802795+00	2026-05-29 06:44:56.089784+00	qf6b42o6p2gn	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1006	tjp7u7f2rtzc	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:56.091008+00	2026-05-29 06:44:56.380446+00	5bkcxjn7byff	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1007	utow4kr3atzg	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:56.382055+00	2026-05-29 06:44:56.672054+00	tjp7u7f2rtzc	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1008	hxawuqyutgts	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:56.672373+00	2026-05-29 06:44:56.964353+00	utow4kr3atzg	3ce6c222-95d3-46c9-8dc5-974ba870abfb
+00000000-0000-0000-0000-000000000000	1084	cdmgh5foznf7	bc00594c-8776-4bef-9d32-cf6176f89f81	t	2026-06-14 13:59:50.348729+00	2026-06-15 13:21:03.905962+00	\N	9869946c-8777-4c38-9bf8-6060915720dd
 00000000-0000-0000-0000-000000000000	1009	47r5h47v42mg	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:56.965773+00	2026-05-29 06:44:57.24927+00	hxawuqyutgts	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1056	ezexqay7f75s	b84fe995-c654-433b-949a-5d14b471481b	f	2026-05-29 07:32:40.94995+00	2026-05-29 07:32:40.94995+00	\N	b71c0817-a47b-4c03-8ed3-4d0c8cfd8bad
 00000000-0000-0000-0000-000000000000	1010	f7h35os6agwx	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:57.250208+00	2026-05-29 06:44:57.55352+00	47r5h47v42mg	3ce6c222-95d3-46c9-8dc5-974ba870abfb
-00000000-0000-0000-0000-000000000000	1058	yoxzaxezgki7	2e83ba6a-9778-4e84-80b2-168409debced	f	2026-05-29 08:06:41.13933+00	2026-05-29 08:06:41.13933+00	mea7vznsuoal	afdb3340-8b61-48c7-bbd5-747d425ce99f
 00000000-0000-0000-0000-000000000000	1011	htx7v6knnzrx	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:57.554596+00	2026-05-29 06:44:57.852909+00	f7h35os6agwx	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1012	turig3ymxscz	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:57.853815+00	2026-05-29 06:44:58.150777+00	htx7v6knnzrx	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1013	vvem6oyq2xg7	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:58.15114+00	2026-05-29 06:44:58.442106+00	turig3ymxscz	3ce6c222-95d3-46c9-8dc5-974ba870abfb
-00000000-0000-0000-0000-000000000000	1060	prkbr6vidj2y	bc00594c-8776-4bef-9d32-cf6176f89f81	t	2026-05-29 12:06:59.006505+00	2026-06-02 14:03:30.62955+00	4rynw2dxrraz	35f9bd15-a054-4315-b4fd-092eb8d4cb57
 00000000-0000-0000-0000-000000000000	1014	eufsd7vfwjlq	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:58.443463+00	2026-05-29 06:44:58.733765+00	vvem6oyq2xg7	3ce6c222-95d3-46c9-8dc5-974ba870abfb
-00000000-0000-0000-0000-000000000000	1065	z43pfebnpn4p	bc00594c-8776-4bef-9d32-cf6176f89f81	f	2026-06-02 14:03:30.662897+00	2026-06-02 14:03:30.662897+00	prkbr6vidj2y	35f9bd15-a054-4315-b4fd-092eb8d4cb57
 00000000-0000-0000-0000-000000000000	1015	44p6jsopx3u4	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:58.734965+00	2026-05-29 06:44:59.01969+00	eufsd7vfwjlq	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1016	yw2grrsc25vx	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:59.020142+00	2026-05-29 06:44:59.299383+00	44p6jsopx3u4	3ce6c222-95d3-46c9-8dc5-974ba870abfb
-00000000-0000-0000-0000-000000000000	1067	zhk2tteu7ijb	ea5561b5-6918-4212-83d9-5e48dec790ce	t	2026-06-04 10:22:44.940595+00	2026-06-04 15:18:15.027991+00	\N	7b03a3e4-bfe1-4fe2-924d-3c4b8ccf1dca
 00000000-0000-0000-0000-000000000000	1017	4bedbssyrgk6	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:59.300115+00	2026-05-29 06:44:59.596263+00	yw2grrsc25vx	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1018	d6vsfsz6vvtn	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:59.597017+00	2026-05-29 06:44:59.882476+00	4bedbssyrgk6	3ce6c222-95d3-46c9-8dc5-974ba870abfb
 00000000-0000-0000-0000-000000000000	1019	w4jlvx5wydjq	2e83ba6a-9778-4e84-80b2-168409debced	t	2026-05-29 06:44:59.883614+00	2026-05-29 06:45:00.175436+00	d6vsfsz6vvtn	3ce6c222-95d3-46c9-8dc5-974ba870abfb
@@ -4972,17 +4994,19 @@ a76f5fed-6a03-40d9-b2d7-2acf895ce7d8	2e83ba6a-9778-4e84-80b2-168409debced	2026-0
 0ece92fa-53df-42db-a509-8b2b01ce3321	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:43:01.726011+00	2026-05-29 06:43:06.070164+00	\N	aal1	\N	2026-05-29 06:43:06.070072	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
 b61a4643-ec2e-40b8-9e12-2ffebe17b920	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:42:34.797751+00	2026-05-29 06:42:37.105919+00	\N	aal1	\N	2026-05-29 06:42:37.105804	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
 b4a49cb0-0b5a-4295-a106-acaf14602e9b	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:47:35.671476+00	2026-05-29 06:47:35.671476+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
-afdb3340-8b61-48c7-bbd5-747d425ce99f	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:46:26.241331+00	2026-05-29 08:06:41.156101+00	\N	aal1	\N	2026-05-29 08:06:41.155389	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	122.183.150.39	\N	\N	\N	\N	\N
 3ce6c222-95d3-46c9-8dc5-974ba870abfb	2e83ba6a-9778-4e84-80b2-168409debced	2026-05-29 06:44:50.187517+00	2026-05-29 06:45:00.761756+00	\N	aal1	\N	2026-05-29 06:45:00.761657	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
-49eaad77-5f9f-470d-babe-9c3f22046eef	b84fe995-c654-433b-949a-5d14b471481b	2026-05-28 09:37:10.729574+00	2026-05-28 09:37:10.729574+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.156.51	\N	\N	\N	\N	\N
 d967d768-9611-4b9d-adcc-0af86ad909bb	b84fe995-c654-433b-949a-5d14b471481b	2026-05-28 09:37:26.601753+00	2026-05-28 09:37:26.601753+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.156.51	\N	\N	\N	\N	\N
 b71c0817-a47b-4c03-8ed3-4d0c8cfd8bad	b84fe995-c654-433b-949a-5d14b471481b	2026-05-29 07:32:40.947714+00	2026-05-29 07:32:40.947714+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.158.12	\N	\N	\N	\N	\N
-f8160813-6e1a-443f-bc69-03353095811d	f6601227-10dc-4bb5-9be0-a48df646882c	2026-05-30 06:26:54.206007+00	2026-05-30 06:26:54.206007+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.214.0.232	\N	\N	\N	\N	\N
-417df4f3-34ce-4af9-a0ac-ef483e3f6cb5	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 10:14:30.306609+00	2026-05-28 10:14:30.306609+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.214.0.232	\N	\N	\N	\N	\N
-35f9bd15-a054-4315-b4fd-092eb8d4cb57	bc00594c-8776-4bef-9d32-cf6176f89f81	2026-05-29 07:20:38.386562+00	2026-06-02 14:03:30.699735+00	\N	aal1	\N	2026-06-02 14:03:30.699634	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	122.183.36.188	\N	\N	\N	\N	\N
-7b03a3e4-bfe1-4fe2-924d-3c4b8ccf1dca	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-06-04 10:22:44.909447+00	2026-06-04 15:18:15.078673+00	\N	aal1	\N	2026-06-04 15:18:15.078564	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.157.39	\N	\N	\N	\N	\N
+e5bf4bab-8481-4261-891a-11e20b5b233b	bc00594c-8776-4bef-9d32-cf6176f89f81	2026-06-18 06:36:49.912791+00	2026-06-18 06:36:49.912791+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36	49.37.157.118	\N	\N	\N	\N	\N
 661ab255-7150-4bb1-af9c-3c55d35128a7	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 08:59:22.441108+00	2026-05-28 14:47:16.885173+00	\N	aal1	\N	2026-05-28 14:47:16.885066	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.156.51	\N	\N	\N	\N	\N
 4efc29ef-893a-41d5-8bc4-5639ef427ee9	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 09:25:20.015103+00	2026-05-28 14:47:42.499541+00	\N	aal1	\N	2026-05-28 14:47:42.499444	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	49.37.156.51	\N	\N	\N	\N	\N
+5678ad3d-a932-4b82-80e2-0b04316326a8	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-06-06 07:41:27.280068+00	2026-06-06 07:41:27.280068+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.205.28.37	\N	\N	\N	\N	\N
+9869946c-8777-4c38-9bf8-6060915720dd	bc00594c-8776-4bef-9d32-cf6176f89f81	2026-06-14 13:59:50.347477+00	2026-06-15 13:21:03.977942+00	\N	aal1	\N	2026-06-15 13:21:03.9774	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	27.57.93.184	\N	\N	\N	\N	\N
+7e579c1b-3573-4b6e-9034-2c4ac1a526d6	bc00594c-8776-4bef-9d32-cf6176f89f81	2026-06-06 07:47:55.893249+00	2026-06-06 07:47:55.893249+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.205.28.37	\N	\N	\N	\N	\N
+6f5852aa-158f-481d-a703-ce92c4617207	f6601227-10dc-4bb5-9be0-a48df646882c	2026-06-06 08:10:41.29826+00	2026-06-06 08:10:41.29826+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36	106.205.28.37	\N	\N	\N	\N	\N
+2a46e00f-083f-4fc9-aa1d-9550404b6ca4	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-06-14 12:38:51.184578+00	2026-06-14 12:38:51.184578+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36	49.37.150.222	\N	\N	\N	\N	\N
+e62301df-9038-444d-95a9-a66e1c30bfbd	bc00594c-8776-4bef-9d32-cf6176f89f81	2026-06-16 05:47:37.786074+00	2026-06-16 05:47:37.786074+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36	49.37.158.111	\N	\N	\N	\N	\N
+466e150b-5557-4534-bb42-71ea04aba575	bc00594c-8776-4bef-9d32-cf6176f89f81	2026-06-16 06:53:09.341637+00	2026-06-16 06:53:09.341637+00	\N	aal1	\N	\N	Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36	49.37.158.111	\N	\N	\N	\N	\N
 \.
 
 
@@ -5008,16 +5032,16 @@ COPY auth.sso_providers (id, resource_id, created_at, updated_at, disabled) FROM
 
 COPY auth.users (instance_id, id, aud, role, email, encrypted_password, email_confirmed_at, invited_at, confirmation_token, confirmation_sent_at, recovery_token, recovery_sent_at, email_change_token_new, email_change, email_change_sent_at, last_sign_in_at, raw_app_meta_data, raw_user_meta_data, is_super_admin, created_at, updated_at, phone, phone_confirmed_at, phone_change, phone_change_token, phone_change_sent_at, email_change_token_current, email_change_confirm_status, banned_until, reauthentication_token, reauthentication_sent_at, is_sso_user, deleted_at, is_anonymous) FROM stdin;
 00000000-0000-0000-0000-000000000000	b280f8c8-b05a-4237-b606-802420092eb1	authenticated	authenticated	23r11a67c7@gcet.edu.in	$2a$10$Hw0R100d6KpNcNHDAVZVou1oP1996BIlcnJYAQqp1rCf5rhBxryOi	2026-02-14 05:26:50.4084+00	\N		2026-02-14 05:26:30.899003+00		\N			\N	2026-02-14 05:27:28.154323+00	{"provider": "email", "providers": ["email"]}	{"sub": "b280f8c8-b05a-4237-b606-802420092eb1", "name": "advika", "email": "23r11a67c7@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-02-14 05:26:30.863318+00	2026-02-14 05:27:28.157119+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	bc00594c-8776-4bef-9d32-cf6176f89f81	authenticated	authenticated	23r11a0531@gcet.edu.in	$2a$10$ILyeD8yB/qHwj.uEbEYng.ZiV2hMNoImNvj4.Dp/CHT9YYTQn6UdW	2026-05-29 07:20:38.363541+00	\N		2026-05-29 07:15:19.796459+00		\N			\N	2026-05-29 07:20:38.384481+00	{"provider": "email", "providers": ["email"]}	{"sub": "bc00594c-8776-4bef-9d32-cf6176f89f81", "name": "Vivek Vardhan", "year": "4", "email": "23r11a0531@gcet.edu.in", "tenant_id": "0ee52668-ea70-4740-9f7b-b15ba5535254", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-05-29 07:15:19.688332+00	2026-06-02 14:03:30.683331+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	2e83ba6a-9778-4e84-80b2-168409debced	authenticated	authenticated	23r11a0515@gcet.edu.in	$2a$10$qxp3ooqfxDqfCR/Er/zWiukQmoP4OOINmMTbO1xPjkWtsBb0/wAvW	2026-05-29 05:55:41.460556+00	\N		2026-05-29 05:55:01.099802+00		\N			\N	2026-05-29 06:47:35.671387+00	{"provider": "email", "providers": ["email"]}	{"sub": "2e83ba6a-9778-4e84-80b2-168409debced", "name": "Advika", "year": "4", "email": "23r11a0515@gcet.edu.in", "tenant_id": "0ee52668-ea70-4740-9f7b-b15ba5535254", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-05-29 05:55:01.037614+00	2026-05-29 08:06:41.14456+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	ea5561b5-6918-4212-83d9-5e48dec790ce	authenticated	authenticated	23r11a0544@gcet.edu.in	$2a$10$qeFWBM14aNcOZHN7sulZFugqnpIJNTFjzope/uzeiZvsTK6a5pE1K	2026-02-10 15:04:07.871251+00	\N		\N		\N			\N	2026-06-04 10:22:44.908418+00	{"provider": "email", "providers": ["email"]}	{"sub": "ea5561b5-6918-4212-83d9-5e48dec790ce", "name": "Jay", "email": "23r11a0544@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-02-10 15:03:19.438845+00	2026-06-04 15:18:15.064262+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	f6601227-10dc-4bb5-9be0-a48df646882c	authenticated	authenticated	23r11a0505@gcet.edu.in	$2a$10$JoIF2WbMXOA.zSsS594QaO8YpgW1j62hLHGszIwLM7AvkcAtvlSGW	2026-03-10 04:37:16.046228+00	\N		2026-03-10 04:36:59.199945+00		\N			\N	2026-05-30 06:26:54.205916+00	{"provider": "email", "providers": ["email"]}	{"sub": "f6601227-10dc-4bb5-9be0-a48df646882c", "name": "Shivani", "email": "23r11a0505@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-10 04:36:59.157124+00	2026-05-30 06:26:54.208685+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	b84fe995-c654-433b-949a-5d14b471481b	authenticated	authenticated	23r11a0546@gcet.edu.in	$2a$10$6PWqyEbPVahnILEsDlnrZ.N/PzHXRzWyYq2f.xDPnVIcB.TFeQEpu	2026-03-03 08:29:21.748028+00	\N		2026-03-03 08:25:15.234103+00		\N			\N	2026-05-29 07:32:40.947621+00	{"provider": "email", "providers": ["email"]}	{"sub": "b84fe995-c654-433b-949a-5d14b471481b", "name": "rishik", "email": "23r11a0546@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-03 08:25:15.22731+00	2026-06-15 06:11:38.203768+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	bc00594c-8776-4bef-9d32-cf6176f89f81	authenticated	authenticated	23r11a0531@gcet.edu.in	$2a$10$ILyeD8yB/qHwj.uEbEYng.ZiV2hMNoImNvj4.Dp/CHT9YYTQn6UdW	2026-05-29 07:20:38.363541+00	\N		2026-05-29 07:15:19.796459+00		\N			\N	2026-06-18 06:36:49.911087+00	{"provider": "email", "providers": ["email"]}	{"sub": "bc00594c-8776-4bef-9d32-cf6176f89f81", "name": "Vivek Vardhan", "year": "4", "email": "23r11a0531@gcet.edu.in", "tenant_id": "0ee52668-ea70-4740-9f7b-b15ba5535254", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-05-29 07:15:19.688332+00	2026-06-18 06:36:49.950296+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	2e83ba6a-9778-4e84-80b2-168409debced	authenticated	authenticated	23r11a0515@gcet.edu.in	$2a$10$qxp3ooqfxDqfCR/Er/zWiukQmoP4OOINmMTbO1xPjkWtsBb0/wAvW	2026-05-29 05:55:41.460556+00	\N		2026-05-29 05:55:01.099802+00		\N			\N	2026-06-16 05:46:45.500222+00	{"provider": "email", "providers": ["email"]}	{"sub": "2e83ba6a-9778-4e84-80b2-168409debced", "name": "Advika", "year": "4", "email": "23r11a0515@gcet.edu.in", "tenant_id": "0ee52668-ea70-4740-9f7b-b15ba5535254", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-05-29 05:55:01.037614+00	2026-06-16 05:46:45.526628+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	ea5561b5-6918-4212-83d9-5e48dec790ce	authenticated	authenticated	23r11a0544@gcet.edu.in	$2a$10$qeFWBM14aNcOZHN7sulZFugqnpIJNTFjzope/uzeiZvsTK6a5pE1K	2026-02-10 15:04:07.871251+00	\N		\N		\N			\N	2026-06-18 06:29:10.236103+00	{"provider": "email", "providers": ["email"]}	{"sub": "ea5561b5-6918-4212-83d9-5e48dec790ce", "name": "Jay", "email": "23r11a0544@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-02-10 15:03:19.438845+00	2026-06-18 06:29:10.253826+00	\N	\N			\N		0	\N		\N	f	\N	f
+00000000-0000-0000-0000-000000000000	f6601227-10dc-4bb5-9be0-a48df646882c	authenticated	authenticated	23r11a0505@gcet.edu.in	$2a$10$JoIF2WbMXOA.zSsS594QaO8YpgW1j62hLHGszIwLM7AvkcAtvlSGW	2026-03-10 04:37:16.046228+00	\N		2026-03-10 04:36:59.199945+00		\N			\N	2026-06-06 08:10:41.29817+00	{"provider": "email", "providers": ["email"]}	{"sub": "f6601227-10dc-4bb5-9be0-a48df646882c", "name": "Shivani", "email": "23r11a0505@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-10 04:36:59.157124+00	2026-06-06 08:10:41.306454+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	ec79d798-6f6f-4549-8d79-edd15870b43b	authenticated	authenticated	23r11a0566@gcet.edu.in	$2a$10$SoOh1We.JwePj0lg3AAY/.F.frMi9vT9djHexgOn69PS525lgHj0S	\N	\N	59c5025a182016539fc625b9dcc945b992f9334734da09d9d8a757e2	2026-02-15 18:58:18.482872+00		\N			\N	\N	{"provider": "email", "providers": ["email"]}	{"sub": "ec79d798-6f6f-4549-8d79-edd15870b43b", "name": "lilly", "email": "23r11a0566@gcet.edu.in", "email_verified": false, "phone_verified": false}	\N	2026-02-15 18:58:18.435041+00	2026-02-15 18:58:22.009647+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	595d5afb-c1f6-47a7-b92a-96519c1fc36f	authenticated	authenticated	23r11a0513@gcet.edu.in	$2a$10$j8DgzenHXxTfVsX1oCRzN.4PYpBa.WQvq5oIf1dqrLJ5MY4ftBbrS	\N	\N	a10c1bac50098bc6c2f76bdff270755b9b91c3f6918a39cf378482d5	2026-03-06 16:16:51.323563+00		\N			\N	\N	{"provider": "email", "providers": ["email"]}	{"sub": "595d5afb-c1f6-47a7-b92a-96519c1fc36f", "name": "Vaishnavi", "email": "23r11a0513@gcet.edu.in", "email_verified": false, "phone_verified": false}	\N	2026-03-06 16:16:51.299526+00	2026-03-06 16:16:54.303236+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	f6e82f04-701a-4e83-84a9-b311eaed6db2	authenticated	authenticated	21r11a05c0@gcet.edu.in	$2a$10$HH76AujlPZAvl1Hs6373BeAsc7CMb9ESTvPNT8jYj.MAp7KkHZIpS	2026-04-16 16:04:23.896036+00	\N		2026-04-16 16:03:43.344649+00		\N			\N	2026-05-28 07:23:05.683282+00	{"provider": "email", "providers": ["email"]}	{"sub": "f6e82f04-701a-4e83-84a9-b311eaed6db2", "name": "Abhaya", "year": "4", "email": "21r11a05c0@gcet.edu.in", "department": "CSE", "email_verified": true, "phone_verified": false}	\N	2026-04-16 16:03:43.239968+00	2026-05-28 07:23:05.712285+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	99abb06b-7974-45ae-887a-9a87e6ec9c36	authenticated	authenticated	23r11a0512@gcet.edu.in	$2a$10$6Ca38F.tvBPmdqYlcphwk.ajnAODdCi2i/kvpj2USvrQzl6NbAGOW	2026-03-06 16:07:11.50213+00	\N		2026-03-06 16:05:35.119243+00		\N			\N	2026-05-28 08:25:11.330989+00	{"provider": "email", "providers": ["email"]}	{"sub": "99abb06b-7974-45ae-887a-9a87e6ec9c36", "name": "Rishik", "email": "23r11a0512@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-06 16:05:35.029377+00	2026-05-29 06:58:22.633727+00	\N	\N			\N		0	\N		\N	f	\N	f
 00000000-0000-0000-0000-000000000000	d1645cf0-5274-43f6-94d5-f0db4c6dcabf	authenticated	authenticated	23r11a0511@gcet.edu.in	$2a$10$EqGeI1x/dT63agnVH5NkcuPU1rolqh2HcvzQ.UX2OYkoN2WmXAcJO	2026-03-03 08:31:35.552407+00	\N		2026-03-03 08:24:42.185096+00		\N			\N	2026-05-29 06:42:19.272937+00	{"provider": "email", "providers": ["email"]}	{"sub": "d1645cf0-5274-43f6-94d5-f0db4c6dcabf", "name": "abhiram", "email": "23r11a0511@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-03 08:24:42.139416+00	2026-05-29 07:32:19.771705+00	\N	\N			\N		0	\N		\N	f	\N	f
-00000000-0000-0000-0000-000000000000	b84fe995-c654-433b-949a-5d14b471481b	authenticated	authenticated	23r11a0546@gcet.edu.in	$2a$10$6PWqyEbPVahnILEsDlnrZ.N/PzHXRzWyYq2f.xDPnVIcB.TFeQEpu	2026-03-03 08:29:21.748028+00	\N		2026-03-03 08:25:15.234103+00		\N			\N	2026-05-29 07:32:40.947621+00	{"provider": "email", "providers": ["email"]}	{"sub": "b84fe995-c654-433b-949a-5d14b471481b", "name": "rishik", "email": "23r11a0546@gcet.edu.in", "email_verified": true, "phone_verified": false}	\N	2026-03-03 08:25:15.22731+00	2026-05-29 07:32:40.951525+00	\N	\N			\N		0	\N		\N	f	\N	f
 \.
 
 
@@ -5052,14 +5076,26 @@ COPY cron.job (jobid, schedule, command, nodename, nodeport, database, username,
 
 COPY cron.job_run_details (jobid, runid, job_pid, database, username, command, status, return_message, start_time, end_time) FROM stdin;
 1	1	666301	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-05-29 02:30:00.244129+00	2026-05-29 02:30:00.382624+00
+1	11	1807177	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-08 02:30:00.202573+00	2026-06-08 02:30:00.306636+00
+1	19	2270687	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-16 02:30:00.15026+00	2026-06-16 02:30:00.277305+00
 1	2	782168	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-05-30 02:30:00.188011+00	2026-05-30 02:30:00.311091+00
+1	12	1892792	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-09 02:30:00.166455+00	2026-06-09 02:30:00.342658+00
 1	3	893733	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-05-31 02:30:00.183743+00	2026-05-31 02:30:00.288865+00
 1	4	1005529	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-01 02:30:00.171638+00	2026-06-01 02:30:00.281639+00
+1	20	2325266	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-17 02:30:00.178909+00	2026-06-17 02:30:00.276748+00
+1	13	1948130	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-10 02:30:00.18572+00	2026-06-10 02:30:00.283236+00
 1	5	1119136	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-02 02:30:00.181083+00	2026-06-02 02:30:00.273096+00
 1	6	1234070	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-03 02:30:00.162969+00	2026-06-03 02:30:00.26671+00
+1	14	2001666	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-11 02:30:00.131814+00	2026-06-11 02:30:00.225626+00
 1	7	1348466	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-04 02:30:00.165843+00	2026-06-04 02:30:00.353506+00
+1	21	2384229	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-18 02:30:00.162372+00	2026-06-18 02:30:00.270298+00
+1	15	2055457	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-12 02:30:00.168228+00	2026-06-12 02:30:00.283602+00
 1	8	1464877	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-05 02:30:00.173444+00	2026-06-05 02:30:00.283127+00
 1	9	1578602	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-06 02:30:00.162793+00	2026-06-06 02:30:00.255564+00
+1	16	2108762	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-13 02:30:00.156721+00	2026-06-13 02:30:00.272077+00
+1	10	1693821	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-07 02:30:00.190641+00	2026-06-07 02:30:00.304767+00
+1	17	2162334	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-14 02:30:00.194192+00	2026-06-14 02:30:00.308325+00
+1	18	2216222	postgres	postgres	 select public.archive_past_events('7 days'::interval); 	succeeded	1 row	2026-06-15 02:30:00.181727+00	2026-06-15 02:30:00.276996+00
 \.
 
 
@@ -5101,7 +5137,8 @@ COPY public.event_registrations (id, event_id, user_id, created_at) FROM stdin;
 
 COPY public.events (id, title, description, event_date, location, created_at, updated_at, is_active, event_type, mode, image_url, organizer_name, organizer_contact, registration_deadline, max_participants, problem_statement_deadline, registration_start_date, has_problem_statement, resource_person, tenant_id, registration_link) FROM stdin;
 826e7f29-0b3b-4248-81c8-b17c3c7e54b9	hackathon	student hackathon	2026-06-12 23:52:00+00	Seminar Hall 2	2026-05-27 18:22:38.981304+00	2026-05-27 18:22:38.981304+00	t	Workshop	Hybrid	https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/event_images/event_1779906158133.webp	\N	\N	2026-05-31 23:52:00+00	\N	2026-05-27 18:22:38.981304+00	2026-05-27 18:22:38.981304+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	https://www.instagram.com/
-9f2caecd-c52e-4b49-b492-7bcb1f564225	ferfergregr	frgergregr	2026-06-01 10:25:00+00	rewq	2026-05-27 17:56:17.320553+00	2026-05-27 17:56:17.320553+00	t	gfds	Hybrid	https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/event_images/event_1779905902167.webp	\N	\N	2026-05-30 10:26:00+00	\N	2026-05-27 17:56:17.320553+00	2026-05-27 17:56:17.320553+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254	https://docs.google.com/forms/d/1eIpvfF9oODrdHLzZXYnV4kXbifMyoWLXK9N_n7ZJ5ho
+171087e5-6199-4247-a5b4-70e272e1bca1	HackathonAPEX	National Level Hackathon	2026-06-20 01:43:00+00	Seminar Hall 1	2026-06-16 07:57:14.893575+00	2026-06-16 07:57:14.893575+00	t	Hackathon	Offline		\N	\N	\N	\N	2026-06-16 07:57:14.893575+00	2026-06-16 07:57:14.893575+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	https://docs.google.com/forms/d/1eIpvfF9oODrdHLzZXYnV4kXbifMyoWLXK9N_n7ZJ5ho
+7e6f5b5a-d9cb-449e-80cc-87c3e0c79f93	Webinar	dediibe	2026-06-28 07:14:00+00	Innovation Lab	2026-06-16 07:58:36.723225+00	2026-06-16 07:58:36.723225+00	t	webinar	Online	https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/event_images/event_1781554533004.png	\N	\N	\N	\N	2026-06-16 07:58:36.723225+00	2026-06-16 07:58:36.723225+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	https://docs.google.com/forms/d/1eIpvfF9oODrdHLzZXYnV4kXbifMyoWLXK9N_n7ZJ5ho
 \.
 
 
@@ -5115,6 +5152,7 @@ COPY public.events_archive (id, title, description, event_date, location, create
 46ba0b05-30a7-4480-ab7b-49b09165c1fd	event4	4th	2026-02-28 18:50:00+00	keesara	2026-03-03 07:14:36.838933+00	2026-03-03 07:14:36.838933+00	t	hackathon	Offline		lika	bdwubdhwbhb	2026-02-26 18:50:00+00	\N	2026-03-03 07:14:36.838933+00	2026-03-03 07:14:36.838933+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	\N	2026-05-29 02:30:00.244155+00
 51411070-c3e4-432c-84fd-f68bf680d71f	event5	event5	2026-02-28 18:51:00+00	ksndndjefk	2026-03-03 07:15:15.736982+00	2026-03-03 07:15:15.736982+00	t	kefbkwje	Online		71736824	l2rkrkjn5r	2026-02-24 18:51:00+00	\N	2026-03-03 07:15:15.736982+00	2026-03-03 07:15:15.736982+00	f	\N	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	\N	2026-05-29 02:30:00.244155+00
 218058b8-b7a5-459b-9ff7-0f45d5a81577	geenovate	hackathon for students	2026-05-27 10:31:00+00	Seminar Hall 2	2026-05-25 05:02:25.840432+00	2026-05-25 05:02:25.840432+00	t	Workshop	Offline		\N	\N	2026-05-23 10:32:00+00	1	2026-05-25 05:02:25.840432+00	2026-05-25 05:02:25.840432+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254	\N	2026-06-04 02:30:00.165863+00
+9f2caecd-c52e-4b49-b492-7bcb1f564225	ferfergregr	frgergregr	2026-06-01 10:25:00+00	rewq	2026-05-27 17:56:17.320553+00	2026-05-27 17:56:17.320553+00	t	gfds	Hybrid	https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/event_images/event_1779905902167.webp	\N	\N	2026-05-30 10:26:00+00	\N	2026-05-27 17:56:17.320553+00	2026-05-27 17:56:17.320553+00	f	\N	0ee52668-ea70-4740-9f7b-b15ba5535254	https://docs.google.com/forms/d/1eIpvfF9oODrdHLzZXYnV4kXbifMyoWLXK9N_n7ZJ5ho	2026-06-09 02:30:00.166473+00
 \.
 
 
@@ -5131,9 +5169,9 @@ b4c1c049-2352-4224-ae8d-e0620cd32f2e	contact	general_info	{"email": "inCamp@gcet
 25684097-d43d-446a-8f8e-5c0f5ecc2e9c	home	timeline_cards	[{"id": "72cafa00-7b2f-491e-a05e-7ece2c1d1e29", "name": "Phase 1", "title": "New Phase", "icon_url": null, "icon_name": "Rocket", "image_urls": ["https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_timeline_images/1780039084760_0_SwimLane.png"], "description": "Describe the next step in the journey."}, {"id": "05bd0eb3-aed3-453a-adc6-15827b42f6b2", "name": "Phase 2", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "60170615-d562-4ad4-84b9-19c2e5284352", "name": "Phase 3", "title": "New Phase", "icon_url": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "a752caac-5044-490c-a41a-6edac3c39855", "name": "Phase 4", "title": "New Phase", "icon_url": null, "icon_name": null, "image_urls": [], "description": "Describe the next step in the journey."}, {"id": "efd886e8-204f-4336-99aa-c6ef2af64419", "name": "Phase 5", "title": "New Phase", "icon_url": null, "icon_name": null, "image_urls": [], "description": "Describe the next step in the journey."}]	2026-05-29 07:19:39.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 c87a3a43-665e-46d3-a047-f1cf7c1d4929	home	timeline_header	{"label": "journey cards", "title": "Event Journey", "subtitle": "How the phases of the events are ", "photo_url": "https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_timeline_header/1776163288369_IMG_7495.JPG", "photo_urls": ["https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_timeline_header/1780039175531_0_29thAugAgenda.jpg"]}	2026-05-29 07:19:39.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 2620fffa-73cb-411c-b511-dcc1dbf8d2da	contact	coordinators	[{"name": "Advika", "role": "Coordinator", "email": "23r11a0515@gmail.com", "phone": "9492362238", "description": "coordinates overall event"}]	2026-05-29 07:29:54.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
+89806030-d144-4c88-8489-0adecf323775	home	hero	{"title": "inCamp", "chipText": "inCamp", "subtitle": "hi im sub-title", "backImage": "https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_hero_images/1781727387309-1.png", "frontImage": "/front.png", "heroStyles": {"title": {"fontSize": "text-7xl", "animation": "bounce", "textColor": "#fafafa"}, "subtitle": {"textColor": "#ffffff"}}, "sliderImages": ["https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_slider_images/1779534895422-blue.webp"]}	2026-06-17 20:16:31.944+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 e05d7711-3554-4aa2-8cee-b4802acd69fc	contact	contact_header	{"title": "Contact Us", "styles": {"title": {"color": "#ffffff", "effect": "none", "fontSize": "text-5xl", "fontType": "font-poppins", "fontWeight": "font-bold"}, "subtitle": {"color": "#dbeafe", "effect": "none", "fontSize": "text-lg", "fontType": "font-sans", "fontWeight": "font-normal"}, "backgroundColor": "#0b3a82"}, "subtitle": "Have questions? Reach out to our organizing team for assistance.", "enquiriesTitle": "General Enquiries", "organizingTitle": "Organizing Team"}	2026-05-29 07:29:54.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 66b3c02c-32a0-40a9-9cb1-7ec1d941b7c5	contact	general_enquiries	[{"id": "5066ba1e-e5a4-40d3-95a3-564d8a457993", "icon": "Mail", "title": "Email", "description": "inCamp@gcet.edu.in"}, {"id": "42015db8-a47e-4e24-97c3-a1e2f55b289b", "icon": "Phone", "title": "Helpline", "description": "+91 981276345"}, {"id": "98f3bb3f-c8fa-4d54-b2b4-8bd32c822d19", "icon": "MapPin", "title": "Address", "description": "Geethanjali Campus, Hyderabad\\n"}, {"id": "4fe2144b-73ac-4f2a-b79a-7a7d09d10c7a", "icon": "Info", "title": "info", "description": "In Geethanjali College "}]	2026-05-29 07:29:54.765+00	0ee52668-ea70-4740-9f7b-b15ba5535254
-89806030-d144-4c88-8489-0adecf323775	home	hero	{"title": "outCamp", "chipText": "inCamp", "subtitle": "hi im sub-title", "backImage": "https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_hero_images/1779969783058-Geenovate-logo.jpg", "frontImage": "/front.png", "heroStyles": {"title": {"fontSize": "text-7xl", "animation": "bounce", "textColor": "#fafafa"}, "subtitle": {"textColor": "#ffffff"}}, "sliderImages": ["https://nducuwfztcjhelztdzbc.supabase.co/storage/v1/object/public/resources/home_slider_images/1779534895422-blue.webp"]}	2026-05-29 07:31:31.674+00	0ee52668-ea70-4740-9f7b-b15ba5535254
 a6d37947-049f-45cd-b514-14dc61a1896e	about	team_cards	[{"id": "geenovate", "title": "Geenovate Foundation", "image_url": null, "description": "The driving force behind inCamp, fostering innovation and entrepreneurship across GCET."}, {"id": "patrons", "title": "Patrons & Leadership", "image_url": null, "description": "Chairman, Director, and institutional leaders providing vision and guidance."}, {"id": "core", "title": "Core Organisers", "image_url": null, "description": "Head Coordinator and 5 Co-Coordinators managing event operations and participant experience."}, {"id": "support", "title": "Department Support Group", "image_url": null, "description": "Academic supporters from each department ensuring curriculum alignment and mentorship."}, {"id": "partners", "title": "Partner Clubs & Councils", "image_url": null, "description": "Innovation Council, Tech Clubs, and professional bodies collaborating for success."}, {"id": "volunteers", "title": "Volunteers & Sponsors", "image_url": null, "description": "Dedicated student volunteers and external sponsors making this event possible."}]	2026-05-25 06:16:41.041+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 85ec90de-67a9-4de6-8f65-100d765964e7	home	hero	{"title": "outCamp", "chipText": "Chapter 1 — Innovation Begins Here", "subtitle": "Turning Campus Challenges into Countable changes", "backImage": "/back.png", "frontImage": "/front.png", "heroStyles": {"title": {"textColor": "#f9f5f5"}, "subtitle": {"textColor": "#eff2f5"}}, "sliderImages": ["/BackgroundSlider1.jpeg", "/BackgroundSlider2.JPG", "/BackgroundSlider3.JPG", "/BackgroundSlider4.jpeg", "/BackgroundSlider5.jpeg", "/BackgroundSlider6.jpeg", "/BackgroundSlider7.jpeg"]}	2026-05-27 22:24:31.674+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 9f26bd89-c657-4d32-a624-80cf0c55e851	home	timeline_cards	[{"id": "phase-0", "name": "Phase 0", "title": "Problem Discovery", "image_urls": [], "description": "Identify and document real campus challenges through observation and research."}, {"id": "phase-1", "name": "Phase 1", "title": "Team Formation & Registration", "image_urls": [], "description": "Form cross-functional teams and register with your chosen problem statement."}, {"id": "phase-2", "name": "Phase 2", "title": "Solution Ideation", "image_urls": [], "description": "Brainstorm, validate, and refine your innovative solution approach."}, {"id": "phase-3", "name": "Phase 3", "title": "Prototype Development", "image_urls": [], "description": "Build working prototypes and prepare comprehensive documentation."}, {"id": "phase-4", "name": "Phase 4", "title": "Final Pitch & Evaluation", "image_urls": [], "description": "Present your solution to the jury and compete for recognition and prizes."}]	2026-05-25 06:00:57.818+00	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
@@ -5203,6 +5241,7 @@ e64f18cb-6944-480a-96a2-c5363dfdc6a6	PS-2026-4178	smart attendance	Design a smar
 ea3e53f6-e975-4db7-9c61-8b44ed2c84e3	PS-2026-6019	Economic problem	Economic	Hardware	Non-Academic	2026-04-15 09:52:12.298832+00	Economic	Computer Science & Engineering	pending_review	\N	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	\N	\N	\N	2026-04-15 09:52:10.697+00	\N	\N	\N	\N	\N	\N	2026-04-15 09:52:12.298832+00	\N	\N	\N	0	0ee52668-ea70-4740-9f7b-b15ba5535254
 a4521cc3-64c7-4143-a72e-f9c8d8947e32	VIT-1002	AR Campus Navigation	Indoor navigation using AR.	Software	Smart Campus	2026-05-09 18:03:29.95091+00	\N	\N	approved	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	2026-05-09 18:03:29.95091+00	\N	\N	15	4	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 0f98bf1a-d45a-4902-937e-80d9b00402f5	VIT-1001	Smart Waste Management	Build an AI waste segregation platform.	Software		2026-05-09 18:03:29.95091+00		\N	approved	\N	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	\N	\N	\N	\N	\N	\N	\N	\N	\N	\N	2026-05-09 18:03:29.95091+00	\N	\N	10	3	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+e96c3637-f8d3-443e-b269-1adb74770e32	2006	jelly man finder	find max jellybean in min time possible.	Hardware/Software	xlr8	2026-06-06 07:51:42.44417+00	use algos like dfs,bfs and find jellybeans.	\N	approved	bc00594c-8776-4bef-9d32-cf6176f89f81	f81975e7-3f24-42b7-a046-330effce532c	\N	\N	\N	2026-06-06 07:51:41.122+00	2026-06-06 07:51:41.122+00	\N	\N	\N	\N	\N	2026-06-06 07:51:42.44417+00	\N	\N	3	0	0ee52668-ea70-4740-9f7b-b15ba5535254
 52809188-a629-4709-9005-90ee77240525	PS-2026-9494	smart attendance system	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Software	Academic	2026-04-03 15:17:49.122534+00	Design a smart attendance system for departments that uses facial recognition or QR-based authentication to automatically track student attendance and generate real-time reports for faculty	Computer Science & Engineering	approved	\N	684525f8-6dcc-40b3-9fe3-0c9da7d70f8e	Latha	\N	\N	2026-04-03 15:17:49.893+00	2026-04-03 15:20:39.96+00	\N	\N	\N	\N	\N	2026-04-03 15:17:49.122534+00	\N	\N	4	0	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
@@ -5212,14 +5251,14 @@ a4521cc3-64c7-4143-a72e-f9c8d8947e32	VIT-1002	AR Campus Navigation	Indoor naviga
 --
 
 COPY public.profiles (id, name, email, role, created_at, phone, avatar_url, faculty_id, department_id, updated_at, department, year, tenant_id) FROM stdin;
-bc00594c-8776-4bef-9d32-cf6176f89f81	Vivek Vardhan	23r11a0531@gcet.edu.in	student	2026-05-29 07:15:19.685944+00	\N	\N	\N	\N	2026-05-29 07:15:19.685944+00	CSE	4	0ee52668-ea70-4740-9f7b-b15ba5535254
+bc00594c-8776-4bef-9d32-cf6176f89f81	Vivek Vardhan	23r11a0531@gcet.edu.in	admin	2026-05-29 07:15:19.685944+00	\N	\N	\N	\N	2026-06-06 07:26:14.030385+00	CSE	4	0ee52668-ea70-4740-9f7b-b15ba5535254
+2e83ba6a-9778-4e84-80b2-168409debced	Advika	23r11a0515@gcet.edu.in	admin	2026-05-29 05:55:01.035892+00	\N	\N	\N	\N	2026-06-06 07:27:34.631303+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
+595d5afb-c1f6-47a7-b92a-96519c1fc36f	Vaishnavi	23r11a0513@gcet.edu.in	student	2026-03-06 16:16:51.298508+00	\N	\N	\N	\N	2026-06-06 07:28:45.83821+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
+ec79d798-6f6f-4549-8d79-edd15870b43b	lilly	23r11a0566@gcet.edu.in	student	2026-02-15 18:58:18.434703+00	\N	\N	\N	\N	2026-06-06 07:29:33.979739+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 b280f8c8-b05a-4237-b606-802420092eb1	Shasidhar reddy	23r11a67c7@gcet.edu.in	student	2026-02-14 05:26:30.861648+00	\N	\N	\N	\N	2026-05-28 07:20:16.196848+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 99abb06b-7974-45ae-887a-9a87e6ec9c36	siri	23r11a0512@gcet.edu.in	deptadmin	2026-03-06 16:05:35.02836+00	\N	\N	\N	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	2026-05-28 08:19:21.337855+00	Unknown	Unknown	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
-2e83ba6a-9778-4e84-80b2-168409debced	Advika	23r11a0515@gcet.edu.in	student	2026-05-29 05:55:01.035892+00	\N	\N	\N	\N	2026-05-29 06:00:44.244934+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
-ec79d798-6f6f-4549-8d79-edd15870b43b	lilly	23r11a0566@gcet.edu.in	student	2026-02-15 18:58:18.434703+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
-595d5afb-c1f6-47a7-b92a-96519c1fc36f	Vaishnavi	23r11a0513@gcet.edu.in	student	2026-03-06 16:16:51.298508+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
+ea5561b5-6918-4212-83d9-5e48dec790ce	Jay	23r11a0544@gcet.edu.in	admin	2026-02-10 15:03:19.438526+00	\N	\N	\N	\N	2026-06-06 07:33:49.001887+00	Unknown	Unknown	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
 f6601227-10dc-4bb5-9be0-a48df646882c	Shivani	23r11a0505@gcet.edu.in	student	2026-03-10 04:36:59.156753+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
-ea5561b5-6918-4212-83d9-5e48dec790ce	Jay	23r11a0544@gcet.edu.in	admin	2026-02-10 15:03:19.438526+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 f6e82f04-701a-4e83-84a9-b311eaed6db2	Abhaya	21r11a05c0@gcet.edu.in	student	2026-04-16 16:03:43.238841+00	\N	\N	\N	\N	2026-05-10 10:51:08.142164+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 d1645cf0-5274-43f6-94d5-f0db4c6dcabf	abhiram	23r11a0511@gcet.edu.in	deptadmin	2026-03-03 08:24:42.139035+00	\N	\N	\N	c5bbdf77-79b5-4304-8fdc-59a4e87c2a53	2026-05-28 05:31:14.775118+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
 b84fe995-c654-433b-949a-5d14b471481b	rishik	23r11a0546@gcet.edu.in	deptadmin	2026-03-03 08:25:15.226993+00	\N	\N	\N	186cc1c0-b797-40bf-b9d8-b8431531ecf3	2026-05-28 05:47:54.675883+00	Unknown	Unknown	0ee52668-ea70-4740-9f7b-b15ba5535254
@@ -5280,6 +5319,24 @@ COPY public.tenants (id, name, slug, created_at) FROM stdin;
 
 
 --
+-- Data for Name: themes; Type: TABLE DATA; Schema: public; Owner: postgres
+--
+
+COPY public.themes (id, name, tenant_id, created_at) FROM stdin;
+41160002-d103-479e-bbb4-e09d013c0366	Community Innovation	0ee52668-ea70-4740-9f7b-b15ba5535254	2026-06-06 07:13:00.124586+00
+2eca9e44-e38e-49f4-b9f7-6f7f4e935255	Academic	0ea0e008-8c3b-4570-ab6b-d36ab89565f9	2026-06-06 07:13:00.124586+00
+9f9fb493-56a8-411e-9ff4-35eed7210d76	Non-Academic	0ea0e008-8c3b-4570-ab6b-d36ab89565f9	2026-06-06 07:13:00.124586+00
+8650764d-cebd-448d-87fd-be5529a1510a	Non-Academic	0ee52668-ea70-4740-9f7b-b15ba5535254	2026-06-06 07:13:00.124586+00
+8fd234cf-fd26-49c0-b180-114796c9d79f	Academic	0ee52668-ea70-4740-9f7b-b15ba5535254	2026-06-06 07:13:00.124586+00
+3fa271b0-4f63-4866-9442-d8a60fff8fcc	Non-Academic	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	2026-06-06 07:13:00.124586+00
+30a9ede1-a7b5-4383-a3c2-9e22a0910cec	Community Innovation	0ea0e008-8c3b-4570-ab6b-d36ab89565f9	2026-06-06 07:13:00.124586+00
+01c2ca90-896d-495c-bf89-066ace27c6d6	Smart Campus	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	2026-06-06 07:13:00.124586+00
+d2f22e60-c995-4ebe-bd60-84870ef7a07d	humangsour	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6	2026-06-06 07:46:36.964026+00
+d59b2bba-f55d-4569-820a-b3e7454a95c0	xlr8	0ee52668-ea70-4740-9f7b-b15ba5535254	2026-06-06 07:48:15.287941+00
+\.
+
+
+--
 -- Data for Name: user_queries; Type: TABLE DATA; Schema: public; Owner: postgres
 --
 
@@ -5294,17 +5351,17 @@ e6134ae1-0295-4377-8b3d-96962afb203b	Can we update team members later?	\N	vivek@
 --
 
 COPY public.user_roles (id, user_id, role, tenant_id) FROM stdin;
-85431bdf-2b6b-418e-ae0c-5f98519cdae6	bc00594c-8776-4bef-9d32-cf6176f89f81	student	0ee52668-ea70-4740-9f7b-b15ba5535254
+85431bdf-2b6b-418e-ae0c-5f98519cdae6	bc00594c-8776-4bef-9d32-cf6176f89f81	admin	0ee52668-ea70-4740-9f7b-b15ba5535254
+842f30c3-6ae8-427b-bc42-5bf42e4334bc	ea5561b5-6918-4212-83d9-5e48dec790ce	admin	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+3b0973dc-105e-4223-b7d8-95ec46bfa24e	2e83ba6a-9778-4e84-80b2-168409debced	admin	0ea0e008-8c3b-4570-ab6b-d36ab89565f9
+0f1dca9b-ac4e-43a8-983a-4ac84f0971ec	595d5afb-c1f6-47a7-b92a-96519c1fc36f	student	472b9f7c-9f68-4ade-9b01-dbb969d2f4e6
+1c1ae2ca-188d-486b-af94-eca15c5f2089	ec79d798-6f6f-4549-8d79-edd15870b43b	student	0ea0e008-8c3b-4570-ab6b-d36ab89565f9
 7c01eb6d-827a-419e-88db-296f1caede2e	b280f8c8-b05a-4237-b606-802420092eb1	student	0ee52668-ea70-4740-9f7b-b15ba5535254
-1c1ae2ca-188d-486b-af94-eca15c5f2089	ec79d798-6f6f-4549-8d79-edd15870b43b	student	0ee52668-ea70-4740-9f7b-b15ba5535254
-0f1dca9b-ac4e-43a8-983a-4ac84f0971ec	595d5afb-c1f6-47a7-b92a-96519c1fc36f	student	0ee52668-ea70-4740-9f7b-b15ba5535254
 e73cd2ad-f09a-4674-aab0-3e9fbe0e10ac	f6601227-10dc-4bb5-9be0-a48df646882c	student	0ee52668-ea70-4740-9f7b-b15ba5535254
-842f30c3-6ae8-427b-bc42-5bf42e4334bc	ea5561b5-6918-4212-83d9-5e48dec790ce	admin	0ee52668-ea70-4740-9f7b-b15ba5535254
 2746488b-1053-4505-b296-06d27d350702	f6e82f04-701a-4e83-84a9-b311eaed6db2	student	0ee52668-ea70-4740-9f7b-b15ba5535254
 72e1882c-18be-453f-bf40-5866cf968ab5	99abb06b-7974-45ae-887a-9a87e6ec9c36	deptadmin	0ee52668-ea70-4740-9f7b-b15ba5535254
 031dbcc8-6653-41b8-bf1d-b7d4db2ee09d	d1645cf0-5274-43f6-94d5-f0db4c6dcabf	deptadmin	0ee52668-ea70-4740-9f7b-b15ba5535254
 09dbea22-1bdc-4c6b-a992-317f37a8a17e	b84fe995-c654-433b-949a-5d14b471481b	deptadmin	0ee52668-ea70-4740-9f7b-b15ba5535254
-3b0973dc-105e-4223-b7d8-95ec46bfa24e	2e83ba6a-9778-4e84-80b2-168409debced	student	0ee52668-ea70-4740-9f7b-b15ba5535254
 \.
 
 
@@ -5426,6 +5483,8 @@ COPY realtime.schema_migrations (version, inserted_at) FROM stdin;
 20260527120000	2026-06-03 14:08:14
 20260528120000	2026-06-03 14:08:14
 20260603120000	2026-06-06 06:29:39
+20260605120000	2026-06-16 05:44:52
+20260606110000	2026-06-16 05:44:52
 \.
 
 
@@ -5544,12 +5603,14 @@ d4a19559-3932-4972-a33c-7e7dbda95d41	ps-documents	8f064c44-6ed2-479d-a547-d1beaf
 815e502e-9fdd-4610-b011-e6c7097e08b5	resources	about_cards/1779969857725_blue.webp	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 12:04:17.872951+00	2026-05-28 12:04:17.872951+00	2026-05-28 12:04:17.872951+00	{"eTag": "\\"038ee50ea18420f10fa63952b7dac42c\\"", "size": 6636, "mimetype": "image/webp", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T12:04:18.000Z", "contentLength": 6636, "httpStatusCode": 200}	1a6d5e94-d2bb-44c0-93f5-62ac7ca62296	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 86b4ef81-c5ef-4ab2-b706-db51f925cc62	event_images	event_1772441673812.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-03-02 08:54:32.21534+00	2026-03-02 08:54:32.21534+00	2026-03-02 08:54:32.21534+00	{"eTag": "\\"988445ab6be8b89b3768b770e8e4ab63\\"", "size": 1037364, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-03-02T08:54:33.000Z", "contentLength": 1037364, "httpStatusCode": 200}	ee4431d5-644a-4fe3-956e-58fb05235ead	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 3db70ba2-aee1-433f-9b6d-11a7f1eeb12b	resources	.emptyFolderPlaceholder	\N	2025-12-26 08:24:36.312642+00	2025-12-26 08:24:36.312642+00	2025-12-26 08:24:36.312642+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2025-12-26T08:24:36.303Z", "contentLength": 0, "httpStatusCode": 200}	0736994d-1b72-4fb7-9fbb-fe68269cd8ab	\N	{}
+26ce3bd0-ac9e-420c-821c-5d95d4c2cf9d	event_images	event_1781554533004.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-06-16 07:59:04.5429+00	2026-06-16 07:59:04.5429+00	2026-06-16 07:59:04.5429+00	{"eTag": "\\"dce66d2e590268ed9ffb6bf30a03157b\\"", "size": 5061, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-06-16T07:59:05.000Z", "contentLength": 5061, "httpStatusCode": 200}	91f5baa4-c201-4dae-8b7f-dc089c47e668	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 d71548c8-e04f-45db-861a-7eb6bef72a08	event_images	.emptyFolderPlaceholder	\N	2025-12-26 08:39:12.892654+00	2025-12-26 08:39:12.892654+00	2025-12-26 08:39:12.892654+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2025-12-26T08:39:12.885Z", "contentLength": 0, "httpStatusCode": 200}	14fac6ab-6a28-41e3-bc61-faf57ef765a0	\N	{}
 a17b9552-1ef9-43df-ac63-941f5915e06f	team-documents	.emptyFolderPlaceholder	\N	2025-12-26 11:17:38.033572+00	2025-12-26 11:17:38.033572+00	2025-12-26 11:17:38.033572+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2025-12-26T11:17:38.036Z", "contentLength": 0, "httpStatusCode": 200}	b5b4b55e-9689-4e44-9cc5-177c38892e62	\N	{}
 2eed9cfb-65f1-4547-8d02-2d533e3bc247	event_images	event_1770222166836.png	de2f5cb1-c1cf-48c9-a2c4-0d7f6dd6373c	2026-02-04 16:22:49.055869+00	2026-02-04 16:22:49.055869+00	2026-02-04 16:22:49.055869+00	{"eTag": "\\"988445ab6be8b89b3768b770e8e4ab63\\"", "size": 1037364, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-02-04T16:22:49.000Z", "contentLength": 1037364, "httpStatusCode": 200}	8b91d685-0128-45cf-80b7-3877d2ddfb8a	de2f5cb1-c1cf-48c9-a2c4-0d7f6dd6373c	{}
 710e0614-6e17-474f-9851-a219b43d3f60	event_images	event_1770222321163.png	de2f5cb1-c1cf-48c9-a2c4-0d7f6dd6373c	2026-02-04 16:25:22.617412+00	2026-02-04 16:25:22.617412+00	2026-02-04 16:25:22.617412+00	{"eTag": "\\"988445ab6be8b89b3768b770e8e4ab63\\"", "size": 1037364, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-02-04T16:25:23.000Z", "contentLength": 1037364, "httpStatusCode": 200}	5cd57df4-103e-43bf-8398-f1a052ac3ad5	de2f5cb1-c1cf-48c9-a2c4-0d7f6dd6373c	{}
 f8d5114e-5160-4592-8d1f-076047dbda91	ps-documents	8f064c44-6ed2-479d-a547-d1beaf8d4a06/5c568dba-9547-4dad-a9c5-2812a42eeb9a/1770962105789-letter (1).docx	8f064c44-6ed2-479d-a547-d1beaf8d4a06	2026-02-13 05:55:06.048355+00	2026-02-13 05:55:06.048355+00	2026-02-13 05:55:06.048355+00	{"eTag": "\\"db04e20137720a3366f0a470bc735ccb\\"", "size": 14468, "mimetype": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "cacheControl": "max-age=3600", "lastModified": "2026-02-13T05:55:07.000Z", "contentLength": 14468, "httpStatusCode": 200}	869893bc-6a97-4742-8907-b9a7be7c94cd	8f064c44-6ed2-479d-a547-d1beaf8d4a06	{}
 9d546054-e146-400b-b4c9-9529ed40fb84	resources	home_timeline_header/.emptyFolderPlaceholder	\N	2026-05-28 12:09:07.851734+00	2026-05-28 12:09:07.851734+00	2026-05-28 12:09:07.851734+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T12:09:07.842Z", "contentLength": 0, "httpStatusCode": 200}	5a0d5b2f-c9f8-4545-bde0-ef9f785c75cd	\N	{}
+9944acb1-44bb-4b05-922f-c8c64bc61f08	resources	home_hero_images/1781727387309-1.png	bc00594c-8776-4bef-9d32-cf6176f89f81	2026-06-18 06:29:49.340133+00	2026-06-18 06:29:49.340133+00	2026-06-18 06:29:49.340133+00	{"eTag": "\\"723bf3df892b0b28d722a72646a57e9f\\"", "size": 12778, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-06-18T06:29:50.000Z", "contentLength": 12778, "httpStatusCode": 200}	e508704d-65da-441e-88a7-220a09f8209c	bc00594c-8776-4bef-9d32-cf6176f89f81	{}
 b3e01312-38f0-4b66-874d-d4db54d5ea25	resources	about_cards/.emptyFolderPlaceholder	\N	2026-05-25 07:23:19.31332+00	2026-05-25 07:23:19.31332+00	2026-05-25 07:23:19.31332+00	{"eTag": "\\"d41d8cd98f00b204e9800998ecf8427e\\"", "size": 0, "mimetype": "application/octet-stream", "cacheControl": "max-age=3600", "lastModified": "2026-05-25T07:23:19.316Z", "contentLength": 0, "httpStatusCode": 200}	bdc5d70e-6f03-454e-ae25-d3c49a55df82	\N	{}
 c4f2cb9c-4f02-417e-80ee-5ee4e833969c	event_images	event_1779904352393.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-27 17:52:34.086789+00	2026-05-27 17:52:34.086789+00	2026-05-27 17:52:34.086789+00	{"eTag": "\\"2ec93adf606b53f2d16676d14d1e2008\\"", "size": 1265679, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-05-27T17:52:35.000Z", "contentLength": 1265679, "httpStatusCode": 200}	f53f7323-6b60-41e0-beb6-f4a508ecb77b	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 aaa9937c-da65-48f5-b8e5-b934de2bfdb0	resources	home_timeline_images/1779949980574_0_20240302_111524.jpg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 06:33:01.639551+00	2026-05-28 06:33:01.639551+00	2026-05-28 06:33:01.639551+00	{"eTag": "\\"d9d5ee11207489acab077ad462bd9602-2\\"", "size": 7844607, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T06:33:02.000Z", "contentLength": 7844607, "httpStatusCode": 200}	2307aea6-5dd8-4a7d-9efc-e1453396d2c7	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
@@ -5566,7 +5627,6 @@ e4a55a96-f5cb-4dd0-a4f5-60092ed29f42	team-documents	d0162e3c-be25-43b0-8e46-9a74
 ae876233-7eb7-4cd7-ab7b-ca62197a0d2d	resources	shortlist_excel_1775894765880_24-3-26__1_.xlsx	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-04-11 08:06:07.073875+00	2026-04-11 08:06:07.073875+00	2026-04-11 08:06:07.073875+00	{"eTag": "\\"f2792c6f356dc8864cbc2888e4ef3053\\"", "size": 103282, "mimetype": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", "cacheControl": "max-age=3600", "lastModified": "2026-04-11T08:06:08.000Z", "contentLength": 103282, "httpStatusCode": 200}	5754c128-082a-452f-8499-a2f107aa3e47	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 23348825-0767-482e-81f3-650d4768df4b	event_images	event_1779894563476.png	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-27 15:09:25.150531+00	2026-05-27 15:09:25.150531+00	2026-05-27 15:09:25.150531+00	{"eTag": "\\"2ec93adf606b53f2d16676d14d1e2008\\"", "size": 1265679, "mimetype": "image/png", "cacheControl": "max-age=3600", "lastModified": "2026-05-27T15:09:26.000Z", "contentLength": 1265679, "httpStatusCode": 200}	634ae6e3-797c-469e-9a95-ee801f0c49b4	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 9e1e0a97-764c-4fcb-88b6-191e3d0288f5	event_images	event_1779894767938.webp	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-27 15:12:49.51457+00	2026-05-27 15:12:49.51457+00	2026-05-27 15:12:49.51457+00	{"eTag": "\\"038ee50ea18420f10fa63952b7dac42c\\"", "size": 6636, "mimetype": "image/webp", "cacheControl": "max-age=3600", "lastModified": "2026-05-27T15:12:50.000Z", "contentLength": 6636, "httpStatusCode": 200}	c5ea3236-a487-49e4-8049-11bd43587e41	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
-169b898f-3056-49e3-a5ab-449aabe06fe9	resources	home_hero_images/1779969783058-Geenovate-logo.jpg	ea5561b5-6918-4212-83d9-5e48dec790ce	2026-05-28 12:03:02.898327+00	2026-05-28 12:03:02.898327+00	2026-05-28 12:03:02.898327+00	{"eTag": "\\"6e75be07d57168edbfcc18c7d9ffea16\\"", "size": 31346, "mimetype": "image/jpeg", "cacheControl": "max-age=3600", "lastModified": "2026-05-28T12:03:03.000Z", "contentLength": 31346, "httpStatusCode": 200}	88ee1948-bfce-48e8-a08d-4724628d1f12	ea5561b5-6918-4212-83d9-5e48dec790ce	{}
 \.
 
 
@@ -5614,7 +5674,7 @@ COPY vault.secrets (id, name, description, secret, key_id, nonce, created_at, up
 -- Name: refresh_tokens_id_seq; Type: SEQUENCE SET; Schema: auth; Owner: supabase_auth_admin
 --
 
-SELECT pg_catalog.setval('auth.refresh_tokens_id_seq', 1068, true);
+SELECT pg_catalog.setval('auth.refresh_tokens_id_seq', 1096, true);
 
 
 --
@@ -5628,7 +5688,7 @@ SELECT pg_catalog.setval('cron.jobid_seq', 1, true);
 -- Name: runid_seq; Type: SEQUENCE SET; Schema: cron; Owner: supabase_admin
 --
 
-SELECT pg_catalog.setval('cron.runid_seq', 9, true);
+SELECT pg_catalog.setval('cron.runid_seq', 21, true);
 
 
 --
@@ -6139,6 +6199,14 @@ ALTER TABLE ONLY public.tenants
 
 ALTER TABLE ONLY public.tenants
     ADD CONSTRAINT tenants_slug_key UNIQUE (slug);
+
+
+--
+-- Name: themes themes_pkey; Type: CONSTRAINT; Schema: public; Owner: postgres
+--
+
+ALTER TABLE ONLY public.themes
+    ADD CONSTRAINT themes_pkey PRIMARY KEY (id);
 
 
 --
@@ -6914,6 +6982,13 @@ CREATE UNIQUE INDEX team_registrations_team_name_lower_unique ON public.team_reg
 
 
 --
+-- Name: themes_tenant_name_lower_idx; Type: INDEX; Schema: public; Owner: postgres
+--
+
+CREATE UNIQUE INDEX themes_tenant_name_lower_idx ON public.themes USING btree (tenant_id, lower(name));
+
+
+--
 -- Name: ix_realtime_subscription_entity; Type: INDEX; Schema: realtime; Owner: supabase_admin
 --
 
@@ -7107,6 +7182,13 @@ CREATE TRIGGER on_auth_user_created AFTER INSERT ON auth.users FOR EACH ROW EXEC
 --
 
 CREATE TRIGGER on_team_registration_insert AFTER INSERT ON public.team_registrations FOR EACH ROW EXECUTE FUNCTION public.handle_new_team_registration();
+
+
+--
+-- Name: themes themes_prevent_delete; Type: TRIGGER; Schema: public; Owner: postgres
+--
+
+CREATE TRIGGER themes_prevent_delete BEFORE DELETE ON public.themes FOR EACH ROW EXECUTE FUNCTION public.prevent_theme_delete();
 
 
 --
@@ -8155,6 +8237,13 @@ CREATE POLICY "tenant admins can manage tenant roles" ON public.user_roles TO au
 
 
 --
+-- Name: themes tenant admins can manage themes; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant admins can manage themes" ON public.themes TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_admin(tenant_id)));
+
+
+--
 -- Name: profiles tenant admins can update tenant profiles; Type: POLICY; Schema: public; Owner: postgres
 --
 
@@ -8176,10 +8265,30 @@ CREATE POLICY "tenant admins can view tenant profiles" ON public.profiles FOR SE
 
 
 --
+-- Name: themes tenant deptadmins can manage themes; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant deptadmins can manage themes" ON public.themes TO authenticated USING ((public.same_tenant(tenant_id) AND public.is_tenant_deptadmin(tenant_id))) WITH CHECK ((public.same_tenant(tenant_id) AND public.is_tenant_deptadmin(tenant_id)));
+
+
+--
+-- Name: themes tenant users can read themes; Type: POLICY; Schema: public; Owner: postgres
+--
+
+CREATE POLICY "tenant users can read themes" ON public.themes FOR SELECT TO authenticated USING (public.same_tenant(tenant_id));
+
+
+--
 -- Name: tenants; Type: ROW SECURITY; Schema: public; Owner: postgres
 --
 
 ALTER TABLE public.tenants ENABLE ROW LEVEL SECURITY;
+
+--
+-- Name: themes; Type: ROW SECURITY; Schema: public; Owner: postgres
+--
+
+ALTER TABLE public.themes ENABLE ROW LEVEL SECURITY;
 
 --
 -- Name: user_queries; Type: ROW SECURITY; Schema: public; Owner: postgres
@@ -9343,6 +9452,15 @@ GRANT ALL ON FUNCTION public.is_tenant_deptadmin(_tenant_id uuid) TO service_rol
 
 
 --
+-- Name: FUNCTION prevent_theme_delete(); Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON FUNCTION public.prevent_theme_delete() TO anon;
+GRANT ALL ON FUNCTION public.prevent_theme_delete() TO authenticated;
+GRANT ALL ON FUNCTION public.prevent_theme_delete() TO service_role;
+
+
+--
 -- Name: FUNCTION problem_statements_set_defaults(); Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -9980,6 +10098,15 @@ GRANT ALL ON TABLE public.tenants TO service_role;
 
 
 --
+-- Name: TABLE themes; Type: ACL; Schema: public; Owner: postgres
+--
+
+GRANT ALL ON TABLE public.themes TO anon;
+GRANT ALL ON TABLE public.themes TO authenticated;
+GRANT ALL ON TABLE public.themes TO service_role;
+
+
+--
 -- Name: TABLE user_queries; Type: ACL; Schema: public; Owner: postgres
 --
 
@@ -10477,5 +10604,5 @@ ALTER EVENT TRIGGER pgrst_drop_watch OWNER TO supabase_admin;
 -- PostgreSQL database dump complete
 --
 
-\unrestrict zNBmaSPEVW02Irboi5BooricXbleH5JVGtGOfWFqFABTmxtwIcQjVvX2v6Z9oCY
+\unrestrict C0sGbBiBpEHfwbNsn2gx8RqxaGtY5dyIAubPO8BZtitELSuihOl8S6ceicDPVtU
 

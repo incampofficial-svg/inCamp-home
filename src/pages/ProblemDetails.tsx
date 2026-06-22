@@ -6,6 +6,8 @@ import { supabase } from "@/integrations/supabase/client";
 import { ArrowLeft, FileText, Tag, Layers } from "lucide-react";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
+import { useAuth } from "@/contexts/AuthContext";
+import { LoginGate } from "@/components/LoginGate";
 
 interface ProblemStatement {
   id: string;
@@ -20,6 +22,7 @@ interface ProblemStatement {
 export default function ProblemDetails() {
   const { id } = useParams<{ id: string }>();
   const { tenant } = useTenant();
+  const { user } = useAuth();
   const [problem, setProblem] = useState<ProblemStatement | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -111,6 +114,18 @@ export default function ProblemDetails() {
         return "bg-muted text-muted-foreground";
     }
   };
+
+  if (!user) {
+    return (
+      <Layout>
+        <LoginGate
+          title="Login to view problem details"
+          description="Please log in to see full problem statement details."
+          actionLabel="Login to view problems"
+        />
+      </Layout>
+    );
+  }
 
   if (loading) {
     return (

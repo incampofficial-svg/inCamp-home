@@ -5,6 +5,9 @@ import { ChevronLeft, ChevronRight, Calendar, Clock, MapPin } from "lucide-react
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { supabase } from "@/integrations/supabase/client";
 import { useTenant } from "@/context/TenantContext";
+import { useAuth } from "@/contexts/AuthContext";
+import { Link } from "react-router-dom";
+import { tenantPath } from "@/utils/tenantPath";
 
 interface Event {
   id: string;
@@ -17,6 +20,7 @@ interface Event {
 
 export function EventsCarousel() {
   const { tenant } = useTenant();
+  const { user, loading: authLoading } = useAuth();
   const [events, setEvents] = useState<Event[]>([]);
   const [slideIndex, setSlideIndex] = useState(0);
   const [isTransitioning, setIsTransitioning] = useState(true);
@@ -49,8 +53,13 @@ export function EventsCarousel() {
   };
 
   useEffect(() => {
+    if (!tenant?.id || !user) {
+      setLoading(false);
+      return;
+    }
+
     fetchEvents();
-  }, [tenant?.id]);
+  }, [tenant?.id, user]);
 
   const fetchEvents = async () => {
     try {
@@ -168,6 +177,27 @@ export function EventsCarousel() {
       minute: "2-digit",
     });
   };
+
+  if (!user) {
+    return (
+      <section className="py-16 bg-gradient-to-b from-slate-100 to-slate-200">
+        <div className="container mx-auto px-4">
+          <div className="rounded-3xl border border-border bg-white p-10 text-center shadow-lg">
+            <div className="mx-auto mb-4 flex h-16 w-16 items-center justify-center rounded-full bg-primary/10 text-primary">
+              <Calendar className="h-8 w-8" />
+            </div>
+            <h2 className="text-3xl font-semibold text-foreground">Login to see upcoming events</h2>
+            <p className="mt-4 text-muted-foreground max-w-2xl mx-auto">
+              Please log in to view the full list of upcoming events and access event registration.
+            </p>
+            <Button asChild variant="orange" className="mt-8">
+              <Link to={tenantPath(tenant?.slug ?? "", "/auth")}>Login to view events</Link>
+            </Button>
+          </div>
+        </div>
+      </section>
+    );
+  }
 
   if (loading) {
     return (

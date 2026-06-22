@@ -6,6 +6,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { FileText, Download, HelpCircle, Upload, Trash2, Edit, Save, X, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/contexts/AuthContext";
 import { useAdmin } from "@/hooks/useAdmin";
 import { ResourceUploadDialog } from "@/components/admin/ResourceUploadDialog";
 import { DeleteConfirmDialog } from "@/components/admin/DeleteConfirmDialog";
@@ -14,6 +15,7 @@ import { AdminQueryList } from "@/components/resources/AdminQueryList";
 import { toast } from "sonner";
 import { useTenant } from "@/context/TenantContext";
 import { RESOURCE_ICON_MAP, getResourceIconKey } from "@/lib/resourceIcons";
+import { LoginGate } from "@/components/LoginGate";
 
 interface Resource {
   id: string;
@@ -62,6 +64,7 @@ const faqs = [
 ];
 
 export default function Resources() {
+  const { user } = useAuth();
   const { isAdmin } = useAdmin();
   const { tenant } = useTenant();
   const [resources, setResources] = useState<Resource[]>([]);
@@ -139,10 +142,15 @@ export default function Resources() {
   };
 
   useEffect(() => {
+    if (!tenant?.id || !user) {
+      setLoading(false);
+      return;
+    }
+
     fetchResources();
     fetchPageHeader();
     fetchDownloadsHeader();
-    }, [tenant?.id]);
+  }, [tenant?.id, user]);
 
   const savePageHeader = async () => {
     setHeaderSaving(true);
@@ -209,6 +217,18 @@ export default function Resources() {
     setSelectedResource(resource);
     setDeleteDialogOpen(true);
   };
+
+  if (!user) {
+    return (
+      <Layout>
+        <LoginGate
+          title="Login to view resources"
+          description="Please log in to access downloads, uploads, and resources."
+          actionLabel="Login to view resources"
+        />
+      </Layout>
+    );
+  }
 
   const handleDelete = async () => {
     if (!selectedResource) return;

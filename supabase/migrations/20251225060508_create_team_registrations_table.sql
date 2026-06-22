@@ -17,6 +17,7 @@ CREATE TABLE public.team_registrations (
   phone TEXT NOT NULL,
   email TEXT NOT NULL,
   document_url TEXT,
+  accepted BOOLEAN,
   created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now(),
   updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT now()
 );

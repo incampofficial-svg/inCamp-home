@@ -8,8 +8,9 @@ import { useTenant } from "@/context/TenantContext";
 
 export function ThemeManager({ onClose }: { onClose?: () => void }) {
   const { tenant } = useTenant();
-  const [themes, setThemes] = useState<{ id: string; name: string }[]>([]);
+  const [themes, setThemes] = useState<{ id: string; name: string; description: string | null }[]>([]);
   const [newTheme, setNewTheme] = useState("");
+  const [newThemeDescription, setNewThemeDescription] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -17,7 +18,7 @@ export function ThemeManager({ onClose }: { onClose?: () => void }) {
     if (!tenant) return;
     const { data, error } = await supabase
       .from("themes")
-      .select("id, name")
+      .select("id, name, description")
       .eq("tenant_id", tenant.id)
       .order("name", { ascending: true });
 
@@ -38,9 +39,10 @@ export function ThemeManager({ onClose }: { onClose?: () => void }) {
     setLoading(true);
     setError(null);
     try {
-      const { error } = await supabase.from("themes").insert({ name: newTheme.trim(), tenant_id: tenant.id });
+      const { error } = await supabase.from("themes").insert({ name: newTheme.trim(), description: newThemeDescription.trim(), tenant_id: tenant.id });
       if (error) throw error;
       setNewTheme("");
+      setNewThemeDescription("");
       await fetchThemes();
       toast.success("Theme added");
     } catch (err: any) {
@@ -53,7 +55,7 @@ export function ThemeManager({ onClose }: { onClose?: () => void }) {
     }
   };
 
-  const handleDelete = async (theme: { id: string; name: string }) => {
+  const handleDelete = async (theme: { id: string; name: string; description: string | null }) => {
     if (!tenant) return;
     // Check if any problem_statements use this theme
     try {
@@ -91,9 +93,13 @@ export function ThemeManager({ onClose }: { onClose?: () => void }) {
       )}
 
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <div className="sm:col-span-2">
+        <div className="sm:col-span-1">
           <Label htmlFor="new-theme">Add new theme</Label>
           <Input id="new-theme" value={newTheme} onChange={(e) => setNewTheme(e.target.value)} placeholder="Theme name" />
+        </div>
+        <div className="sm:col-span-1">
+          <Label htmlFor="new-theme-description">Description</Label>
+          <Input id="new-theme-description" value={newThemeDescription} onChange={(e) => setNewThemeDescription(e.target.value)} placeholder="Theme description" />
         </div>
         <div className="flex items-end">
           <Button onClick={handleAdd} disabled={loading || !newTheme.trim()}>
@@ -108,7 +114,10 @@ export function ThemeManager({ onClose }: { onClose?: () => void }) {
           {themes.length === 0 && <div className="text-muted-foreground">No themes created yet.</div>}
           {themes.map((t) => (
             <div key={t.id} className="flex items-center justify-between bg-card p-3 rounded-md">
-              <div className="capitalize">{t.name}</div>
+              <div>
+                <div className="capitalize font-medium">{t.name}</div>
+                <div className="text-sm text-muted-foreground">{t.description}</div>
+              </div>
               <div className="flex gap-2">
                 <Button variant="destructive" size="sm" onClick={() => handleDelete(t)}>
                   Delete

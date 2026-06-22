@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS themes (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name text NOT NULL,
+  description text,
   tenant_id uuid NOT NULL,
   created_at timestamptz DEFAULT now(),
   -- note: case-insensitive uniqueness is enforced via an index below

@@ -2,7 +2,8 @@ import { useState, useEffect } from "react";
 import { Link } from "react-router-dom";
 import { AdminLayout } from "@/components/layout/AdminLayout";
 import { supabase } from "@/integrations/supabase/client";
-import { FileText, Shield, TrendingUp, Edit, Trash2, Eye, Download, Calendar, ChevronUp, Users } from "lucide-react";
+import { FileText, Shield, TrendingUp, Edit, Trash2, Eye, Download, Calendar, ChevronUp, Users, Check, X } from "lucide-react";
+import { toast } from "sonner";
 import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from "@/components/ui/accordion";
 import { PieChart, Pie, Cell, ResponsiveContainer, Legend, Tooltip } from "recharts";
 import { Button } from "@/components/ui/button";
@@ -67,6 +68,7 @@ interface TeamRegistration {
   email?: string;
   document_url?: string;
   document_filename?: string;
+  accepted?: boolean | null;
   created_at: string;
   problem_title?: string;
   theme?: string;
@@ -125,6 +127,7 @@ export default function AdminDashboard() {
   const [studentDepartmentFilter, setStudentDepartmentFilter] = useState<string>("all");
   const [studentYearFilter, setStudentYearFilter] = useState<string>("all");
   const [deptAdminActionLoading, setDeptAdminActionLoading] = useState<string | null>(null);
+  const [acceptingTeamId, setAcceptingTeamId] = useState<string | null>(null);
   const [deptAdminError, setDeptAdminError] = useState<string | null>(null);
   const [dashboardError, setDashboardError] = useState<string | null>(null);
 
@@ -428,10 +431,12 @@ try {
     URL.revokeObjectURL(link.href);
   };
 
-  const downloadTeamData = () => {
-    const rows = filteredTeams;
-    if (rows.length === 0) return;
-
+  const downloadTeamRows = (rows: TeamRegistration[], filename: string) => {
+    if (rows.length === 0) {
+      toast.error("No team data available to download");
+      return;
+    }
+    
     const header = [
       "Team Name",
       "Problem Statement",
@@ -478,11 +483,20 @@ try {
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = `registered-teams-${problemFilter}-${themeFilter}.csv`.replace(/[^a-zA-Z0-9-_.]/g, "_");
+    link.download = filename.replace(/[^a-zA-Z0-9-_.]/g, "_");
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
     URL.revokeObjectURL(link.href);
+  };
+
+  const downloadTeamData = () => {
+    downloadTeamRows(filteredTeams, `registered-teams-${problemFilter}-${themeFilter}.csv`);
+  };
+
+  const downloadAcceptedTeamData = () => {
+    const acceptedTeams = teamRegistrations.filter((team) => team.accepted === true);
+    downloadTeamRows(acceptedTeams, "accepted-teams.csv");
   };
 
   const toggleDepartmentAdminRole = async (user: UserProfile) => {
@@ -537,6 +551,35 @@ try {
 
   const handleDeleteAllTeams = () => {
     setDeleteAllConfirmDialogOpen(true);
+  };
+
+  const handleToggleTeamAccepted = async (team: TeamRegistration) => {
+    const nextAccepted = !team.accepted;
+    setAcceptingTeamId(team.id);
+
+    try {
+      const { error } = await (supabase as any)
+        .from("team_registrations")
+        .update({ accepted: nextAccepted })
+        .eq("id", team.id)
+        .eq("tenant_id", tenant!.id);
+
+      if (error) throw error;
+
+      setTeamRegistrations((currentTeams) =>
+        currentTeams.map((currentTeam) =>
+          currentTeam.id === team.id
+            ? { ...currentTeam, accepted: nextAccepted }
+            : currentTeam
+        )
+      );
+      toast.success(nextAccepted ? "Team accepted" : "Team acceptance removed");
+    } catch (error) {
+      console.error("Error updating team acceptance:", error);
+      toast.error("Failed to update team acceptance");
+    } finally {
+      setAcceptingTeamId(null);
+    }
   };
 
   const confirmDeleteTeam = async () => {
@@ -1206,7 +1249,7 @@ try {
                     {dialogView === "allTeams" && (
                       <div className="space-y-6">
                         {/* Filter, Sort, and Download Controls */}
-                        <div className="grid md:grid-cols-4 gap-4 items-end">
+                        <div className="grid md:grid-cols-5 gap-4 items-end">
                           <div>
                             <Label htmlFor="team-filter-problem">Filter by Problem Statement</Label>
                             <select
@@ -1265,6 +1308,11 @@ try {
                           <div>
                             <Button className="w-full" onClick={() => downloadTeamData()}>
                               Download info
+                            </Button>
+                          </div>
+                          <div>
+                            <Button className="w-full" variant="outline" onClick={() => downloadAcceptedTeamData()}>
+                              Download accepted teams
                             </Button>
                           </div>
                         </div>
@@ -1399,6 +1447,20 @@ try {
                                           className="h-8 w-8 p-0"
                                         >
                                           <Edit className="h-4 w-4" />
+                                        </Button>
+                                        <Button
+                                          variant="outline"
+                                          size="sm"
+                                          onClick={() => handleToggleTeamAccepted(team)}
+                                          disabled={acceptingTeamId === team.id}
+                                          className={`h-8 w-8 p-0 ${
+                                            team.accepted
+                                              ? "text-destructive hover:text-destructive"
+                                              : "text-emerald-600 hover:text-emerald-700"
+                                          }`}
+                                          title={team.accepted ? "Remove Acceptance" : "Accept Team"}
+                                        >
+                                          {team.accepted ? <X className="h-4 w-4" /> : <Check className="h-4 w-4" />}
                                         </Button>
                                         <Button
                                           variant="outline"
