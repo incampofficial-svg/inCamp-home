@@ -70,13 +70,6 @@ const defaultDescriptiveBoxes: DescriptiveBox[] = [
 
 const defaultTeamCards: AboutCard[] = [
   {
-    id: "geenovate",
-    title: "Geenovate Foundation",
-    description:
-      "The driving force behind inCamp, fostering innovation and entrepreneurship across GCET.",
-    image_url: null,
-  },
-  {
     id: "patrons",
     title: "Patrons & Leadership",
     description:

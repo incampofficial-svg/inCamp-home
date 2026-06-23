@@ -141,7 +141,7 @@ export function Footer() {
         {/* Bottom Bar */}
         <div className="mt-12 pt-8 border-t border-primary-foreground/20">
           <p className="text-center text-primary-foreground/60 text-sm">
-            © {new Date().getFullYear()} inCamp. Organized by Geenovate Foundation. All rights reserved.
+            © {new Date().getFullYear()} inCamp. All rights reserved.
           </p>
         </div>
       </div>

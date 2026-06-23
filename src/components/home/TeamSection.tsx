@@ -6,11 +6,6 @@ const departments = [
 
 const teamBlocks = [
   {
-    title: "Geenovate Foundation",
-    description: "The driving force behind inCamp, fostering innovation and entrepreneurship across GCET.",
-    icon: Building2,
-  },
-  {
     title: "Patrons & Leadership",
     description: "Chairman, Director, and institutional leaders providing vision and guidance.",
     icon: Star,

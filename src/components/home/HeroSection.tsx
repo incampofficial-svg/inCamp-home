@@ -44,7 +44,7 @@ const defaultHeroContent: HeroContent = {
   title: "inCamp",
   subtitle: "Turning Campus Challenges into Countable Change",
   frontImage: "/front.png",
-  backImage: "/back.png",
+  backImage: "/front.png",
   sliderImages: [
     "/BackgroundSlider1.jpeg",
     "/BackgroundSlider2.jpeg",
@@ -168,7 +168,7 @@ export function HeroSection() {
     }
   };
 
-  const uploadImage = async (field: keyof Pick<HeroContent, "frontImage" | "backImage">, file: File) => {
+  const uploadImage = async (field: "backImage", file: File) => {
     setUploadingFor(field);
     try {
       // Delete old image from storage if it was uploaded (not a default static asset)
@@ -537,25 +537,6 @@ export function HeroSection() {
               </div>
 
               <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-foreground">Front image</label>
-                  <div className="mt-2 flex items-center gap-4">
-                    <img src={editContent.frontImage} alt="Front preview" className="w-24 h-24 rounded-xl object-cover border" />
-                    <label className="cursor-pointer rounded-lg border border-border bg-background px-3 py-2 text-sm text-foreground shadow-sm hover:bg-slate-100">
-                      <Upload className="w-4 h-4 inline-block mr-2" />
-                      {uploadingFor === "frontImage" ? "Uploading..." : "Upload"}
-                      <input
-                        type="file"
-                        accept="image/*"
-                        className="hidden"
-                        onChange={(e) => {
-                          if (e.target.files?.[0]) uploadImage("frontImage", e.target.files[0]);
-                        }}
-                      />
-                    </label>
-                  </div>
-                </div>
-
                 <div>
                   <label className="block text-sm font-medium text-foreground">Back image</label>
                   <div className="mt-2 flex items-center gap-4">
