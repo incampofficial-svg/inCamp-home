@@ -146,7 +146,7 @@ export default function Contact() {
     
     const { data } = await (supabase as any)
       .from("page_content")
-      .select("*")
+      .select("section_key,content")
       .eq("page_name", "contact")
       .eq("tenant_id", tenant!.id);
 

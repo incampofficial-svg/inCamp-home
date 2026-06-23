@@ -3,6 +3,7 @@ import { useAuth } from "@/contexts/AuthContext";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
 import { useAdmin } from "@/hooks/useAdmin";
+import { PageSkeleton } from "@/components/PageSkeleton";
 
 interface ProtectedRouteProps {
   children: React.ReactNode;
@@ -16,16 +17,7 @@ export function ProtectedRoute({ children, requireAdmin = false }: ProtectedRout
   const location = useLocation();
 
   if (loading || (requireAdmin && adminLoading)) {
-    return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
-        <div className="text-center">
-          <div className="w-12 h-12 rounded-xl bg-primary flex items-center justify-center mx-auto mb-4 animate-pulse">
-            <span className="text-primary-foreground font-poppins font-bold text-xl">C</span>
-          </div>
-          <p className="text-muted-foreground">Loading...</p>
-        </div>
-      </div>
-    );
+    return <PageSkeleton />;
   }
 
   if (!user) {

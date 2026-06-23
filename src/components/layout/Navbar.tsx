@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { memo, useCallback, useMemo, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { Menu, X, LogIn, LogOut, User, Shield } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -7,23 +7,23 @@ import { useAdmin } from "@/hooks/useAdmin";
 import { useTenant } from "@/context/TenantContext";
 import { tenantPath } from "@/utils/tenantPath";
 
-export function Navbar() {
+function NavbarComponent() {
   const [isOpen, setIsOpen] = useState(false);
   const location = useLocation();
   const { user, signOut } = useAuth();
   const { isAdmin } = useAdmin();
   const { tenant } = useTenant();
   const slug = tenant?.slug || "";
-  const path = (value: string) => tenantPath(slug, value);
+  const path = useCallback((value: string) => tenantPath(slug, value), [slug]);
 
-  const username = user
+  const username = useMemo(() => user
     ? (user.user_metadata?.full_name as string) ||
       (user.user_metadata?.name as string) ||
       user.email?.split("@")[0] ||
       "User"
-    : "";
+    : "", [user]);
 
-  const navLinks = [
+  const navLinks = useMemo(() => [
     { name: "Home", path: path("/") },
     { name: "About Us", path: path("/about") },
     { name: "Events", path: path("/events") },
@@ -36,12 +36,12 @@ export function Navbar() {
         ]
       : [{ name: "Registration", path: path("/registration") }]),
     { name: "Contact", path: path("/contact") },
-  ];
+  ], [isAdmin, path]);
 
-  const handleSignOut = async () => {
+  const handleSignOut = useCallback(async () => {
     await signOut();
     setIsOpen(false);
-  };
+  }, [signOut]);
 
   return (
     <header className="fixed top-0 left-0 right-0 z-50 bg-white shadow-sm">
@@ -52,13 +52,15 @@ export function Navbar() {
           {/* Logo */}
           <Link to={path("/")} className="flex items-center gap-2 shrink-0">
             <img
-              src="/favicon.png"
+              src={isAdmin ? "/og-image-admin.png" : "/favicon.png"}
               alt="inCamp Logo"
-              className="w-9 h-9 rounded-lg"
+              className={isAdmin ? "w-42 h-36 rounded-lg" : "w-9 h-9 rounded-lg"}
             />
-            <span className="font-semibold text-lg hidden sm:block">
-              inCamp
-            </span>
+            {!isAdmin && (
+              <span className="font-semibold text-lg hidden sm:block">
+                inCamp
+              </span>
+            )}
           </Link>
 
           {/* Desktop Auth */}
@@ -72,7 +74,11 @@ export function Navbar() {
                   className="flex items-center gap-2 rounded-full border border-border px-3 py-2"
                 >
                   <Link to={path("/profile")}>
-                    {isAdmin && <Shield className="w-4 h-4 text-secondary" />}
+                    {isAdmin ? (
+                      <img src="/favicon-admin.png" alt="Admin" className="w-4 h-4" />
+                    ) : (
+                      <Shield className="w-4 h-4 text-secondary" />
+                    )}
                     <User className="w-4 h-4" />
                     <span className="max-w-[140px] truncate text-sm">{username}</span>
                   </Link>
@@ -147,7 +153,9 @@ export function Navbar() {
               {user ? (
                 <div className="px-4 space-y-3">
                   <div className="flex items-center gap-1 text-sm text-muted-foreground">
-                    {isAdmin && <Shield className="w-4 h-4 text-secondary" />}
+                    {isAdmin && (
+                      <img src="/favicon-admin.png" alt="Admin" className="w-4 h-4" />
+                    )}
                     <User className="w-4 h-4" />
                     {username}
                   </div>
@@ -183,3 +191,5 @@ export function Navbar() {
     </header>
   );
 }
+
+export const Navbar = memo(NavbarComponent);

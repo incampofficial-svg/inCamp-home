@@ -43,7 +43,7 @@ export default function EventDetails() {
   const fetchEvent = async () => {
     const { data, error } = await supabase
       .from("events")
-      .select("*")
+      .select("id,title,description,event_date,location,event_type,mode,registration_deadline,max_participants,organizer_name,organizer_contact,is_active,image_url,registration_link")
       .eq("id", id)
       .eq("tenant_id", tenant!.id)
       .single();

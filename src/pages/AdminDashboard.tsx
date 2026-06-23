@@ -205,7 +205,7 @@ try {
 
     (supabase as any)
       .from("team_registrations")
-      .select("*")
+      .select("id,team_name,problem_id,member1_name,member1_roll,member1_year,member1_department,member1_phone,member1_email,member2_name,member2_roll,member2_year,member2_department,member2_phone,member2_email,member3_name,member3_roll,member3_year,member3_department,member3_phone,member3_email,member4_name,member4_roll,member4_year,member4_department,member4_phone,member4_email,year,department,phone,email,document_url,document_filename,accepted,created_at")
       .eq("tenant_id", tenant!.id),
 
     supabase.auth.getUser(),

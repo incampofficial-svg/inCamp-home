@@ -140,7 +140,7 @@ export default function EventsPage() {
   const fetchEvents = async () => {
     const { data, error } = await (supabase as any)
       .from("events")
-      .select("*")
+      .select("id,title,description,event_date,location,event_type,mode,organizer_name,organizer_contact,registration_deadline,registration_link,max_participants,is_active,image_url")
       .eq("tenant_id", tenant!.id)
       .order("event_date", { ascending: true });
 
@@ -152,7 +152,7 @@ export default function EventsPage() {
     try {
       const { data } = await supabase
         .from("page_content")
-        .select("*")
+        .select("content")
         .eq("page_name", "events")
         .eq("section_key", "page_header")
         .eq("tenant_id", tenant!.id);

@@ -1,3 +1,4 @@
+import { lazy, Suspense } from "react";
 import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -6,25 +7,27 @@ import { BrowserRouter, Navigate, Routes, Route, useLocation } from "react-route
 import { AuthProvider } from "@/contexts/AuthContext";
 import { ProtectedRoute } from "@/components/ProtectedRoute";
 import TenantLayout from "@/layouts/TenantLayout";
-import Index from "./pages/Index";
-import About from "./pages/About";
-import Problems from "./pages/Problems";
-import Departments from "./pages/Departments";
-import ProblemDetails from "./pages/ProblemDetails";
-import Events from "./pages/Events";
-import Resources from "./pages/Resources";
-import Registration from "./pages/Registration";
-import Contact from "./pages/Contact";
-import Auth from "./pages/Auth";
-import Profile from "./pages/Profile";
-import AdminDashboard from "./pages/AdminDashboard";
-import NotFound from "./pages/NotFound";
-import EventDetails from "./pages/EventDetails";
-import EventRegister from "./pages/EventRegister";
 import ScrollToTop from "./components/ScrollToTop";
+import { PageSkeleton } from "@/components/PageSkeleton";
 
 const queryClient = new QueryClient();
 const defaultTenantSlug = "gcet";
+
+const Index = lazy(() => import("./pages/Index"));
+const About = lazy(() => import("./pages/About"));
+const Problems = lazy(() => import("./pages/Problems"));
+const Departments = lazy(() => import("./pages/Departments"));
+const ProblemDetails = lazy(() => import("./pages/ProblemDetails"));
+const Events = lazy(() => import("./pages/Events"));
+const Resources = lazy(() => import("./pages/Resources"));
+const Registration = lazy(() => import("./pages/Registration"));
+const Contact = lazy(() => import("./pages/Contact"));
+const Auth = lazy(() => import("./pages/Auth"));
+const Profile = lazy(() => import("./pages/Profile"));
+const AdminDashboard = lazy(() => import("./pages/AdminDashboard"));
+const NotFound = lazy(() => import("./pages/NotFound"));
+const EventDetails = lazy(() => import("./pages/EventDetails"));
+const EventRegister = lazy(() => import("./pages/EventRegister"));
 
 function LegacyTenantRedirect() {
   const location = useLocation();
@@ -44,6 +47,7 @@ const App = () => (
         <Sonner />
         <BrowserRouter>
           <ScrollToTop />
+          <Suspense fallback={<PageSkeleton />}>
           <Routes>
             <Route path="/" element={<Navigate to={`/${defaultTenantSlug}`} replace />} />
             <Route path="/about" element={<LegacyTenantRedirect />} />
@@ -98,6 +102,7 @@ const App = () => (
             </Route>
             <Route path="*" element={<NotFound />} />
           </Routes>
+          </Suspense>
         </BrowserRouter>
       </TooltipProvider>
     </AuthProvider>

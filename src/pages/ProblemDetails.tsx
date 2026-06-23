@@ -39,7 +39,7 @@ export default function ProblemDetails() {
       // Fetch by public-facing problem_statement_id first (e.g. "25001")
       let byCodeQuery: any = supabase
         .from("problem_statements")
-        .select("*")
+        .select("id,problem_statement_id,title,description,category,theme,created_at")
         .eq("problem_statement_id", id);
 
       if (tenant?.id) byCodeQuery = byCodeQuery.eq("tenant_id", tenant.id);
@@ -70,7 +70,7 @@ export default function ProblemDetails() {
       if (isUuid) {
         let byUuidQuery: any = supabase
           .from("problem_statements")
-          .select("*")
+          .select("id,problem_statement_id,title,description,category,theme,created_at")
           .eq("id", id);
 
         if (tenant?.id) byUuidQuery = byUuidQuery.eq("tenant_id", tenant.id);

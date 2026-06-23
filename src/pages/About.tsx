@@ -166,7 +166,7 @@ export default function About() {
     try {
       const { data } = await supabase
         .from("page_content")
-        .select("*")
+        .select("section_key,content")
         .eq("page_name", "about")
         .eq("tenant_id", tenant!.id);
 

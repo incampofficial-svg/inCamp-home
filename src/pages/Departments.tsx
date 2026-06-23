@@ -52,7 +52,12 @@ export default function DepartmentsPage() {
   const fetch = async () => {
     setLoading(true);
     const [{ data: problemsData, error: problemsError }, { data: regsData }] = await Promise.all([
-      supabase.from("problem_statements").select("*").eq("tenant_id", tenant!.id).eq("status", "pending_review").order("created_at", { ascending: false }),
+      supabase
+        .from("problem_statements")
+        .select("id,problem_statement_id,title,description,detailed_description,category,department,theme,status,created_at,approved_at,max_registrations")
+        .eq("tenant_id", tenant!.id)
+        .eq("status", "pending_review")
+        .order("created_at", { ascending: false }),
       (supabase as any).from("team_registrations").select("department").eq("tenant_id", tenant!.id),
     ]);
 

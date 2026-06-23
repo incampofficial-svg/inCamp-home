@@ -134,14 +134,14 @@ export function TimelineSection() {
           await Promise.all([
             supabase
               .from("page_content")
-              .select("*")
+              .select("content")
               .eq("page_name", "home")
               .eq("section_key", "timeline_cards")
               .eq("tenant_id", tenant!.id)
               .maybeSingle(),
             supabase
               .from("page_content")
-              .select("*")
+              .select("content")
               .eq("page_name", "home")
               .eq("section_key", "timeline_header")
               .eq("tenant_id", tenant!.id)

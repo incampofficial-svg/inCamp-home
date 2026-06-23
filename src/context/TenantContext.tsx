@@ -1,4 +1,4 @@
-import { createContext, ReactNode, useContext, useEffect, useMemo, useState } from "react";
+import { createContext, ReactNode, useContext, useEffect, useMemo, useState, useRef } from "react";
 import { supabase } from "@/integrations/supabase/client";
 import type { Tenant } from "@/types/tenant";
 
@@ -10,6 +10,9 @@ interface TenantContextValue {
 
 const TenantContext = createContext<TenantContextValue | undefined>(undefined);
 
+// Module-level cache for tenant data - persists across component remounts
+const tenantCacheRef = { current: new Map<string, Tenant>() };
+
 interface TenantProviderProps {
   tenantSlug: string | undefined;
   children: ReactNode;
@@ -19,6 +22,7 @@ export function TenantProvider({ tenantSlug, children }: TenantProviderProps) {
   const [tenant, setTenant] = useState<Tenant | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const previousSlugRef = useRef<string | undefined>();
 
   useEffect(() => {
     let cancelled = false;
@@ -31,12 +35,26 @@ export function TenantProvider({ tenantSlug, children }: TenantProviderProps) {
         return;
       }
 
-      setLoading(true);
+      // **OPTIMIZATION: Check cache first**
+      const cached = tenantCacheRef.current.get(tenantSlug);
+      if (cached) {
+        if (!cancelled) {
+          setTenant(cached);
+          setError(null);
+          setLoading(false);
+        }
+        return;
+      }
+
+      // Only show loading if we're changing tenants (not on first load with cache)
+      if (previousSlugRef.current !== tenantSlug) {
+        setLoading(true);
+      }
       setError(null);
 
       const { data, error: tenantError } = await (supabase as any)
         .from("tenants")
-        .select("*")
+        .select("id,name,slug,created_at")
         .eq("slug", tenantSlug)
         .single();
 
@@ -46,11 +64,14 @@ export function TenantProvider({ tenantSlug, children }: TenantProviderProps) {
         setTenant(null);
         setError("Tenant not found");
       } else {
+        // **OPTIMIZATION: Store in cache**
+        tenantCacheRef.current.set(tenantSlug, data as Tenant);
         setTenant(data as Tenant);
         setError(null);
       }
 
       setLoading(false);
+      previousSlugRef.current = tenantSlug;
     };
 
     void fetchTenant();

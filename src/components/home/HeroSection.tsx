@@ -116,7 +116,7 @@ export function HeroSection() {
       try {
         const { data, error } = await supabase
           .from("page_content")
-          .select("*")
+          .select("content")
           .eq("page_name", "home")
           .eq("section_key", "hero")
           .eq("tenant_id", tenant!.id)

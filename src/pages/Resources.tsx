@@ -91,7 +91,7 @@ export default function Resources() {
     setLoading(true);
     const { data } = await supabase
       .from("resources")
-      .select("*")
+      .select("id,title,description,file_url,file_type,section_key")
       .eq("tenant_id", tenant!.id)
       .order("section_key");
 
@@ -105,7 +105,7 @@ export default function Resources() {
     try {
       const { data } = await supabase
         .from("page_content")
-        .select("*")
+        .select("content")
         .eq("page_name", "resources")
         .eq("section_key", "header")
         .eq("tenant_id", tenant!.id);
@@ -125,7 +125,7 @@ export default function Resources() {
     try {
       const { data } = await supabase
         .from("page_content")
-        .select("*")
+        .select("content")
         .eq("page_name", "resources")
         .eq("section_key", "downloads")
         .eq("tenant_id", tenant!.id);

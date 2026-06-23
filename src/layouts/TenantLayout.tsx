@@ -1,66 +1,30 @@
-import { useEffect, useState } from "react";
+import { useMemo } from "react";
 import { Outlet, useParams } from "react-router-dom";
 import { AlertCircle } from "lucide-react";
 import { TenantProvider, useTenant } from "@/context/TenantContext";
 import { useAuth } from "@/contexts/AuthContext";
-import { supabase } from "@/integrations/supabase/client";
+import { FaviconUpdater } from "@/components/FaviconUpdater";
 import { Button } from "@/components/ui/button";
+import { Layout } from "@/components/layout/Layout";
+import { PageSkeleton } from "@/components/PageSkeleton";
 
 function TenantContent() {
-  const { tenant, loading, error } = useTenant();
-  const { user, loading: authLoading, signOut } = useAuth();
-  const [membershipLoading, setMembershipLoading] = useState(false);
-  const [hasTenantAccess, setHasTenantAccess] = useState(true);
+  const { tenant, loading: tenantLoading, error: tenantError } = useTenant();
+  const { user, profile, loading: authLoading, signOut } = useAuth();
+  const hasTenantAccess = useMemo(
+    () => !user || !tenant?.id || profile?.tenant_id === tenant.id,
+    [user, tenant?.id, profile?.tenant_id]
+  );
 
-  useEffect(() => {
-    if (loading || authLoading || !tenant?.id || !user) {
-      setHasTenantAccess(true);
-      setMembershipLoading(false);
-      return;
-    }
-
-    let cancelled = false;
-
-    const checkTenantMembership = async () => {
-      setMembershipLoading(true);
-      try {
-        const { data, error: profileError } = await supabase
-          .from("profiles")
-          .select("tenant_id")
-          .eq("id", user.id)
-          .maybeSingle();
-
-        if (profileError) throw profileError;
-        if (!cancelled) {
-          setHasTenantAccess(data?.tenant_id === tenant.id);
-        }
-      } catch (err) {
-        console.error("Error checking tenant access:", err);
-        if (!cancelled) setHasTenantAccess(false);
-      } finally {
-        if (!cancelled) setMembershipLoading(false);
-      }
-    };
-
-    void checkTenantMembership();
-
-    return () => {
-      cancelled = true;
-    };
-  }, [authLoading, loading, tenant?.id, user]);
-
-  if (loading || authLoading || membershipLoading) {
+  if (tenantLoading || authLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-background">
-        <div className="text-center">
-          <div className="w-12 h-12 rounded-xl bg-primary mx-auto mb-4 animate-pulse" />
-          <p className="text-muted-foreground">Loading tenant...</p>
-        </div>
-      </div>
+      <Layout>
+        <PageSkeleton />
+      </Layout>
     );
   }
 
-  if (error) {
+  if (tenantError) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-background px-4">
         <div className="text-center max-w-md">
@@ -99,7 +63,12 @@ function TenantContent() {
     );
   }
 
-  return <Outlet />;
+  return (
+    <>
+      <FaviconUpdater />
+      <Outlet />
+    </>
+  );
 }
 
 export default function TenantLayout() {

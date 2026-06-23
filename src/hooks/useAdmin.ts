@@ -1,22 +1,26 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { useAuth } from "@/contexts/AuthContext";
 import { supabase } from "@/integrations/supabase/client";
 import { useTenant } from "@/context/TenantContext";
 
 export function useAdmin() {
-  const { user } = useAuth();
+  const { user, profile, loading: authLoading } = useAuth();
   const [isAdmin, setIsAdmin] = useState(false);
   const [isDeptAdmin, setIsDeptAdmin] = useState(false);
   const [loading, setLoading] = useState(true);
   const [hasAdminRoleElsewhere, setHasAdminRoleElsewhere] = useState(false);
   const { tenant } = useTenant();
+  const hasCurrentTenantProfile = useMemo(
+    () => !!user && !!tenant?.id && profile?.tenant_id === tenant.id,
+    [user, tenant?.id, profile?.tenant_id]
+  );
 
   useEffect(() => {
     const checkAdminRole = async () => {
-      if (!user || !tenant?.id) {
+      if (authLoading || !user || !tenant?.id) {
         setIsAdmin(false);
         setIsDeptAdmin(false);
-        setLoading(false);
+        setLoading(authLoading);
         return;
       }
 
@@ -35,18 +39,6 @@ export function useAdmin() {
         const roles = (rolesData || []).map((r: any) => String(r.role));
         const hasAdminRole = roles.includes("admin") || roles.includes("institution_admin");
         const hasDeptAdminRole = roles.includes("deptadmin") || roles.includes("department_admin");
-
-        // Confirm the user's profile belongs to the active tenant.
-        const { data: profileData, error: profileError } = await supabase
-          .from("profiles")
-          .select("tenant_id")
-          .eq("id", user.id)
-          .eq("tenant_id", tenant.id)
-          .maybeSingle();
-
-        if (profileError) throw profileError;
-
-        const hasCurrentTenantProfile = profileData?.tenant_id === tenant.id;
 
         if (hasAdminRole && hasCurrentTenantProfile) {
           setIsAdmin(true);
@@ -82,7 +74,7 @@ export function useAdmin() {
     };
 
     checkAdminRole();
-  }, [user, tenant?.id]);
+  }, [authLoading, user, tenant?.id, hasCurrentTenantProfile]);
 
   return { isAdmin, isDeptAdmin, loading, hasAdminRoleElsewhere };
 }

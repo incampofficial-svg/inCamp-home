@@ -80,7 +80,7 @@ export default function Problems() {
 
     let query = supabase
       .from("problem_statements")
-      .select("*")
+      .select("id,problem_statement_id,title,description,detailed_description,category,theme,department,status,created_at,approved_at,max_registrations,curr_registrations")
       .order("problem_statement_id", { ascending: true });
 
     if (!isAdmin) {

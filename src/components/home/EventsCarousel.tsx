@@ -65,7 +65,7 @@ export function EventsCarousel() {
     try {
       const { data, error } = await supabase
         .from("events")
-        .select("*")
+        .select("id,title,description,event_date,location,image_url")
         .eq("tenant_id", tenant!.id)
         .eq("is_active", true)
         .order("event_date", { ascending: true });

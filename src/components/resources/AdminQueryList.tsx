@@ -30,7 +30,7 @@ export function AdminQueryList() {
     setLoading(true);
     const { data, error } = await supabase
       .from("user_queries")
-      .select("*")
+      .select("id,query_text,user_id,user_email,user_name,status,resolved_at,created_at")
       .eq("tenant_id", tenant!.id)
       .order("created_at", { ascending: false });
 
@@ -38,25 +38,25 @@ export function AdminQueryList() {
       console.error("Error fetching queries:", error);
       toast.error("Failed to load queries");
     } else {
-      // Fetch profile information for queries with user_id
-      const queriesWithProfiles = await Promise.all(
-        (data || []).map(async (query) => {
-          if (query.user_id) {
-            const { data: profile } = await supabase
-              .from("profiles")
-              .select("name, email")
-              .eq("id", query.user_id)
-              .eq("tenant_id", tenant!.id)
-              .single();
+      const userIds = [...new Set((data || []).map((query) => query.user_id).filter(Boolean))] as string[];
+      const profilesById = new Map<string, { name: string | null; email: string }>();
 
-            return {
-              ...query,
-              user_profile: profile || null,
-            };
-          }
-          return query;
-        })
-      );
+      if (userIds.length > 0) {
+        const { data: profiles } = await supabase
+          .from("profiles")
+          .select("id,name,email")
+          .eq("tenant_id", tenant!.id)
+          .in("id", userIds);
+
+        (profiles || []).forEach((profile) => {
+          profilesById.set(profile.id, { name: profile.name, email: profile.email });
+        });
+      }
+
+      const queriesWithProfiles = (data || []).map((query) => ({
+        ...query,
+        user_profile: query.user_id ? profilesById.get(query.user_id) || null : null,
+      }));
 
       setQueries(queriesWithProfiles);
     }
